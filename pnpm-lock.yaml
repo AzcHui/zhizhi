@@ -26,6 +26,9 @@ importers:
       '@zhizhi/core':
         specifier: workspace:*
         version: link:../core
+      '@zhizhi/persona-zhi':
+        specifier: workspace:*
+        version: link:../plugins/persona-zhi
       '@zhizhi/plugin-sdk':
         specifier: workspace:*
         version: link:../plugin-sdk
@@ -57,6 +60,12 @@ importers:
         version: link:../../plugin-sdk
 
   packages/plugins/channel-console:
+    dependencies:
+      '@zhizhi/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../plugin-sdk
+
+  packages/plugins/persona-zhi:
     dependencies:
       '@zhizhi/plugin-sdk':
         specifier: workspace:*

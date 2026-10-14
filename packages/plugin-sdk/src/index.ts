@@ -14,8 +14,8 @@ export { defineProbe } from './define-probe.ts';
 export type { ProbeDefinition } from './define-probe.ts';
 export { defineRule } from './define-rule.ts';
 export type { RuleDefinition } from './define-rule.ts';
-export { definePersona } from './define-persona.ts';
-export type { PersonaDefinition } from './define-persona.ts';
+export { definePersona, definePersonaFromJson } from './define-persona.ts';
+export type { PersonaDefinition, PersonaJson } from './define-persona.ts';
 export { defineChannel } from './define-channel.ts';
 export type { ChannelDefinition } from './define-channel.ts';
 

@@ -16,12 +16,14 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type {
   Channel,
   LoadOutcome,
   Logger,
+  Persona,
   PluginFailureKind,
   PluginSpec,
   PluginType,
@@ -29,7 +31,7 @@ import type {
   Registry,
   Rule,
 } from '@zhizhi/core';
-import { validateManifest } from '@zhizhi/plugin-sdk';
+import { definePersonaFromJson, validateManifest } from '@zhizhi/plugin-sdk';
 import type { PluginManifest } from '@zhizhi/plugin-sdk';
 
 /** 插件模块对外的形状：默认导出该插件的实例 */
@@ -75,6 +77,15 @@ export async function loadPlugins(
 
 async function loadOne(spec: PluginSpec, registry: Registry, log: Logger): Promise<LoadOutcome> {
   const { specifier, type } = spec;
+
+  // ── 特例：persona 可以直接给一个 `.json` 路径 ──
+  // 这是「性格包 = 纯数据，不执行代码」那条决策的落点（文档第七节 / 决策 D）：
+  // 别人分享一套性格 = 分享一个 JSON 文件，不需要写代码，也就没有安全风险。
+  // ⚠️ 关键在于：**清单里写的是路径，不是一个写死的内置包名** ——
+  //    内置台词包只是「清单里的一项默认值」，不是必需品。
+  if (type === 'persona' && specifier.toLowerCase().endsWith('.json')) {
+    return loadPersonaJson(specifier, registry, log);
+  }
 
   // ── 第 1 步：读 manifest（顺带把「装没装」判掉）──
   let rawManifest: unknown;
@@ -152,6 +163,10 @@ function mismatchReason(
       return typeof instance['sample'] === 'function' ? undefined : 'probe 必须提供 sample()';
     case 'rule':
       return typeof instance['evaluate'] === 'function' ? undefined : 'rule 必须提供 evaluate()';
+    case 'persona':
+      return typeof instance['speak'] === 'function'
+        ? undefined
+        : 'persona 必须提供 speak()（用 definePersona / definePersonaFromJson 生成即可）';
     case 'channel':
       if (typeof instance['send'] !== 'function') return 'channel 必须提供 send()';
       if (!Array.isArray(instance['sends']) || instance['sends'].length === 0) {
@@ -159,7 +174,7 @@ function mismatchReason(
       }
       return undefined;
     default:
-      return `M2 还不支持 ${type} 类型的插件（persona / action / view 留给后续里程碑）`;
+      return `暂不支持 ${type} 类型的插件（action / view 留给后续里程碑）`;
   }
 }
 
@@ -174,10 +189,47 @@ function adoptInstance(
       return registry.adoptProbe(manifest.id, instance as unknown as Probe);
     case 'rule':
       return registry.adoptRule(manifest.id, instance as unknown as Rule);
+    case 'persona':
+      return registry.adoptPersona(manifest.id, instance as unknown as Persona);
     case 'channel':
       return registry.adoptChannel(manifest.id, instance as unknown as Channel);
     default:
       // mismatchReason 已经拦过不支持的类型，这里纯属兜底
       return registry.reject(manifest.id, manifest.type, 'invalid', `${manifest.type} 类型尚未支持`);
+  }
+}
+
+/**
+ * 加载一个**纯数据**台词包：清单里给的是 JSON 路径，不是包名。
+ *
+ * 相对路径按**当前工作目录**解析（写绝对路径更稳，推荐）。
+ * 失败同样分三类，措辞与插件一致 —— 而且这里**绝不因为台词包不在就报错退出**：
+ * 台词包是「默认值」不是「必需品」，读不到就用客观描述说话（见 core/voice.ts）。
+ */
+function loadPersonaJson(specifier: string, registry: Registry, log: Logger): LoadOutcome {
+  const path = isAbsolute(specifier) ? specifier : resolve(process.cwd(), specifier);
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    const reason = describe(err);
+    const missing = codeOf(err) === 'ENOENT';
+    log.error(
+      missing
+        ? `台词包读不到：${path} —— 清单里指向了它，但文件不在。内核继续运行，改用客观描述说话。`
+        : `台词包读不动：${path} —— ${reason}`,
+    );
+    return registry.reject(specifier, 'persona', missing ? 'missing' : 'invalid', reason);
+  }
+
+  try {
+    const persona = definePersonaFromJson(raw, path);
+    log.info(`台词包已激活：${persona.id}（纯数据 JSON：${path}）`);
+    return registry.adoptPersona(persona.id, persona);
+  } catch (err) {
+    const reason = describe(err);
+    log.error(`台词包不合规：${path} —— ${reason}`);
+    return registry.reject(specifier, 'persona', 'invalid', reason);
   }
 }

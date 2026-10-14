@@ -1,0 +1,16 @@
+{
+  "name": "@zhizhi/persona-zhi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "内置台词包（只只本尊）—— 台词全在 persona.json，纯数据，改它不用碰代码",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./persona.json": "./persona.json",
+    "./manifest.json": "./manifest.json"
+  },
+  "dependencies": {
+    "@zhizhi/plugin-sdk": "workspace:*"
+  }
+}

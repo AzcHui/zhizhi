@@ -30,7 +30,7 @@ import {
   runGates,
   setLogLevel,
 } from '@zhizhi/core';
-import type { Metric, MetricBatch, Persona, ZhizhiEvent } from '@zhizhi/core';
+import type { Metric, MetricBatch, ZhizhiEvent } from '@zhizhi/core';
 
 import { loadPlugins } from './loader.ts';
 import { PLUGINS } from './plugins.ts';
@@ -108,8 +108,9 @@ for (const channel of registry.channels()) dispatcher.register(channel);
 
 let tickBatches: MetricBatch[] = [];
 const passedEvents: ZhizhiEvent[] = [];
-// M5 才会有 persona 插件；在那之前 composeLine 会用事件自带的客观描述兜底
-const personas: readonly Persona[] = [];
+// 台词包从**账本**里取 —— 与 probe / rule / channel 走同一条加载路径。
+// ⚠️ M5 硬约束：这里**不许** import 任何写死的内置台词包，否则「可整体替换」就是假的。
+//   一个台词包都没有时，composeLine 会自动降级成事件的客观描述（不崩、不哑）。
 
 bus.on<MetricBatch>('metric', (batch) => {
   // ① 汇总起来，给本 tick 的 stdout 报告用
@@ -143,7 +144,7 @@ bus.on<ZhizhiEvent>('event.candidate', (event) => {
   passedEvents.push(event);
   if (passedEvents.length > 200) passedEvents.shift();
 
-  const line = composeLine(event, personas, log.child('voice'));
+  const line = composeLine(event, registry.personas(), log.child('voice'));
   bus.emit<ZhizhiEvent>('event.passed', event);
 
   void dispatcher
@@ -219,6 +220,13 @@ process.on('SIGTERM', () => shutdown(0));
 log.info(`只只已上线 —— 每 ${intervalMs} ms 采一次`);
 log.info(
   `插件在岗 ${registry.activeCount} / ${PLUGINS.length}：${registry.activeIds().join(', ') || '（无）'}`,
+);
+// 台词包单独说一句 —— 「0 个」是**正常降级**，不是故障，得让日志把它说清楚
+const personaIds = registry.personaIds();
+log.info(
+  personaIds.length > 0
+    ? `台词包：${personaIds.join(', ')}（挑台词）`
+    : '台词包：0 个 —— 只只会用事件的客观描述说话（降级，不是故障）',
 );
 if (errors.length > 0) {
   log.warn(`有 ${errors.length} 个插件没起来（明细见上方 loader 日志），内核照常运行`);

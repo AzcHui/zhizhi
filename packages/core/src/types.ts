@@ -164,7 +164,13 @@ export interface LoadOutcome {
 
 /** 清单里的一条插件声明 */
 export interface PluginSpec {
-  /** 包名（S3 之后这里会换成目录路径） */
+  /**
+   * 包名（S3 之后这里会换成目录路径）。
+   *
+   * 📌 例外：`type: 'persona'` 时可以直接给一个 **`.json` 文件路径** ——
+   *    那表示「纯数据台词包」（性格包不执行代码，见《人格系统与模型接入设计》第七节）。
+   *    相对路径按当前工作目录解析，写绝对路径更稳。
+   */
   readonly specifier: string;
   /** 期望的插件类型 —— 即使插件没起来，也要能如实记账 */
   readonly type: PluginType;

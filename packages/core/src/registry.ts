@@ -18,11 +18,20 @@
  *     内核只管如实记账，日志全部由 loader 出。
  */
 
-import type { Channel, LoadOutcome, PluginFailureKind, PluginType, Probe, Rule } from './types.ts';
+import type {
+  Channel,
+  LoadOutcome,
+  Persona,
+  PluginFailureKind,
+  PluginType,
+  Probe,
+  Rule,
+} from './types.ts';
 
 export class Registry {
   readonly #probes = new Map<string, Probe>();
   readonly #rules = new Map<string, Rule>();
+  readonly #personas = new Map<string, Persona>();
   readonly #channels = new Map<string, Channel>();
   readonly #outcomes: LoadOutcome[] = [];
 
@@ -38,6 +47,20 @@ export class Registry {
   adoptRule(id: string, rule: Rule): LoadOutcome {
     this.#rules.set(id, rule);
     const outcome: LoadOutcome = { id, type: 'rule', status: 'active' };
+    this.#outcomes.push(outcome);
+    return outcome;
+  }
+
+  /**
+   * 登记一个已经加载就绪的 persona（台词包）。
+   *
+   * 📌 **可以有 0 个** —— 台词包是「默认值」不是「必需品」：
+   *    一个都不在时，内核用事件的客观描述兜底说话（见 core/voice.ts）。
+   *    所以这里**不是** must-have，缺失时只记账、不报错。
+   */
+  adoptPersona(id: string, persona: Persona): LoadOutcome {
+    this.#personas.set(id, persona);
+    const outcome: LoadOutcome = { id, type: 'persona', status: 'active' };
     this.#outcomes.push(outcome);
     return outcome;
   }
@@ -96,9 +119,23 @@ export class Registry {
     return [...this.#channels.keys()];
   }
 
+  /** 在岗的台词包（可能为空 —— 空 loadout 必须能降级，不是故障） */
+  personas(): readonly Persona[] {
+    return [...this.#personas.values()];
+  }
+
+  personaIds(): string[] {
+    return [...this.#personas.keys()];
+  }
+
   /** 这个 id 是否已被任何类型的插件占用（加载器用来查重名冲突） */
   hasPlugin(id: string): boolean {
-    return this.#probes.has(id) || this.#rules.has(id) || this.#channels.has(id);
+    return (
+      this.#probes.has(id) ||
+      this.#rules.has(id) ||
+      this.#personas.has(id) ||
+      this.#channels.has(id)
+    );
   }
 
   /** 账本全貌（含没起来的那些） */
@@ -111,13 +148,18 @@ export class Registry {
     return this.#outcomes.filter((o) => o.status === 'failed');
   }
 
-  /** 在岗插件的全部 id（三类合并）—— 上线报告用 */
+  /** 在岗插件的全部 id（四类合并）—— 上线报告用 */
   activeIds(): string[] {
-    return [...this.#probes.keys(), ...this.#rules.keys(), ...this.#channels.keys()];
+    return [
+      ...this.#probes.keys(),
+      ...this.#rules.keys(),
+      ...this.#personas.keys(),
+      ...this.#channels.keys(),
+    ];
   }
 
-  /** 在岗插件总数（probe + rule + channel 相加） */
+  /** 在岗插件总数（probe + rule + persona + channel 相加） */
   get activeCount(): number {
-    return this.#probes.size + this.#rules.size + this.#channels.size;
+    return this.#probes.size + this.#rules.size + this.#personas.size + this.#channels.size;
   }
 }

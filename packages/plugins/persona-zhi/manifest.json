@@ -1,0 +1,15 @@
+{
+  "id": "persona-zhi",
+  "name": "只只本尊",
+  "version": "0.1.0",
+  "type": "persona",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "内置台词包（有人味 + 会吐槽）。台词全在 persona.json 里 —— 改台词不用碰代码；整个包也可以被别人换掉。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

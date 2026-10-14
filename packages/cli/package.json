@@ -16,6 +16,7 @@
     "@zhizhi/channel-alert": "workspace:*",
     "@zhizhi/channel-console": "workspace:*",
     "@zhizhi/core": "workspace:*",
+    "@zhizhi/persona-zhi": "workspace:*",
     "@zhizhi/plugin-sdk": "workspace:*",
     "@zhizhi/probe-cpu": "workspace:*",
     "@zhizhi/probe-disk": "workspace:*",

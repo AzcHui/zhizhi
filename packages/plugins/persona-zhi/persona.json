@@ -7,7 +7,7 @@
     "cpu.high": [
       "CPU 都 {value}% 了 —— 你这是开了几个浏览器？",
       "风扇已经开始喊了：CPU {value}%。",
-      "{value}% 的 CPU，我数了下，{value} 的背后是 12 个核在加班。",
+      "{value}% 的 CPU —— 快赶上烤面包机了。",
       "有点烫。CPU {value}%，要不要看看是谁在偷跑？"
     ],
     "mem.high": [

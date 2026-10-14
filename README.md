@@ -6,7 +6,7 @@
 它不只报警 —— 它会说话，有自己的语气（有人味，还会吐槽你），
 而且知道**什么时候该闭嘴**。
 
-**当前状态**：🟢 **M0–M3 + M5 已完成（5/11）** —— 内核可独立跑 · 浮窗可用 · **只只会说人味的话了（台词全在 JSON 里，可改可换）** · ⏸️ **M4 外壳搁置（不卡主线）**
+**当前状态**：🟢 **M0–M3 + M5 已完成（5/11）** —— 内核可独立跑 · 台词可改可换 · 🆕 **最小可用只只**：一个窗口自己养着内核，实时看机器、并把它说的话显示出来（**M4-a** ✅）· 🟡 M4-b 整容搁置
 
 ---
 
@@ -32,8 +32,8 @@
 
 ```
 M0   M1   M2   |  M3   M4   |  M5   M6   M7   M8   |  M9   M10
-✅   ✅   ✅   |  ✅   ⏸️   |  ✅   ⬜   ⬜   ⬜   |  ⬜    ⬜
-                              ▲ 当前位置（M5 台词池外置已完成；M4 外壳搁置）
+✅   ✅   ✅   |  ✅   🟡   |  ✅   ⬜   ⬜   ⬜   |  ⬜    ⬜
+                              ▲ 当前位置（M4-a 数据接线 ✅；M4-b 整容搁置）
 └─ 内核阶段 ─┘   └─ 外观 ─┘   └──── 性格阶段 ────┘   └─ 收尾 ─┘
    纯 Node / 零安装 / 不需要 Rust        ★ 这一层才是只只
 ```
@@ -92,24 +92,34 @@ pnpm typecheck   # 全量类型检查
 
 > 把台词包**整个删掉**也没关系：只只会改用「事件的客观描述」说话（**降级，不是故障**）。
 
-## 试试浮窗（M3 手感验证）
+## 最小可用只只（浮窗）
 
-一个**最丑最快**的浮窗，只为把「位置 / 遮挡 / 按钮」问明白 —— 不是正式外壳（那是 M4）。
+**一个窗口，自己养着一个内核。** 它会把内核当 sidecar 拉起来、**长连接读它的 stdout**，
+所以 CPU / 内存是**实时刷新**的（不用你另外开终端跑 `pnpm start`）；
+它还抽干内核的 stderr —— 于是**只只说的话会显示在窗口上**。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1                  # 右下角
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Position TopCenter
-powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest        # 自检（含处理器冒烟），不弹窗
-powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -RenderCheck     # 渲染回归：真开窗 0.9s，数「红叉」
+# 想快点看到它开口（默认要「连续超标 2 分钟」才说）：
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Interval 1000 -SustainMs 3000 -CooldownMs 5000
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest        # 自检（含流式读内核），不弹窗
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -RenderCheck     # 渲染回归：真开窗、数「红叉」
 ```
 
-点浮窗里的按钮，再切到编辑器按 `Ctrl+V` —— **能粘贴 = 没抢焦点**（`WS_EX_NOACTIVATE` 生效）。
+窗口上有什么：状态行（位置 · node · **已看 N 轮**）· CPU · MEM · **只只说的话** · 说说/安静/位置/设置 · ✕
 
 点「**设置**」可**原地展开**基础设置：**尺寸**（小/中/大）· **透明**（细/中/实）· **置顶**（开/关）· **记住位置**（开/关）。
 改完**立即生效**，自动存到 `tools/float-preview.settings.json`（已 gitignore），下次打开自动生效。
 
+点浮窗里的按钮，再切到编辑器按 `Ctrl+V` —— **能粘贴 = 没抢焦点**（`WS_EX_NOACTIVATE` 生效）。
+
+> 📌 它还不是最终外壳（M4-b 搁置）：没有托盘、没有开机自启、长得还是 WinForms 那副样子。
+> 但**数据接线**（M4-a）已经打通 —— 换成 Tauri / Electron 时这条路一样成立。
+
 > ⚠️ 改这个 `.ps1` 时注意：**必须存成 UTF-8 带 BOM**，否则 PS 5.1 按 GBK 读、中文全乱码（详见《环境基线》第六节）。
 
-> ⚠️ **关闭请点浮窗右上角的 ✕。不要在这个控制台里按 `Ctrl+C`** —— 那会停止 PowerShell 管道，
-> 之后浮窗点任何按钮都会报 `PipelineStoppedException`（实测踩过）。真出问题时异常会写进
-> `tools/float-preview.log`，不会再弹致命对话框、也不会卡死。
+> ⚠️ **关闭请点浮窗右上角的 ✕**（它会顺带把内核子进程收掉）。
+> **不要在这个控制台里按 `Ctrl+C`** —— 那会停止 PowerShell 管道，之后浮窗点任何按钮都会报
+> `PipelineStoppedException`（实测踩过）。真出问题时异常会写进 `tools/float-preview.log`，
+> 不会再弹致命对话框、也不会卡死。

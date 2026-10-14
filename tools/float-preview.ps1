@@ -1,9 +1,18 @@
 ﻿<#
-  float-preview.ps1 -- 只只 M3「手感验证」丑浮窗（一次性探针，非正式外壳）
+  float-preview.ps1 -- 只只的「最小可用外壳」（M4-a）
 
-  目的：用最丑最快的办法，把「位置 / 尺寸 / 挡不挡 / 按钮够不够」问明白，
-        并顺带验证「基础设置 + 配置外置」这条路走不走得通。
-  它不是 M4 的外壳；M4 会重写，这里只验证手感与配置机制。
+  它是什么：一个**能自己把内核跑起来**的小浮窗。
+    · 自己拉起内核（node 的 sidecar 子进程），**长连接读它的 stdout**
+      → 每来一行指标就刷新窗口（不再是「打开时采一次」）
+    · 同时读内核的 stderr → 把它**说的话**显示在窗口上
+      —— 显示 CPU 数字的叫监控工具，会说话的才是「只只」
+    · 关窗时自动把内核收掉，不留孤儿进程
+
+  它不是最终外壳（M4-b）：没有托盘、没有开机自启、长得还是 WinForms 那副样子。
+  但它验证的是**数据接线**那条路，而这条路换成 Tauri / Electron 也一样成立
+  ——「stdout = 一行 JSON」这个约定是 M0 就锁死的。
+
+  演进：M3 时它只是「手感探针」（一次性采样）；**M4-a 起它变成 MVP 外壳（sidecar 宿主）**。
 
   命门扩展样式（缺一不可）：
     WS_EX_NOACTIVATE  点浮窗按钮时不抢走编辑器焦点（否则 Ctrl+V 会失效）
@@ -18,10 +27,17 @@
   ⚠️ PowerShell 变量名大小写不敏感：$FormW 与 $formw 是同一个变量。
      本脚本刻意避开 $W / $H / $h 这类短名。
 
+  ⚠️⚠️ **绝不用 `add_OutputDataReceived` 读子进程输出** —— 那个回调跑在**线程池线程**上，
+     PowerShell 的脚本块在那种线程上会炸（没有 Runspace / 管道已停止）。
+     本脚本用「轮询异步读」：每次只挂一个 `ReadLineAsync()`，由 UI 线程的 Timer 检查它
+     完成没有 → 取结果 → 再挂下一个。**零线程、零阻塞**（M4-a 实测通过，见《环境基线》）。
+
   用法：
     powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1
     powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Position TopCenter
-    powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest   # 只自检，不弹窗、不写设置
+    # 想快点看到只只开口（默认要「连续超标 2 分钟」才说）：
+    powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Interval 1000 -SustainMs 3000 -CooldownMs 5000
+    powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest   # 自检，不弹窗、不写设置
 
   设置：点浮窗里的「设置」原地展开，改完立即生效，自动存到
         tools\float-preview.settings.json（下次打开自动生效）
@@ -43,12 +59,22 @@ param(
   # 留空则自动从 PATH 找 node
   [string]$NodeExe = '',
 
+  # ── 内核（sidecar 子进程）的参数 ──
+  # 采样间隔：越小窗口越「活」，但也越费 CPU。2000ms 是「看着像实时」与「不打扰」的折中。
+  [int]$Interval = 2000,
+  # 持续判定窗口 / 冷却期：0 = 用内核默认（2 分钟 / 15 分钟）。
+  # 调小只为「快点看到只只开口」，不是产品默认值。
+  [int]$SustainMs = 0,
+  [int]$CooldownMs = 0,
+
   # 只搭窗口 + 打印自检，不真的显示，也不写设置文件（给自动化验证用）
   # ⚠️ 它**不绘制**，所以抓不到「绘制类」缺陷 —— 2026-10-14 的红叉事件就是这么漏过去的
   [switch]$SelfTest,
 
-  # 真开一次窗口 ~0.9 秒：数「绘制期异常」次数 + 截图存证 + 退出（渲染回归专用）
-  [switch]$RenderCheck
+  # 真开一次窗口：数「绘制期异常」次数 + 截图存证 + 退出（渲染回归专用）
+  # ShotDelayMs 默认 2600（够内核出第一条采样）；想连「只只开口」一起截到就调大
+  [switch]$RenderCheck,
+  [int]$ShotDelayMs = 2600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -280,37 +306,138 @@ function Get-NodeScore([string]$exe) {
   return [pscustomobject]@{ Raw = 'unknown'; Score = 0 }
 }
 
-# 读一次 cli 的 stdout（一行 JSON）—— 单次采样，不驻留进程
-function Read-Metrics([string]$nodeExe) {
-  $result = [pscustomobject]@{ Ok = $false; Cpu = $null; Mem = $null; Err = '' }
-  if (-not $nodeExe) { $result.Err = 'node 未找到'; return $result }
+# ──────────────────── 内核 sidecar：自己把它跑起来，长连接读它的流 ────────────────────
+#
+# 为什么这么写（M4-a 实测结论）：
+#   ① **长连接读 stdout**：内核每 tick 吐一行 JSON —— 这个约定 M0 就锁死了，
+#      今天终于有人消费它。换成 Tauri / Electron 外壳时，这条路径完全不变。
+#   ② **轮询异步读**，绝不用 `add_OutputDataReceived` —— 那个回调跑在线程池线程上，
+#      PowerShell 的脚本块在那儿会炸（没有 Runspace / 管道已停止）。
+#   ③ **stderr 也必须一直抽干**：管道缓冲区写满（约 64KB）内核就会被阻塞。
+#      顺带的收获：**只只说的话就在 stderr 里**，正好显示到窗口上。
 
-  # 关键：cli 的日志走 stderr；在 ErrorActionPreference=Stop 下，
-  # 原生命令写 stderr 会被 PowerShell 当成「终止错误」抛出来 → 这里必须临时放宽。
-  $prevEap = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  Push-Location $script:REPO_ROOT
-  try {
-    $raw = & $nodeExe --disable-warning=ExperimentalWarning 'packages/cli/src/main.ts' --ticks=1 --interval=250 2>$null | Out-String
-  } catch {
-    $result.Err = $_.Exception.Message
-    return $result
-  } finally {
-    Pop-Location
-    $ErrorActionPreference = $prevEap
+$script:kernel = $null        # sidecar 进程
+$script:kernelOut = $null     # stdout 的「待完成异步读」
+$script:kernelErr = $null     # stderr 的「待完成异步读」
+$script:kernelLines = 0       # 已收到几条采样
+$script:kernelDead = $false
+$script:metricsTimer = $null  # UI 线程上的轮询定时器
+
+function Start-Kernel {
+  if (-not $script:nodeExe) {
+    Write-ZhiLog '[ERR] 找不到 node，内核起不来'
+    Show-ErrorHint '找不到 node'
+    return
   }
 
-  $line = ($raw -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
-  if (-not $line) { $result.Err = 'cli 没有输出 JSON'; return $result }
+  $kernelArgs = "--disable-warning=ExperimentalWarning packages/cli/src/main.ts --interval=$script:kernelIntervalMs"
+  if ($script:kernelSustainMs -gt 0) { $kernelArgs += " --sustain-ms=$script:kernelSustainMs" }
+  if ($script:kernelCooldownMs -gt 0) { $kernelArgs += " --cooldown-ms=$script:kernelCooldownMs" }
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $script:nodeExe
+  $psi.Arguments = $kernelArgs
+  $psi.WorkingDirectory = $script:REPO_ROOT
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  # ⚠️ 这两行不设，只只说的中文会被 PowerShell 按 GBK 解码 → 全成乱码（实测踩过）
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $psi.StandardOutputEncoding = $utf8
+  $psi.StandardErrorEncoding = $utf8
+
+  try {
+    $script:kernel = [System.Diagnostics.Process]::Start($psi)
+  } catch {
+    Write-ZhiLog ('[ERR] 内核启动失败：' + $_.Exception.Message)
+    Show-ErrorHint '内核启动失败，详情见日志'
+    return
+  }
+
+  $script:kernelOut = $script:kernel.StandardOutput.ReadLineAsync()
+  $script:kernelErr = $script:kernel.StandardError.ReadLineAsync()
+  Write-ZhiLog ('内核已作为 sidecar 启动：PID=' + $script:kernel.Id + ' 参数=' + $kernelArgs)
+}
+
+function Stop-Kernel {
+  if ($null -eq $script:kernel) { return }
+  try {
+    if (-not $script:kernel.HasExited) {
+      $script:kernel.Kill()
+      [void]$script:kernel.WaitForExit(3000)
+      Write-ZhiLog '内核 sidecar 已收掉'
+    }
+  } catch {
+    Write-ZhiLog ('[ERR] 收内核时出错：' + $_.Exception.Message)
+  }
+  $script:kernel = $null
+  $script:kernelOut = $null
+  $script:kernelErr = $null
+}
+
+# stdout 来了一行：一行 JSON = 一次采样
+function Apply-SampleLine([string]$line) {
+  if (-not $line.TrimStart().StartsWith('{')) { return }   # stdout 只有数据，防一手
   try {
     $obj = $line | ConvertFrom-Json
-    $result.Cpu = ($obj.probes.'probe-cpu' | Where-Object { $_.key -eq 'cpu.usage' } | Select-Object -First 1).value
-    $result.Mem = ($obj.probes.'probe-mem' | Where-Object { $_.key -eq 'mem.usage' } | Select-Object -First 1).value
-    $result.Ok = $true
+    $cpu = ($obj.probes.'probe-cpu' | Where-Object { $_.key -eq 'cpu.usage' } | Select-Object -First 1).value
+    $mem = ($obj.probes.'probe-mem' | Where-Object { $_.key -eq 'mem.usage' } | Select-Object -First 1).value
+    if ($null -ne $cpu) { $lblCpuV.Text = ('{0:N1}%' -f [double]$cpu) }
+    if ($null -ne $mem) { $lblMemV.Text = ('{0:N1}%' -f [double]$mem) }
+    $script:kernelLines++
+    Update-PosLabel
   } catch {
-    $result.Err = 'JSON 解析失败：' + $_.Exception.Message
+    Write-ZhiLog ('[ERR] 采样行解析失败：' + $_.Exception.Message)
   }
-  return $result
+}
+
+# stderr 来了一行：日志。**只只说的话就在里面** —— 捞出来显示到窗口上
+function Apply-LogLine([string]$line) {
+  $m = [regex]::Match($line, '只只说了［([^］]+)］：(.*)$')
+  if ($m.Success) {
+    $text = $m.Groups[2].Value
+    $script:lastSaid = $text
+    if ($text.Length -gt 24) { $lblSaid.Text = $text.Substring(0, 24) + '…' }
+    else { $lblSaid.Text = $text }
+    Write-ZhiLog ('只只说了［' + $m.Groups[1].Value + '］：' + $text)
+  } elseif ($line -match 'ERR|WRN') {
+    Write-ZhiLog ('内核日志：' + $line)
+  }
+}
+
+# 主循环每 200ms 调一次 —— **刻意跑在 UI 线程上**（见文件头的 ⚠️⚠️ 注释）
+function Poll-Kernel {
+  if ($null -eq $script:kernel) { return }
+
+  if ($null -ne $script:kernelOut -and $script:kernelOut.IsCompleted) {
+    $line = $script:kernelOut.Result
+    if ($null -eq $line) {
+      $script:kernelOut = $null                 # EOF：不再挂新的读
+    } else {
+      $script:kernelOut = $script:kernel.StandardOutput.ReadLineAsync()
+      Apply-SampleLine $line
+    }
+  }
+
+  if ($null -ne $script:kernelErr -and $script:kernelErr.IsCompleted) {
+    $line = $script:kernelErr.Result
+    if ($null -eq $line) {
+      $script:kernelErr = $null
+    } else {
+      $script:kernelErr = $script:kernel.StandardError.ReadLineAsync()
+      Apply-LogLine $line
+    }
+  }
+
+  # 内核意外退出了？**必须说出来**（不许静默：窗口会一直停在最后一个数字上）
+  if ($script:kernel.HasExited -and -not $script:kernelDead) {
+    $script:kernelDead = $true
+    Write-ZhiLog ('[ERR] 内核退出了（退出码 ' + $script:kernel.ExitCode + '）—— 数据不再更新')
+    $lblCpuV.Text = '—'
+    $lblMemV.Text = '—'
+    Show-ErrorHint '内核退出，数据已停'
+  }
 }
 
 # ─────────────────────────────── 建窗 ───────────────────────────────
@@ -320,7 +447,7 @@ $form.FormBorderStyle = 'None'
 $form.StartPosition   = 'Manual'
 $form.BackColor       = $cCard
 $form.ShowInTaskbar   = $false
-$form.Text            = '只只 · 手感验证'
+$form.Text            = '只只 · 最小可用外壳'
 
 function New-Label([string]$text, [System.Drawing.Color]$color, [string]$align) {
   $l = New-Object System.Windows.Forms.Label
@@ -354,6 +481,8 @@ $lblCpuK  = New-Label 'CPU'  $cSub    'MiddleLeft'
 $lblCpuV  = New-Label '—'    $cInk    'MiddleRight'
 $lblMemK  = New-Label 'MEM'  $cSub    'MiddleLeft'
 $lblMemV  = New-Label '—'    $cInk    'MiddleRight'
+# 只只说的话（M4-a）：内核 stderr 里的「只只说了…」会显示到这里
+$lblSaid  = New-Label '（正在看着这台机器…）' $cInk 'MiddleLeft'
 
 $btnSay   = New-FlatButton '说说'
 $btnQuiet = New-FlatButton '安静'
@@ -401,7 +530,7 @@ $script:panelCtrls = @($lblSize, $lblOpa, $lblTop, $lblRem,
   $btnTopOn, $btnTopOff, $btnRemOn, $btnRemOff)
 
 $script:mainCtrls = @(
-  $lblTitle, $lblPos, $lblCpuK, $lblCpuV, $lblMemK, $lblMemV,
+  $lblTitle, $lblPos, $lblCpuK, $lblCpuV, $lblMemK, $lblMemV, $lblSaid,
   $btnSay, $btnQuiet, $btnPos, $btnSet, $btnClose
 )
 
@@ -452,7 +581,8 @@ function Set-Layout {
   $fBody  = $script:fonts.body
   $fSmall = $script:fonts.small
 
-  $mainH = [int][Math]::Round(146 * $k)
+  # 主区高度：M4-a 起多了一行「只只说的话」，146 → 170
+  $mainH = [int][Math]::Round(170 * $k)
   $script:mainH = $mainH
   $panelH = [int][Math]::Round(116 * $k)
   $totalH = $mainH
@@ -473,17 +603,21 @@ function Set-Layout {
   Set-Bounds $lblMemV (100 * $k) (82 * $k) (128 * $k) (22 * $k)
   $lblMemV.Font = $fBody
 
-  Set-Bounds $btnSay   (16 * $k)  (110 * $k) (50 * $k) (26 * $k)
-  Set-Bounds $btnQuiet (70 * $k)  (110 * $k) (50 * $k) (26 * $k)
-  Set-Bounds $btnPos   (124 * $k) (110 * $k) (50 * $k) (26 * $k)
-  Set-Bounds $btnSet   (178 * $k) (110 * $k) (50 * $k) (26 * $k)
+  # 只只说的话（M4-a 新增）—— 它是这个窗口里唯一「有温度」的一行
+  Set-Bounds $lblSaid (16 * $k) (106 * $k) (212 * $k) (20 * $k)
+  $lblSaid.Font = $fSmall
+
+  Set-Bounds $btnSay   (16 * $k)  (134 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnQuiet (70 * $k)  (134 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnPos   (124 * $k) (134 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnSet   (178 * $k) (134 * $k) (50 * $k) (26 * $k)
   foreach ($b in @($btnSay, $btnQuiet, $btnPos, $btnSet)) { $b.Font = $fSmall }
 
   Set-Bounds $btnClose (206 * $k) (11 * $k) (24 * $k) (22 * $k)
   $btnClose.Font = $fSmall
 
-  # —— 设置面板：行 154 / 180 / 206 / 232，按钮组右对齐到 228 ——
-  $rows = @(154, 180, 206, 232)
+  # —— 设置面板：行 178 / 204 / 230 / 256（M4-a 因主区多一行整体下移 24），按钮组右对齐到 228 ——
+  $rows = @(178, 204, 230, 256)
   $lbls = @($lblSize, $lblOpa, $lblTop, $lblRem)
   for ($i = 0; $i -lt 4; $i++) {
     $c = $lbls[$i]
@@ -493,8 +627,8 @@ function Set-Layout {
   # 三选一行（尺寸 / 透明）：x = 96 / 141 / 186（宽 42）
   $x3 = @(96, 141, 186)
   $three = @(
-    @{ y = 154; btns = @($btnSizeSm, $btnSizeMd, $btnSizeLg) },
-    @{ y = 180; btns = @($btnOpaThin, $btnOpaMid, $btnOpaSolid) }
+    @{ y = 178; btns = @($btnSizeSm, $btnSizeMd, $btnSizeLg) },
+    @{ y = 204; btns = @($btnOpaThin, $btnOpaMid, $btnOpaSolid) }
   )
   foreach ($g in $three) {
     for ($i = 0; $i -lt 3; $i++) {
@@ -506,8 +640,8 @@ function Set-Layout {
   # 二选一行（置顶 / 记住位置）：x = 141 / 186，对齐到三选一的后两格
   $x2 = @(141, 186)
   $two = @(
-    @{ y = 206; btns = @($btnTopOn, $btnTopOff) },
-    @{ y = 232; btns = @($btnRemOn, $btnRemOff) }
+    @{ y = 230; btns = @($btnTopOn, $btnTopOff) },
+    @{ y = 256; btns = @($btnRemOn, $btnRemOff) }
   )
   foreach ($g in $two) {
     for ($i = 0; $i -lt 2; $i++) {
@@ -562,28 +696,18 @@ function Move-ToPreset([string]$which) {
 }
 
 function Update-PosLabel {
-  $label = Get-PositionLabel $Position
-  $node = 'node 未找到'
+  $parts = @((Get-PositionLabel $Position))
   if ($script:nodeExe) {
-    if ($script:nodeInfo.Score -lt 2218) { $node = 'node 版本过低(' + $script:nodeInfo.Raw + ')' }
-    else { $node = 'node ' + $script:nodeInfo.Raw }
-  }
-  $lblPos.Text = "$label · $node · $($script:stateText)"
-}
-
-function Update-Metrics {
-  $lblCpuV.Text = '采样中…'
-  $lblMemV.Text = '采样中…'
-  $form.Refresh()
-  $m = Read-Metrics $script:nodeExe
-  if ($m.Ok) {
-    $lblCpuV.Text = ('{0:N1}%' -f [double]$m.Cpu)
-    $lblMemV.Text = ('{0:N1}%' -f [double]$m.Mem)
+    if ($script:nodeInfo.Score -lt 2218) { $parts += ('node 版本过低(' + $script:nodeInfo.Raw + ')') }
+    else { $parts += ('node ' + $script:nodeInfo.Raw) }
   } else {
-    $lblCpuV.Text = '—'
-    $lblMemV.Text = '—'
-    Write-ZhiLog ('采样失败：' + $m.Err)
+    $parts += 'node 未找到'
   }
+  # 内核活着的话，把「已经看了几轮」报出来 —— 这是窗口活着最直观的证据
+  if ($script:kernelDead) { $parts += '内核已停' }
+  elseif ($script:kernelLines -gt 0) { $parts += ('已看 ' + $script:kernelLines + ' 轮') }
+  if ($script:stateText) { $parts += $script:stateText }
+  $lblPos.Text = ($parts -join ' · ')
 }
 
 # 把设置真正作用到窗口上
@@ -602,6 +726,12 @@ $script:nodeExe   = Resolve-NodeExe $NodeExe
 if ($script:nodeExe) { $script:nodeInfo = Get-NodeScore $script:nodeExe }
 else { $script:nodeInfo = [pscustomobject]@{ Raw = 'n/a'; Score = 0 } }
 $script:stateText = ''
+
+# 内核参数（命令行给的，或默认）—— M4-a：这个窗口会自己把内核拉起来
+$script:kernelIntervalMs = 2000
+if ($Interval -gt 0) { $script:kernelIntervalMs = $Interval }
+$script:kernelSustainMs = $SustainMs
+$script:kernelCooldownMs = $CooldownMs
 
 # ── 拖拽 ─────────────────────────────────────────────────────────────────────
 # ⚠️ 这里**刻意不用** SendMessage(WM_NCLBUTTONDOWN) 那套「借系统标题栏拖动」。
@@ -789,9 +919,11 @@ $form.Add_HandleCreated({
   } catch { Report-HandlerError 'handlecreated' $_ }
 })
 
-# 关窗时：如果开了「记住位置」，把当前位置存下来
+# 关窗时：收掉内核 sidecar + 停掉轮询 + 记住位置
 $form.Add_FormClosing({
   try {
+    if ($null -ne $script:metricsTimer) { $script:metricsTimer.Stop() }
+    Stop-Kernel            # ⚠️ 必须收 —— 不然会在后台留一个孤儿的 node 进程
     if ($script:settings.rememberPos -eq 'on') {
       $script:settings.posX = $form.Left
       $script:settings.posY = $form.Top
@@ -804,7 +936,7 @@ $form.Add_FormClosing({
 
 if ($SelfTest) {
   # 只读标志已在脚本开头（$script:settingsReadOnly 处）就设好 —— 不能在这儿设，太晚了
-  Write-Host '=== 只只 M3 浮窗 · 自检 ===' -ForegroundColor Cyan
+  Write-Host '=== 只只 · 最小可用外壳 自检（M4-a）===' -ForegroundColor Cyan
   $waSelf = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
   Write-Host ("屏幕工作区   : " + $waSelf.ToString())
   Write-Host ("设置文件     : " + $script:SETTINGS_PATH + "  (已存在: " + (Test-Path $script:SETTINGS_PATH) + ")")
@@ -853,9 +985,26 @@ if ($SelfTest) {
   }
 
   Write-Host ("控件总数     : " + $form.Controls.Count)
-  $m = Read-Metrics $script:nodeExe
-  Write-Host ("读 cli       : Ok=" + $m.Ok + " Cpu=" + $m.Cpu + " Mem=" + $m.Mem)
-  if (-not $m.Ok) { Write-Host ("               Err=" + $m.Err) -ForegroundColor DarkYellow }
+
+  # ── 内核 sidecar + 长连接读流（M4-a 的**真机制**；不再是一次性采样）──
+  Write-Host ''
+  Write-Host '--- 流式读内核（sidecar + 长连接，M4-a 真机制）---' -ForegroundColor Cyan
+  $script:kernelIntervalMs = 400      # 自检只为快，不代表产品默认值
+  Start-Kernel
+  if ($null -ne $script:kernel) {
+    Write-Host ("  sidecar PID  : " + $script:kernel.Id)
+    $t0 = Get-Date
+    while ($script:kernelLines -lt 3 -and ((Get-Date) - $t0).TotalSeconds -lt 12) {
+      Poll-Kernel
+      Start-Sleep -Milliseconds 120
+    }
+    Write-Host ("  收到采样     : " + $script:kernelLines + " 条（CPU " + $lblCpuV.Text + " / MEM " + $lblMemV.Text + "）")
+    Write-Host ("  只只说的话   : " + $lblSaid.Text)
+    Stop-Kernel
+    Write-Host ("  内核已收掉   : " + ($null -eq $script:kernel))
+  } else {
+    Write-Host '  ⚠️ 内核没起来（详情见日志）' -ForegroundColor Red
+  }
 
   # ── 事件处理器冒烟测试：直接调处理器本体（不弹窗、不写设置）──
   Write-Host ''
@@ -927,7 +1076,17 @@ if ($script:settings.rememberPos -eq 'on' -and $script:settings.posX -ge 0 -and 
 }
 Apply-Settings
 Update-PosLabel
-Update-Metrics
+
+# ───────────── M4-a：窗口自己把内核拉起来，并开始长连接读它的流 ─────────────
+# 轮询跑在 **UI 线程的 Timer** 上（刻意如此，见文件头 ⚠️⚠️）：
+# 不用线程池、不用 add_OutputDataReceived —— 那条路在 PowerShell 里必炸。
+Start-Kernel
+$script:metricsTimer = New-Object System.Windows.Forms.Timer
+$script:metricsTimer.Interval = 200
+$script:metricsTimer.Add_Tick({
+  try { Poll-Kernel } catch { Report-HandlerError 'poll-kernel' $_ }
+})
+$script:metricsTimer.Start()
 
 # ─────────────────────── 渲染检查模式（-RenderCheck）───────────────────────
 # 为什么需要它：-SelfTest **不弹窗 = 不绘制**，因此「画字失败」这类缺陷它抓不到。
@@ -938,7 +1097,9 @@ if ($RenderCheck) {
   $script:renderSize = ''
   $shotPath = Join-Path $script:SCRIPT_DIR 'float-preview.render.png'
   $shotTimer = New-Object System.Windows.Forms.Timer
-  $shotTimer.Interval = 900
+  # 默认 2600ms 是**刻意等够**的：内核默认 2000ms 出第一条采样，等它落进标签里再截图 ——
+  # 否则截到的是一张「—」的空图，看不出渲染对不对。
+  $shotTimer.Interval = $ShotDelayMs
   $shotTimer.Add_Tick({
     $shotTimer.Stop()
     try {
@@ -977,12 +1138,14 @@ if ($RenderCheck) {
   exit 0
 }
 
-Write-Host '=== 只只 · M3 手感验证浮窗 ===' -ForegroundColor Cyan
+Write-Host '=== 只只 · 最小可用外壳（M4-a）===' -ForegroundColor Cyan
 Write-Host ("位置        : " + (Get-PositionLabel $Position) + "   （点「位置」按钮可轮换；开了「记住位置」就记你拖到哪）")
+Write-Host ("内核        : 已作为 sidecar 启动 —— 每 " + $script:kernelIntervalMs + " ms 采一次，数据实时刷到窗口上")
+Write-Host ("只只会说话  : 默认「连续超标 2 分钟」才开口；想快点看到它说话就加 -SustainMs 3000 -CooldownMs 5000")
 Write-Host ("设置        : 点「设置」原地展开；自动存到 " + $script:SETTINGS_PATH)
 Write-Host ("node        : " + $(if ($script:nodeExe) { $script:nodeExe + ' ' + $script:nodeInfo.Raw } else { '未找到' }))
 Write-Host '拖拽        : 按住窗口上方的「只只」文字区域可拖动'
-Write-Host '关闭        : 点右上角 ✕' -ForegroundColor DarkGray
+Write-Host '关闭        : 点右上角 ✕（会顺带把内核子进程收掉）' -ForegroundColor DarkGray
 Write-Host '              ⚠️ 不要在本控制台按 Ctrl+C —— 会停止 PowerShell 管道，' -ForegroundColor Red
 Write-Host '                 之后浮窗点任何按钮都会报 PipelineStoppedException' -ForegroundColor Red
 Write-Host ("出错        : 异常会写进 " + $script:LOG_PATH + "（不弹框、不卡死）")
@@ -994,4 +1157,4 @@ Write-Host '  → 能正常粘贴 = 没抢焦点（WS_EX_NOACTIVATE 生效）' -
 Write-Host ''
 
 [void]$form.ShowDialog()
-Write-Host '只只浮窗已关闭。' -ForegroundColor Cyan
+Write-Host '只只浮窗已关闭（内核 sidecar 也已收掉）。' -ForegroundColor Cyan

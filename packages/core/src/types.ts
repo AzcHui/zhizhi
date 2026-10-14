@@ -124,11 +124,32 @@ export interface Channel {
 
 // ─────────────────────────────── 插件加载 ───────────────────────────────
 
+/**
+ * 插件没起来的三种原因 —— 之所以分开，是因为**处置方式完全不同**：
+ *   missing → 没装 / 装不上     → 该提示用户「去装」
+ *   invalid → 装上了但 manifest 不合规 → 该提示插件作者「去改」
+ *   crashed → 装上了、合规，但加载时炸了 → 该提示插件作者「去修」
+ *
+ * 不分开的话，日志里只剩一句「加载失败」，等于没说。
+ */
+export type PluginFailureKind = 'missing' | 'invalid' | 'crashed';
+
 /** 一次插件加载的结果（registry 产出，供内核如实报告，不静默吞错） */
 export interface LoadOutcome {
+  /** 插件自报的 id；若插件根本没起来，退化为清单里的 specifier */
   readonly id: string;
   readonly type: PluginType;
   readonly status: PluginStatus;
-  /** status === 'failed' 时的原因 */
+  /** status === 'failed' 时的失败分类 */
+  readonly failureKind?: PluginFailureKind;
+  /** status === 'failed' 时的具体原因（给人看的原话） */
   readonly error?: string;
+}
+
+/** 清单里的一条插件声明 */
+export interface PluginSpec {
+  /** 包名（S3 之后这里会换成目录路径） */
+  readonly specifier: string;
+  /** 期望的插件类型 —— 即使插件没起来，也要能如实记账 */
+  readonly type: PluginType;
 }

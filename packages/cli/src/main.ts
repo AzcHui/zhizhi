@@ -1,5 +1,5 @@
 /**
- * 只只 · cli —— 内核的独立入口（M0 的验收入口）
+ * 只只 · cli —— 内核的独立入口（M0 起就是验收入口）
  *
  * 为什么需要它：内核「零 UI 依赖」不是口号 —— 这个文件就是证据。
  * 它今天独立跑在终端里，M4 之后会被 app 作为 sidecar 启动，内核代码一行不改。
@@ -12,6 +12,8 @@
  *   pnpm --filter cli start                 # 常驻，每 5 秒一行 JSON
  *   pnpm --filter cli once                  # 只跑几轮就退出（自动化验收用）
  *   node src/main.ts --interval=1000 --ticks=5 --verbose
+ *
+ * M1 起，插件不再写死在这个文件里 —— 见 `plugins.ts`（清单）与 `loader.ts`（加载器）。
  */
 
 import {
@@ -24,12 +26,10 @@ import {
   createPassThroughGates,
   setLogLevel,
 } from '@zhizhi/core';
-import type { Metric } from '@zhizhi/core';
+import type { Metric, MetricBatch } from '@zhizhi/core';
 
-// 插件：S1「契约先行」= 静态 import（动态加载 S3 才做，等真有第三方需求）
-import probeCpu from '@zhizhi/probe-cpu';
-import probeDisk from '@zhizhi/probe-disk';
-import probeMem from '@zhizhi/probe-mem';
+import { loadPlugins } from './loader.ts';
+import { PLUGINS } from './plugins.ts';
 
 // ─────────────────────────────── 参数 ───────────────────────────────
 
@@ -61,31 +61,39 @@ const bus = new Bus(log.child('bus'));
 const store = new Store();
 const gates = createPassThroughGates();
 const dispatcher = new Dispatcher(log.child('dispatcher'));
-const registry = new Registry(log.child('registry'));
+const registry = new Registry();
 
-// 注意：官方插件也走 registry 这同一条加载路径 —— 铁律②，没有后门
-registry.registerProbe('probe-cpu', () => probeCpu);
-registry.registerProbe('probe-mem', () => probeMem);
-registry.registerProbe('probe-disk', () => probeDisk);
+// ────────────────────── 加载插件：清单驱动 + 如实记账 ──────────────────────
+// 加载动作在这里（而不是 core）执行 —— 原因见 loader.ts 顶部注释（Node 的解析基准是物理位置）
 
-// 失败的插件如实报出来，不静默吞掉 —— M1 的验收点（删掉 probe-cpu 也得能跑）
-for (const outcome of registry.failed()) {
-  log.warn(`插件 ${outcome.id} 未加载：${outcome.error ?? '未知原因'}`);
-}
+log.debug(
+  `清单共 ${PLUGINS.length} 条：${PLUGINS.map((s) => s.specifier).join(', ')}`,
+);
+const outcomes = await loadPlugins(PLUGINS, registry, log.child('loader'));
+const errors = outcomes.filter((o) => o.status === 'failed');
+
+// ─────────────────── 事件总线：让指标经总线流动，而不是各拿各的 ───────────────────
+// 此刻的订阅者只有下面这个汇总器；M2 的 rule 插件会挂到**同一个** 'metric' 上，
+// 到时这一行不用改 —— 这就是「插件之间只走总线」的雏形。
+
+let tickBatches: MetricBatch[] = [];
+bus.on<MetricBatch>('metric', (batch) => {
+  tickBatches.push(batch);
+});
 
 // ─────────────────────────────── 采样编排 ───────────────────────────────
-// 这块编排 M0 先放在 cli（此时只有 cli 一个消费者）；
-// 等 M1/M4 出现第二个消费者时，再下沉到 core，届时 app 直接复用。
+// 编排逻辑仍留在 cli：它是「内核进程的入口」，M4 的 app 连的是这个进程而不是重跑一份。
 
 async function sampleAll(): Promise<Record<string, readonly Metric[]>> {
-  const byProbe: Record<string, readonly Metric[]> = {};
+  tickBatches = [];
 
   for (const probe of registry.probes()) {
     try {
-      byProbe[probe.id] = await probe.sample();
+      const metrics = await probe.sample();
+      // 广播出去 —— 谁想用谁自己订阅（铁律①：插件之间只能走总线）
+      bus.emit<MetricBatch>('metric', { probeId: probe.id, metrics });
     } catch (err) {
       // 一个插件采样炸了，不许影响其他插件，更不许带崩内核
-      byProbe[probe.id] = [];
       log.error(
         `插件 ${probe.id} 采样失败（已隔离，其余插件继续）`,
         err instanceof Error ? err.message : err,
@@ -93,7 +101,7 @@ async function sampleAll(): Promise<Record<string, readonly Metric[]>> {
     }
   }
 
-  return byProbe;
+  return Object.fromEntries(tickBatches.map((b) => [b.probeId, b.metrics]));
 }
 
 // ─────────────────────────────── 主循环 ───────────────────────────────
@@ -123,7 +131,7 @@ const scheduler = new Scheduler(
       probes,
     };
 
-    // ⭐ stdout 只有数据，没有别的 —— 这一行就是 M0 的验收标准
+    // ⭐ stdout 只有数据，没有别的 —— M0 的验收标准，M1 继续守
     process.stdout.write(`${JSON.stringify(report)}\n`);
 
     if (tick >= maxTicks) shutdown(0);
@@ -134,9 +142,18 @@ const scheduler = new Scheduler(
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 
+// ─────────────────────────────── 上线报告 ───────────────────────────────
+
+log.info(`只只已上线 —— 每 ${intervalMs} ms 采一次`);
 log.info(
-  `只只已上线 —— 每 ${intervalMs} ms 采一次 · 插件 ${registry.activeCount} 个（${registry.probeIds().join(', ')}）`,
+  `插件在岗 ${registry.activeCount} / ${PLUGINS.length}：${registry.probeIds().join(', ') || '（无）'}`,
 );
+if (errors.length > 0) {
+  log.warn(`有 ${errors.length} 个插件没起来（明细见上方 loader 日志），内核照常运行`);
+}
+if (registry.activeCount === 0) {
+  log.warn('一个插件都没起来 —— 只只会照常运行，但不会采集任何指标。');
+}
 log.info(
   `内核备件：bus=${bus.topics().length} topic · store=${store.size} 项 · ` +
     `gates=${gates.length} 道 · channels=${dispatcher.channelIds().length} 个`,

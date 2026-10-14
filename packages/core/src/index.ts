@@ -19,7 +19,6 @@ export { GATE_NAMES, createPassThroughGates } from './gates.ts';
 export type { Gate, GateName, GateVerdict, GateContext } from './gates.ts';
 export { Dispatcher } from './dispatcher.ts';
 export { Registry } from './registry.ts';
-export type { ProbeFactory } from './registry.ts';
 
 /** 内核版本 —— 外壳与插件可以据此做兼容判断 */
 export const CORE_VERSION = '0.1.0';

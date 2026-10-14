@@ -6,7 +6,8 @@
   "description": "磁盘空间采集插件（官方插件，与社区插件同等待遇）",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./manifest.json": "./manifest.json"
   },
   "dependencies": {
     "@zhizhi/plugin-sdk": "workspace:*"

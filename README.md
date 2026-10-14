@@ -77,7 +77,7 @@ pnpm typecheck   # 全量类型检查
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1                  # 右下角
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Position TopCenter
-powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest        # 只自检，不弹窗
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest        # 自检（含处理器冒烟），不弹窗
 ```
 
 点浮窗里的按钮，再切到编辑器按 `Ctrl+V` —— **能粘贴 = 没抢焦点**（`WS_EX_NOACTIVATE` 生效）。
@@ -86,3 +86,7 @@ powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest      
 改完**立即生效**，自动存到 `tools/float-preview.settings.json`（已 gitignore），下次打开自动生效。
 
 > ⚠️ 改这个 `.ps1` 时注意：**必须存成 UTF-8 带 BOM**，否则 PS 5.1 按 GBK 读、中文全乱码（详见《环境基线》第六节）。
+
+> ⚠️ **关闭请点浮窗右上角的 ✕。不要在这个控制台里按 `Ctrl+C`** —— 那会停止 PowerShell 管道，
+> 之后浮窗点任何按钮都会报 `PipelineStoppedException`（实测踩过）。真出问题时异常会写进
+> `tools/float-preview.log`，不会再弹致命对话框、也不会卡死。

@@ -25,6 +25,14 @@
 
   设置：点浮窗里的「设置」原地展开，改完立即生效，自动存到
         tools\float-preview.settings.json（下次打开自动生效）
+
+  ⚠️ 关闭请点右上角的 ✕。
+     **不要在本控制台按 Ctrl+C** —— 那会「停止 PowerShell 管道」，此后浮窗的
+     任何一个事件（点击 / 重绘）都会抛 PipelineStoppedException，弹出 .NET 致命
+     对话框，控制台也再回不来。（2026-10-14 实测踩坑，详见《环境基线》第七节）
+
+  出错时：任何未预期的异常都会被兜住 → 写进 tools\float-preview.log，
+          并在浮窗上给出提示。**不会再弹致命对话框，也不会卡死。**
 #>
 
 [CmdletBinding()]
@@ -71,6 +79,66 @@ $script:SCRIPT_DIR    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:REPO_ROOT     = Split-Path -Parent $script:SCRIPT_DIR
 $script:SETTINGS_PATH = Join-Path $script:SCRIPT_DIR 'float-preview.settings.json'
 $script:settingsReadOnly = $false
+
+# ───────────────────── 日志与异常兜底（⭐ M3 踩坑后补）─────────────────────
+# 为什么要有这一套：
+#   PowerShell + WinForms 的特性是「事件处理器里抛出的异常直接冒到消息循环」，
+#   默认行为是弹一个 .NET 致命对话框，窗口与控制台一起僵住。
+#   更狠的是：管道（pipeline）一旦被 Ctrl+C 停止，之后**任何**处理器调用都会
+#   抛 PipelineStoppedException，连 try/catch 都来不及进。
+#   对策三层：① 处理器本体抽成普通函数（好测）② 处理器只剩 try/catch + 调用
+#            ③ 再加一个全局兜底（下面这段）④ 处理器里**一律不写控制台**，只写日志文件
+
+$script:LOG_PATH = Join-Path $script:SCRIPT_DIR 'float-preview.log'
+$script:lastError = ''
+$script:paintErrorLogged = $false
+
+function Write-ZhiLog([string]$msg) {
+  try {
+    $line = '[' + [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff') + '] ' + $msg + "`r`n"
+    [System.IO.File]::AppendAllText($script:LOG_PATH, $line, (New-Object System.Text.UTF8Encoding($true)))
+  } catch {
+    # 连日志都写不了就算了 —— 绝不因为它再抛一次
+  }
+}
+
+# 在浮窗上留个显眼但不挡路的痕迹（项目原则：不静默吞错）
+function Show-ErrorHint([string]$text) {
+  try {
+    if ($lblPos) {
+      $lblPos.Text = '⚠ ' + $text
+      $lblPos.ForeColor = [System.Drawing.Color]::FromArgb(255, 190, 60, 60)
+    }
+  } catch { }
+}
+
+function Report-HandlerError([string]$where, $err) {
+  try {
+    $ex = $err.Exception
+    $script:lastError = $where + ' -> ' + $ex.GetType().FullName + ' | ' + $ex.Message
+    Write-ZhiLog ('[ERR] ' + $script:lastError)
+    if ($err.ScriptStackTrace) {
+      Write-ZhiLog ('      script: ' + ($err.ScriptStackTrace -replace "`r?`n", ' | '))
+    }
+    if ($ex.StackTrace) {
+      Write-ZhiLog ('      .net  : ' + ($ex.StackTrace -replace "`r?`n", ' | '))
+    }
+    Show-ErrorHint ($where + ' 出错，详情见 float-preview.log')
+  } catch { }
+}
+
+# 全局兜底：UI 线程上逃出来的异常 → 记日志 + 提示，**不再弹致命对话框**
+try {
+  [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+  [System.Windows.Forms.Application]::add_ThreadException({
+    param($s, $e)
+    Report-HandlerError 'Application.ThreadException（全局兜底）' $e
+  })
+  Write-ZhiLog ''
+  Write-ZhiLog '===== float-preview 启动 ====='
+} catch {
+  Write-Host ('[只只] 全局异常兜底注册失败：' + $_.Exception.Message) -ForegroundColor DarkYellow
+}
 
 # ─────────────────────────────── 配色（浅色主题）───────────────────────────────
 
@@ -131,8 +199,9 @@ function Save-Settings {
   if ($script:settingsReadOnly) { return }
   try {
     $script:settings | ConvertTo-Json | Set-Content -Path $script:SETTINGS_PATH -Encoding UTF8
+    Write-ZhiLog ('设置已保存：' + $script:SETTINGS_PATH)
   } catch {
-    Write-Host ("[只只] 设置存不下：" + $_.Exception.Message) -ForegroundColor DarkYellow
+    Write-ZhiLog ('[ERR] 设置存不下：' + $_.Exception.Message)
   }
 }
 
@@ -478,7 +547,7 @@ function Update-Metrics {
   } else {
     $lblCpuV.Text = '—'
     $lblMemV.Text = '—'
-    Write-Host ("[只只] 采样失败：" + $m.Err) -ForegroundColor DarkYellow
+    Write-ZhiLog ('采样失败：' + $m.Err)
   }
 }
 
@@ -499,103 +568,201 @@ if ($script:nodeExe) { $script:nodeInfo = Get-NodeScore $script:nodeExe }
 else { $script:nodeInfo = [pscustomobject]@{ Raw = 'n/a'; Score = 0 } }
 $script:stateText = ''
 
-# 拖拽：借用原生标题栏拖动，位置随手指走
-$dragHandler = {
-  [void][ZhizhiWin32]::ReleaseCapture()
-  [void][ZhizhiWin32]::SendMessage($form.Handle, 0xA1, 0x2, 0)
+# ── 拖拽 ─────────────────────────────────────────────────────────────────────
+# ⚠️ 这里**刻意不用** SendMessage(WM_NCLBUTTONDOWN) 那套「借系统标题栏拖动」。
+#    它会在处理器内部再开一个模态消息循环 —— 等于在 PowerShell 委托里再抽一次消息，
+#    是「处理器重入」的高风险点（M3 踩坑，见《环境基线》第七节）。
+#    改成纯手工拖：按下时记「光标位置 + 窗口位置」，移动时算差值。零重入、零 Win32。
+#    （user32 那两个 P/Invoke 就留着当备件，不再从处理器里调用。）
+$script:dragOrigin = $null
+
+function Start-Drag([int]$cx, [int]$cy) {
+  $script:dragOrigin = @{ CX = $cx; CY = $cy; WX = $form.Left; WY = $form.Top }
 }
-$form.Add_MouseDown($dragHandler)
-$lblTitle.Add_MouseDown($dragHandler)
-$lblPos.Add_MouseDown($dragHandler)
 
-$btnClose.Add_Click({ $form.Close() })
+function Move-Drag([int]$cx, [int]$cy) {
+  if ($null -eq $script:dragOrigin) { return $false }
+  $x = $script:dragOrigin.WX + ($cx - $script:dragOrigin.CX)
+  $y = $script:dragOrigin.WY + ($cy - $script:dragOrigin.CY)
+  $form.Location = New-Object System.Drawing.Point($x, $y)
+  return $true
+}
 
-$btnSay.Add_Click({
-  $script:stateText = '（以后这里展开详情）'
+function End-Drag {
+  $script:dragOrigin = $null
+}
+
+# ── 处理器本体：全部抽成普通函数 ─────────────────────────────────────────────
+# 好处：① 处理器只剩「try/catch + 调函数」，异常无处可逃
+#       ② 自检（-SelfTest）可以直接调这些函数，不必真去点按钮
+
+function Set-StatusText([string]$text) {
+  $script:stateText = $text
   Update-PosLabel
-})
+}
 
-$btnQuiet.Add_Click({
-  $script:stateText = '（以后这里是静音/降频）'
-  Update-PosLabel
-})
-
-$btnPos.Add_Click({
+function Move-NextPosition {
   $order = @('BottomRight', 'TopCenter', 'Taskbar')
-  $i = $order.IndexOf($Position)
+  $i = -1
+  for ($n = 0; $n -lt $order.Count; $n++) {
+    if ($order[$n] -eq [string]$script:Position) { $i = $n }
+  }
   $next = $order[($i + 1) % $order.Count]
   $script:Position = $next
   [void](Move-ToPreset $next)
   Update-PosLabel
-})
+  return $next
+}
 
-$btnSet.Add_Click({
+function Toggle-Panel {
   $script:panelOpen = -not $script:panelOpen
   if ($script:panelOpen) { $btnSet.Text = '收起' } else { $btnSet.Text = '设置' }
   Set-Layout
   Refresh-Toggles
   Keep-OnScreen
   $form.Invalidate()
+  return $script:panelOpen
+}
+
+function Set-SettingOption([string]$name, [string]$value) {
+  $script:settings.$name = $value
+  # 打开「记住位置」时，立刻把当前位置记下来
+  if ($name -eq 'rememberPos' -and $value -eq 'on') {
+    $script:settings.posX = $form.Left
+    $script:settings.posY = $form.Top
+  }
+  Apply-Settings
+  Update-PosLabel
+  Save-Settings
+  Write-ZhiLog ('设置变更：' + $name + ' = ' + $value)
+}
+
+# ── 把事件挂上去（处理器只做两件事：调函数、兜异常）──────────────────────────
+
+$dragTargets = @($form, $lblTitle, $lblPos)
+foreach ($c in $dragTargets) {
+  $c.Add_MouseDown({
+    param($s, $e)
+    try {
+      $p = [System.Windows.Forms.Cursor]::Position
+      Start-Drag $p.X $p.Y
+      $form.Capture = $true
+    } catch { Report-HandlerError 'mousedown' $_ }
+  })
+  $c.Add_MouseMove({
+    param($s, $e)
+    try {
+      $p = [System.Windows.Forms.Cursor]::Position
+      [void](Move-Drag $p.X $p.Y)
+    } catch { Report-HandlerError 'mousemove' $_ }
+  })
+  $c.Add_MouseUp({
+    param($s, $e)
+    try {
+      End-Drag
+      $form.Capture = $false
+    } catch { Report-HandlerError 'mouseup' $_ }
+  })
+}
+
+$btnClose.Add_Click({
+  try {
+    Write-ZhiLog '点击 ✕ → 关闭'
+    $form.Close()
+  } catch { Report-HandlerError 'click:关闭' $_ }
+})
+
+$btnSay.Add_Click({
+  try {
+    Set-StatusText '（以后这里展开详情）'
+    Write-ZhiLog '点击 说说'
+  } catch { Report-HandlerError 'click:说说' $_ }
+})
+
+$btnQuiet.Add_Click({
+  try {
+    Set-StatusText '（以后这里是静音/降频）'
+    Write-ZhiLog '点击 安静'
+  } catch { Report-HandlerError 'click:安静' $_ }
+})
+
+$btnPos.Add_Click({
+  try {
+    $next = Move-NextPosition
+    Write-ZhiLog ('点击 位置 → ' + $next)
+  } catch { Report-HandlerError 'click:位置' $_ }
+})
+
+$btnSet.Add_Click({
+  try {
+    $open = Toggle-Panel
+    if ($open) { Write-ZhiLog '点击 设置 → 展开' } else { Write-ZhiLog '点击 设置 → 收起' }
+  } catch { Report-HandlerError 'click:设置' $_ }
 })
 
 # 设置项：一处处理全部切换按钮
 foreach ($b in $script:toggleButtons) {
   $b.Add_Click({
     param($s, $e)
-    $parts = $s.Tag -split '\|'
-    $name = $parts[0]
-    $script:settings.$name = $parts[1]
-    # 打开「记住位置」时，立刻把当前位置记下来
-    if ($name -eq 'rememberPos' -and $parts[1] -eq 'on') {
-      $script:settings.posX = $form.Left
-      $script:settings.posY = $form.Top
-    }
-    Apply-Settings
-    Update-PosLabel
-    Save-Settings
+    try {
+      $parts = $s.Tag -split '\|'
+      Set-SettingOption $parts[0] $parts[1]
+    } catch { Report-HandlerError 'click:设置项' $_ }
   })
 }
 
 # 边框（圆角描边）+ 设置面板上方的分隔线
 $form.Add_Paint({
   param($s, $e)
-  $pen = New-Object System.Drawing.Pen($cLine, 1)
-  $g = $e.Graphics
-  $g.SmoothingMode = 'AntiAlias'
-  $cw = $s.ClientSize.Width
-  $ch = $s.ClientSize.Height
-  $rr = [int][Math]::Round(14 * $script:k)
-  if ($rr -gt 1) {
-    $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $gp.AddArc(0.5, 0.5, $rr * 2, $rr * 2, 180, 90)
-    $gp.AddArc($cw - $rr * 2 - 0.5, 0.5, $rr * 2, $rr * 2, 270, 90)
-    $gp.AddArc($cw - $rr * 2 - 0.5, $ch - $rr * 2 - 0.5, $rr * 2, $rr * 2, 0, 90)
-    $gp.AddArc(0.5, $ch - $rr * 2 - 0.5, $rr * 2, $rr * 2, 90, 90)
-    $gp.CloseFigure()
-    $g.DrawPath($pen, $gp)
-    $gp.Dispose()
+  try {
+    $pen = New-Object System.Drawing.Pen($cLine, 1)
+    $g = $e.Graphics
+    $g.SmoothingMode = 'AntiAlias'
+    $cw = $s.ClientSize.Width
+    $ch = $s.ClientSize.Height
+    $rr = [int][Math]::Round(14 * $script:k)
+    if ($rr -gt 1) {
+      $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+      $gp.AddArc(0.5, 0.5, $rr * 2, $rr * 2, 180, 90)
+      $gp.AddArc($cw - $rr * 2 - 0.5, 0.5, $rr * 2, $rr * 2, 270, 90)
+      $gp.AddArc($cw - $rr * 2 - 0.5, $ch - $rr * 2 - 0.5, $rr * 2, $rr * 2, 0, 90)
+      $gp.AddArc(0.5, $ch - $rr * 2 - 0.5, $rr * 2, $rr * 2, 90, 90)
+      $gp.CloseFigure()
+      $g.DrawPath($pen, $gp)
+      $gp.Dispose()
+    }
+    if ($script:panelOpen) {
+      $sy = $script:mainH
+      $x1 = [int][Math]::Round(16 * $script:k)
+      $g.DrawLine($pen, $x1, $sy, $cw - $x1, $sy)
+    }
+    $pen.Dispose()
+  } catch {
+    # Paint 出错会被反复触发，只记一次，免得日志被刷爆
+    if (-not $script:paintErrorLogged) {
+      $script:paintErrorLogged = $true
+      Report-HandlerError 'paint' $_
+    }
   }
-  if ($script:panelOpen) {
-    $sy = $script:mainH
-    $x1 = [int][Math]::Round(16 * $script:k)
-    $g.DrawLine($pen, $x1, $sy, $cw - $x1, $sy)
-  }
-  $pen.Dispose()
 })
 
 # 句柄一建出来就上扩展样式
 $form.Add_HandleCreated({
   param($s, $e)
-  [void](Apply-ExStyles $s.Handle)
+  try {
+    [void](Apply-ExStyles $s.Handle)
+  } catch { Report-HandlerError 'handlecreated' $_ }
 })
 
 # 关窗时：如果开了「记住位置」，把当前位置存下来
 $form.Add_FormClosing({
-  if ($script:settings.rememberPos -eq 'on') {
-    $script:settings.posX = $form.Left
-    $script:settings.posY = $form.Top
-  }
-  Save-Settings
+  try {
+    if ($script:settings.rememberPos -eq 'on') {
+      $script:settings.posX = $form.Left
+      $script:settings.posY = $form.Top
+    }
+    Save-Settings
+  } catch { Report-HandlerError 'formclosing' $_ }
 })
 
 # ─────────────────────────────── 自检模式 ───────────────────────────────
@@ -654,6 +821,60 @@ if ($SelfTest) {
   $m = Read-Metrics $script:nodeExe
   Write-Host ("读 cli       : Ok=" + $m.Ok + " Cpu=" + $m.Cpu + " Mem=" + $m.Mem)
   if (-not $m.Ok) { Write-Host ("               Err=" + $m.Err) -ForegroundColor DarkYellow }
+
+  # ── 事件处理器冒烟测试：直接调处理器本体（不弹窗、不写设置）──
+  Write-Host ''
+  Write-Host '--- 事件处理器冒烟测试（直接调函数，不弹窗）---' -ForegroundColor Cyan
+  function Test-Step([string]$label, [scriptblock]$body) {
+    try {
+      $r = & $body
+      Write-Host ("  OK    {0,-24} {1}" -f $label, $r)
+    } catch {
+      Write-Host ("  THREW {0,-24} {1}" -f $label, $_.Exception.Message) -ForegroundColor Red
+    }
+  }
+
+  Test-Step 'Toggle-Panel 展开' { Toggle-Panel }
+  Test-Step 'Toggle-Panel 收起' { Toggle-Panel }
+
+  $keepSize = $script:settings.size
+  Test-Step '设置项 尺寸=lg' { Set-SettingOption 'size' 'lg'; ('' + $form.ClientSize.Width + 'x' + $form.ClientSize.Height) }
+  Test-Step '设置项 尺寸=sm' { Set-SettingOption 'size' 'sm'; ('' + $form.ClientSize.Width + 'x' + $form.ClientSize.Height) }
+  $script:settings.size = $keepSize
+  Set-Layout
+  Refresh-Toggles
+
+  Test-Step '设置项 置顶=off' {
+    Set-SettingOption 'topmost' 'off'
+    $ex = [ZhizhiWin32]::GetWindowLong($form.Handle, $script:GWL_EXSTYLE)
+    ('EXSTYLE TOP=' + [bool]($ex -band $script:WS_EX_TOPMOST))
+  }
+  Test-Step '设置项 置顶=on' {
+    Set-SettingOption 'topmost' 'on'
+    $ex = [ZhizhiWin32]::GetWindowLong($form.Handle, $script:GWL_EXSTYLE)
+    ('EXSTYLE TOP=' + [bool]($ex -band $script:WS_EX_TOPMOST))
+  }
+
+  Test-Step '位置轮换' {
+    $before = [string]$script:Position
+    $after = Move-NextPosition
+    ($before + ' -> ' + $after)
+  }
+
+  Test-Step '拖拽模拟 (+120,+90)' {
+    $l0 = $form.Location
+    Start-Drag 500 500
+    [void](Move-Drag 620 590)
+    End-Drag
+    $l1 = $form.Location
+    ('(' + $l0.X + ',' + $l0.Y + ') -> (' + $l1.X + ',' + $l1.Y + ')  delta=(' + ($l1.X - $l0.X) + ',' + ($l1.Y - $l0.Y) + ')')
+  }
+
+  Test-Step 'Set-StatusText' { Set-StatusText '（自检）'; $script:stateText }
+
+  Write-Host ("  处理器错误累计 : '" + $script:lastError + "'  （应为空）")
+  Write-Host ("  日志文件       : " + $script:LOG_PATH)
+
   $form.Dispose()
   Write-Host '=== 自检结束（未弹窗、未写设置文件）===' -ForegroundColor Cyan
   exit 0
@@ -678,7 +899,10 @@ Write-Host ("位置        : " + (Get-PositionLabel $Position) + "   （点「�
 Write-Host ("设置        : 点「设置」原地展开；自动存到 " + $script:SETTINGS_PATH)
 Write-Host ("node        : " + $(if ($script:nodeExe) { $script:nodeExe + ' ' + $script:nodeInfo.Raw } else { '未找到' }))
 Write-Host '拖拽        : 按住窗口上方的「只只」文字区域可拖动'
-Write-Host '关闭        : 点右上角 ✕，或在本控制台按 Ctrl+C' -ForegroundColor DarkGray
+Write-Host '关闭        : 点右上角 ✕' -ForegroundColor DarkGray
+Write-Host '              ⚠️ 不要在本控制台按 Ctrl+C —— 会停止 PowerShell 管道，' -ForegroundColor Red
+Write-Host '                 之后浮窗点任何按钮都会报 PipelineStoppedException' -ForegroundColor Red
+Write-Host ("出错        : 异常会写进 " + $script:LOG_PATH + "（不弹框、不卡死）")
 Write-Host ''
 Write-Host '★ 硬指标验收（请真的做一次）：' -ForegroundColor Yellow
 Write-Host '  1. 点一下浮窗里的任意按钮' -ForegroundColor Yellow

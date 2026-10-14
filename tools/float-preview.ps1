@@ -82,7 +82,13 @@ $script:WS_EX_TOOLWINDOW = 0x00000080
 $script:SCRIPT_DIR    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:REPO_ROOT     = Split-Path -Parent $script:SCRIPT_DIR
 $script:SETTINGS_PATH = Join-Path $script:SCRIPT_DIR 'float-preview.settings.json'
-$script:settingsReadOnly = $false
+
+# ⚠️ ⚠️ 「只读」必须在这里就定下来，**不能等到 SelfTest / RenderCheck 的代码块里再设**。
+#     因为「读存档位置 + Apply-Settings」跑在那两个分支**之前**（约 913–919 行）；
+#     若 rememberPos=on，Move-ToPreset 会调 Save-Settings → **改写用户设置**。
+#     （2026-10-14 复验实测：-RenderCheck 会把 settings.json 的 LastWriteTime 推后 → 已修）
+#     => 原则：**验收模式绝不污染用户状态。**
+$script:settingsReadOnly = [bool]($SelfTest -or $RenderCheck)
 
 # ───────────────────── 日志与异常兜底（⭐ M3 踩坑后补）─────────────────────
 # 为什么要有这一套：
@@ -230,8 +236,11 @@ function New-RoundRegion([int]$rw, [int]$rh, [int]$rr) {
 }
 
 function Apply-ExStyles([IntPtr]$handle) {
+  # ⚠️ 这里**刻意不 OR `WS_EX_TOPMOST`** —— 窗口尚未显示时系统会把该位剥掉
+  #    （实测 EXSTYLE 里没有 0x8），所以它既无效、又容易让人误以为「置顶是这儿设的」。
+  #    **置顶一律走 `Form.TopMost` 属性**（见 Apply-Settings）。
   $before = [ZhizhiWin32]::GetWindowLong($handle, $script:GWL_EXSTYLE)
-  $want   = $before -bor $script:WS_EX_NOACTIVATE -bor $script:WS_EX_TOPMOST -bor $script:WS_EX_TOOLWINDOW
+  $want   = $before -bor $script:WS_EX_NOACTIVATE -bor $script:WS_EX_TOOLWINDOW
   [void][ZhizhiWin32]::SetWindowLong($handle, $script:GWL_EXSTYLE, $want)
   $after  = [ZhizhiWin32]::GetWindowLong($handle, $script:GWL_EXSTYLE)
   return [pscustomobject]@{ Before = $before; After = $after }
@@ -794,7 +803,7 @@ $form.Add_FormClosing({
 # ─────────────────────────────── 自检模式 ───────────────────────────────
 
 if ($SelfTest) {
-  $script:settingsReadOnly = $true   # ⚠️ 自检绝不写设置文件
+  # 只读标志已在脚本开头（$script:settingsReadOnly 处）就设好 —— 不能在这儿设，太晚了
   Write-Host '=== 只只 M3 浮窗 · 自检 ===' -ForegroundColor Cyan
   $waSelf = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
   Write-Host ("屏幕工作区   : " + $waSelf.ToString())
@@ -924,7 +933,7 @@ Update-Metrics
 # 为什么需要它：-SelfTest **不弹窗 = 不绘制**，因此「画字失败」这类缺陷它抓不到。
 # 2026-10-14 的「满屏红叉」正是这么漏过去的 —— 补一个真开窗、只数错的回归模式。
 if ($RenderCheck) {
-  $script:settingsReadOnly = $true            # 渲染检查不写用户设置
+  # 只读标志已在脚本开头设好（不能在这儿设 —— 太晚，那时设置可能已经被写过了）
   $script:renderErrors = -1
   $script:renderSize = ''
   $shotPath = Join-Path $script:SCRIPT_DIR 'float-preview.render.png'

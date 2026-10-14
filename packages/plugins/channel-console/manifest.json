@@ -1,0 +1,15 @@
+{
+  "id": "channel-console",
+  "name": "控制台通道",
+  "version": "0.1.0",
+  "type": "channel",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "承载 info / warn 的弱提醒通道，输出一行 JSON 到 stdout。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

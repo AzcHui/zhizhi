@@ -1,0 +1,15 @@
+{
+  "id": "channel-alert",
+  "name": "告警通道",
+  "version": "0.1.0",
+  "type": "channel",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "只承载 critical 的强提醒通道（将来升级为 Windows Toast）。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

@@ -61,6 +61,13 @@ export interface ZhizhiEvent {
   readonly metrics: readonly Metric[];
   /** 首次触发时刻（epoch ms） */
   readonly ts: number;
+  /**
+   * 客观描述（由 rule 生成，会带上具体数值，如「内存占用偏高：mem.usage 87.3%（阈值 >85）」）。
+   *
+   * 它**不是**台词 —— 人格化的说法是 persona 的活儿。
+   * 内核在没有 persona 插件时用它兜底，装了 persona 之后就会被台词覆盖。
+   */
+  readonly summary?: string;
   /** 已被闸门压掉的次数（M2 冷却期用） */
   readonly suppressed?: number;
 }
@@ -72,13 +79,16 @@ export interface Line {
   readonly mood?: string;
 }
 
-/** 一条要发出去的消息（dispatcher 决定它走哪个通道） */
+/**
+ * 一条要发出去的消息。
+ *
+ * ⚠️ 这里**故意没有** `channel` 字段：走哪个通道是内核 dispatcher 的裁决，
+ *    不是调用方（更不是插件）能自己选的事 —— 否则「分通道」这条纪律就形同虚设。
+ */
 export interface OutgoingMessage {
   readonly eventId: string;
   readonly text: string;
   readonly severity: Severity;
-  /** 选定的通道 id：bubble / toast / tray */
-  readonly channel: string;
 }
 
 /**
@@ -101,10 +111,16 @@ export interface Probe {
   sample(): readonly Metric[] | Promise<readonly Metric[]>;
 }
 
-/** rule（判断规则）：消费指标 → 产生事件 */
+/**
+ * rule（判断规则）：消费指标 → 产生事件。
+ *
+ * ⚠️ 判定是**同步**的：它本质是纯计算（读指标、比阈值），没有 IO。
+ *    让判定变成异步，会把事件顺序和闸门的状态搞成竞态 —— 那是自找的麻烦。
+ *    （采集器 probe 之所以是异步的，是因为它要真的去读系统状态。）
+ */
 export interface Rule {
   readonly id: string;
-  evaluate(batch: MetricBatch): readonly ZhizhiEvent[] | Promise<readonly ZhizhiEvent[]>;
+  evaluate(batch: MetricBatch): readonly ZhizhiEvent[];
 }
 
 /** persona（台词包）：事件 + 情境 → 台词 */

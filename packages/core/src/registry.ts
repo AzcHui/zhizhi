@@ -18,10 +18,12 @@
  *     内核只管如实记账，日志全部由 loader 出。
  */
 
-import type { LoadOutcome, PluginFailureKind, PluginType, Probe } from './types.ts';
+import type { Channel, LoadOutcome, PluginFailureKind, PluginType, Probe, Rule } from './types.ts';
 
 export class Registry {
   readonly #probes = new Map<string, Probe>();
+  readonly #rules = new Map<string, Rule>();
+  readonly #channels = new Map<string, Channel>();
   readonly #outcomes: LoadOutcome[] = [];
 
   /** 登记一个已经加载就绪的 probe */
@@ -32,13 +34,29 @@ export class Registry {
     return outcome;
   }
 
+  /** 登记一个已经加载就绪的 rule（判断规则） */
+  adoptRule(id: string, rule: Rule): LoadOutcome {
+    this.#rules.set(id, rule);
+    const outcome: LoadOutcome = { id, type: 'rule', status: 'active' };
+    this.#outcomes.push(outcome);
+    return outcome;
+  }
+
+  /** 登记一个已经加载就绪的 channel（通道） */
+  adoptChannel(id: string, channel: Channel): LoadOutcome {
+    this.#channels.set(id, channel);
+    const outcome: LoadOutcome = { id, type: 'channel', status: 'active' };
+    this.#outcomes.push(outcome);
+    return outcome;
+  }
+
   /**
    * 登记一个**没起来**的插件 —— 如实记下是哪一类原因，绝不静默吞掉。
    *
    * 为什么这里要显式传 type：插件既然没起来，就没法自报身份，
    * 只能相信清单里声明的期望类型（见 `PluginSpec`）。
    */
-  rejectProbe(id: string, type: PluginType, kind: PluginFailureKind, reason: string): LoadOutcome {
+  reject(id: string, type: PluginType, kind: PluginFailureKind, reason: string): LoadOutcome {
     const outcome: LoadOutcome = {
       id,
       type,
@@ -62,6 +80,27 @@ export class Registry {
     return [...this.#probes.keys()];
   }
 
+  rules(): readonly Rule[] {
+    return [...this.#rules.values()];
+  }
+
+  ruleIds(): string[] {
+    return [...this.#rules.keys()];
+  }
+
+  channels(): readonly Channel[] {
+    return [...this.#channels.values()];
+  }
+
+  channelIds(): string[] {
+    return [...this.#channels.keys()];
+  }
+
+  /** 这个 id 是否已被任何类型的插件占用（加载器用来查重名冲突） */
+  hasPlugin(id: string): boolean {
+    return this.#probes.has(id) || this.#rules.has(id) || this.#channels.has(id);
+  }
+
   /** 账本全貌（含没起来的那些） */
   outcomes(): readonly LoadOutcome[] {
     return this.#outcomes;
@@ -72,7 +111,13 @@ export class Registry {
     return this.#outcomes.filter((o) => o.status === 'failed');
   }
 
+  /** 在岗插件的全部 id（三类合并）—— 上线报告用 */
+  activeIds(): string[] {
+    return [...this.#probes.keys(), ...this.#rules.keys(), ...this.#channels.keys()];
+  }
+
+  /** 在岗插件总数（probe + rule + channel 相加） */
   get activeCount(): number {
-    return this.#probes.size;
+    return this.#probes.size + this.#rules.size + this.#channels.size;
   }
 }

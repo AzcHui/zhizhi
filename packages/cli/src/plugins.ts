@@ -15,7 +15,13 @@
 import type { PluginSpec } from '@zhizhi/core';
 
 export const PLUGINS: readonly PluginSpec[] = [
+  // 采集：只说「机器怎么了」
   { specifier: '@zhizhi/probe-cpu', type: 'probe' },
   { specifier: '@zhizhi/probe-mem', type: 'probe' },
   { specifier: '@zhizhi/probe-disk', type: 'probe' },
+  // 判断：把指标翻译成「值得说一句」的候选事件
+  { specifier: '@zhizhi/rule-threshold', type: 'rule' },
+  // 通道：弱提醒（info/warn）与强告警（critical）分开走 —— 分通道原则
+  { specifier: '@zhizhi/channel-console', type: 'channel' },
+  { specifier: '@zhizhi/channel-alert', type: 'channel' },
 ];

@@ -1,0 +1,15 @@
+{
+  "name": "@zhizhi/rule-threshold",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "阈值判断规则（官方插件，与社区插件同等待遇）",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./manifest.json": "./manifest.json"
+  },
+  "dependencies": {
+    "@zhizhi/plugin-sdk": "workspace:*"
+  }
+}

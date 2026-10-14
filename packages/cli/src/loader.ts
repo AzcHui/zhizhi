@@ -18,13 +18,23 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import type { LoadOutcome, Logger, PluginFailureKind, PluginSpec, Registry } from '@zhizhi/core';
+import type {
+  Channel,
+  LoadOutcome,
+  Logger,
+  PluginFailureKind,
+  PluginSpec,
+  PluginType,
+  Probe,
+  Registry,
+  Rule,
+} from '@zhizhi/core';
 import { validateManifest } from '@zhizhi/plugin-sdk';
-import type { PluginManifest, Probe } from '@zhizhi/plugin-sdk';
+import type { PluginManifest } from '@zhizhi/plugin-sdk';
 
-/** 插件模块对外的形状：默认导出一个 probe */
-interface ProbeModule {
-  default?: Probe;
+/** 插件模块对外的形状：默认导出该插件的实例 */
+interface PluginModule {
+  default?: unknown;
 }
 
 /** 从错误里尽量抠出「错误码 + 原话」，让日志能自证 */
@@ -79,7 +89,7 @@ async function loadOne(spec: PluginSpec, registry: Registry, log: Logger): Promi
         ? `插件缺失：${specifier} —— 清单里声明了它，但装不上。内核继续运行，跳过该插件。（${reason}）`
         : `插件 manifest 读不到或不合法：${specifier} —— ${reason}`,
     );
-    return registry.rejectProbe(specifier, type, kind, reason);
+    return registry.reject(specifier, type, kind, reason);
   }
 
   // ── 第 2 步：校验 manifest 合规性（权限声明默认全禁，这里是唯一入口）──
@@ -87,43 +97,87 @@ async function loadOne(spec: PluginSpec, registry: Registry, log: Logger): Promi
   if (issues.length > 0) {
     const reason = issues.map((i) => `${i.field}: ${i.message}`).join('；');
     log.error(`插件不合规：${specifier} —— ${reason}`);
-    return registry.rejectProbe(specifier, type, 'invalid', reason);
+    return registry.reject(specifier, type, 'invalid', reason);
   }
 
   const manifest = rawManifest as PluginManifest;
 
   // ── 第 3 步：id 冲突检查（宁可拒绝，也不静默覆盖别人的账）──
-  if (registry.probe(manifest.id) !== undefined) {
+  if (registry.hasPlugin(manifest.id)) {
     const reason = `插件 id 冲突：${manifest.id} 已被注册，说明 ${specifier} 与它重名`;
     log.error(`插件不合规：${specifier} —— ${reason}`);
-    return registry.rejectProbe(specifier, type, 'invalid', reason);
+    return registry.reject(specifier, type, 'invalid', reason);
   }
 
   // ── 第 4 步：动态加载模块（模块顶层抛错也会在这里被拦住）──
-  let mod: ProbeModule;
+  let mod: PluginModule;
   try {
-    mod = (await import(specifier)) as ProbeModule;
+    mod = (await import(specifier)) as PluginModule;
   } catch (err) {
     const reason = describe(err);
     log.error(`插件加载出错：${specifier} —— 已隔离，内核继续运行。（${reason}）`);
-    return registry.rejectProbe(specifier, type, 'crashed', reason);
+    return registry.reject(specifier, type, 'crashed', reason);
   }
 
-  // ── 第 5 步：确认它真的是个 probe ──
-  const probe = mod.default;
-  if (probe === undefined || typeof probe.sample !== 'function') {
-    const reason = '模块没有 default 导出，或它不是合法的 probe（缺少 sample()）';
-    log.error(`插件不合规：${specifier} —— ${reason}`);
-    return registry.rejectProbe(specifier, type, 'invalid', reason);
+  // ── 第 5 步：确认它真的是清单声明的那种插件 ──
+  const instance = mod.default as Record<string, unknown> | undefined;
+  const mismatch = mismatchReason(manifest.type, instance);
+  if (mismatch !== undefined) {
+    log.error(`插件不合规：${specifier} —— ${mismatch}`);
+    return registry.reject(specifier, type, 'invalid', mismatch);
   }
 
-  if (probe.id !== manifest.id) {
+  const selfId = (instance as { id?: unknown })['id'];
+  if (typeof selfId === 'string' && selfId !== manifest.id) {
     log.warn(
-      `插件 ${specifier} 的自报 id（${probe.id}）与 manifest（${manifest.id}）不一致，以 manifest 为准`,
+      `插件 ${specifier} 的自报 id（${selfId}）与 manifest（${manifest.id}）不一致，以 manifest 为准`,
     );
   }
 
-  // ── 第 6 步：登记入账 ──
-  log.info(`插件已激活：${manifest.id}（${manifest.name} v${manifest.version}）`);
-  return registry.adoptProbe(manifest.id, probe);
+  // ── 第 6 步：按声明的类型登记入账 ──
+  log.info(`插件已激活：${manifest.id}（${manifest.name} v${manifest.version}，${manifest.type}）`);
+  return adoptInstance(registry, manifest, instance as Record<string, unknown>);
+}
+
+/** 模块形状对不对 —— 返回 undefined 表示匹配，返回字符串说明哪里不对 */
+function mismatchReason(
+  type: PluginType,
+  instance: Record<string, unknown> | undefined,
+): string | undefined {
+  if (instance === undefined || instance === null || typeof instance !== 'object') {
+    return '模块没有 default 导出，或导出的不是对象';
+  }
+  switch (type) {
+    case 'probe':
+      return typeof instance['sample'] === 'function' ? undefined : 'probe 必须提供 sample()';
+    case 'rule':
+      return typeof instance['evaluate'] === 'function' ? undefined : 'rule 必须提供 evaluate()';
+    case 'channel':
+      if (typeof instance['send'] !== 'function') return 'channel 必须提供 send()';
+      if (!Array.isArray(instance['sends']) || instance['sends'].length === 0) {
+        return 'channel 必须在 sends 里声明至少一个严重度';
+      }
+      return undefined;
+    default:
+      return `M2 还不支持 ${type} 类型的插件（persona / action / view 留给后续里程碑）`;
+  }
+}
+
+/** 按 manifest 声明的类型，把实例登记进对应的账本 */
+function adoptInstance(
+  registry: Registry,
+  manifest: PluginManifest,
+  instance: Record<string, unknown>,
+): LoadOutcome {
+  switch (manifest.type) {
+    case 'probe':
+      return registry.adoptProbe(manifest.id, instance as unknown as Probe);
+    case 'rule':
+      return registry.adoptRule(manifest.id, instance as unknown as Rule);
+    case 'channel':
+      return registry.adoptChannel(manifest.id, instance as unknown as Channel);
+    default:
+      // mismatchReason 已经拦过不支持的类型，这里纯属兜底
+      return registry.reject(manifest.id, manifest.type, 'invalid', `${manifest.type} 类型尚未支持`);
+  }
 }

@@ -17,6 +17,12 @@ importers:
 
   packages/cli:
     dependencies:
+      '@zhizhi/channel-alert':
+        specifier: workspace:*
+        version: link:../plugins/channel-alert
+      '@zhizhi/channel-console':
+        specifier: workspace:*
+        version: link:../plugins/channel-console
       '@zhizhi/core':
         specifier: workspace:*
         version: link:../core
@@ -32,6 +38,9 @@ importers:
       '@zhizhi/probe-mem':
         specifier: workspace:*
         version: link:../plugins/probe-mem
+      '@zhizhi/rule-threshold':
+        specifier: workspace:*
+        version: link:../plugins/rule-threshold
 
   packages/core: {}
 
@@ -40,6 +49,18 @@ importers:
       '@zhizhi/core':
         specifier: workspace:*
         version: link:../core
+
+  packages/plugins/channel-alert:
+    dependencies:
+      '@zhizhi/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../plugin-sdk
+
+  packages/plugins/channel-console:
+    dependencies:
+      '@zhizhi/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../plugin-sdk
 
   packages/plugins/probe-cpu:
     dependencies:
@@ -54,6 +75,12 @@ importers:
         version: link:../../plugin-sdk
 
   packages/plugins/probe-mem:
+    dependencies:
+      '@zhizhi/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../plugin-sdk
+
+  packages/plugins/rule-threshold:
     dependencies:
       '@zhizhi/plugin-sdk':
         specifier: workspace:*

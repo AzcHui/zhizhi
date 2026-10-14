@@ -1,0 +1,15 @@
+{
+  "id": "rule-threshold",
+  "name": "阈值判断",
+  "version": "0.1.0",
+  "type": "rule",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "把指标翻译成候选事件（内存 / CPU / 磁盘超阈值），零依赖。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

@@ -13,10 +13,13 @@
     "once": "node --disable-warning=ExperimentalWarning src/main.ts --ticks=3 --interval=1000"
   },
   "dependencies": {
+    "@zhizhi/channel-alert": "workspace:*",
+    "@zhizhi/channel-console": "workspace:*",
     "@zhizhi/core": "workspace:*",
     "@zhizhi/plugin-sdk": "workspace:*",
     "@zhizhi/probe-cpu": "workspace:*",
+    "@zhizhi/probe-disk": "workspace:*",
     "@zhizhi/probe-mem": "workspace:*",
-    "@zhizhi/probe-disk": "workspace:*"
+    "@zhizhi/rule-threshold": "workspace:*"
   }
 }

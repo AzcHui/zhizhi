@@ -9,9 +9,8 @@ import type { MetricBatch, Rule, ZhizhiEvent } from '@zhizhi/core';
 
 export interface RuleDefinition {
   readonly id: string;
-  readonly evaluate: (
-    batch: MetricBatch,
-  ) => readonly ZhizhiEvent[] | Promise<readonly ZhizhiEvent[]>;
+  /** 同步判定 —— 理由见 core 里 `Rule` 契约的说明 */
+  readonly evaluate: (batch: MetricBatch) => readonly ZhizhiEvent[];
 }
 
 export function defineRule(definition: RuleDefinition): Rule {

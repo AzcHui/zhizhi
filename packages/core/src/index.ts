@@ -15,9 +15,23 @@ export type { Handler } from './bus.ts';
 export { Scheduler } from './scheduler.ts';
 export type { TickHandler } from './scheduler.ts';
 export { Store } from './store.ts';
-export { GATE_NAMES, createPassThroughGates } from './gates.ts';
-export type { Gate, GateName, GateVerdict, GateContext } from './gates.ts';
+export {
+  DEFAULT_COOLDOWN_MS,
+  DEFAULT_SUSTAIN_MS,
+  GATE_NAMES,
+  createGates,
+  runGates,
+} from './gates.ts';
+export type {
+  Gate,
+  GateContext,
+  GateName,
+  GateOptions,
+  GateRunResult,
+  GateVerdict,
+} from './gates.ts';
 export { Dispatcher } from './dispatcher.ts';
+export { composeLine } from './voice.ts';
 export { Registry } from './registry.ts';
 
 /** 内核版本 —— 外壳与插件可以据此做兼容判断 */

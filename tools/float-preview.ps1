@@ -44,7 +44,11 @@ param(
   [string]$NodeExe = '',
 
   # 只搭窗口 + 打印自检，不真的显示，也不写设置文件（给自动化验证用）
-  [switch]$SelfTest
+  # ⚠️ 它**不绘制**，所以抓不到「绘制类」缺陷 —— 2026-10-14 的红叉事件就是这么漏过去的
+  [switch]$SelfTest,
+
+  # 真开一次窗口 ~0.9 秒：数「绘制期异常」次数 + 截图存证 + 退出（渲染回归专用）
+  [switch]$RenderCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +96,7 @@ $script:settingsReadOnly = $false
 $script:LOG_PATH = Join-Path $script:SCRIPT_DIR 'float-preview.log'
 $script:lastError = ''
 $script:paintErrorLogged = $false
+$script:errorCount = 0
 
 function Write-ZhiLog([string]$msg) {
   try {
@@ -132,6 +137,7 @@ try {
   [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
   [System.Windows.Forms.Application]::add_ThreadException({
     param($s, $e)
+    $script:errorCount += 1
     Report-HandlerError 'Application.ThreadException（全局兜底）' $e
   })
   Write-ZhiLog ''
@@ -401,18 +407,38 @@ function Set-Bounds($ctrl, [double]$x, [double]$y, [double]$w, [double]$h) {
     [int][Math]::Round($w), [int][Math]::Round($h))
 }
 
-function Set-Layout {
-  $k = Get-ScaleFactor $script:settings.size
-  $script:k = $k
+# ─────────────────────────────── 字体（按尺寸缓存，永不 Dispose）───────────────────────────────
+# 见 Set-Layout 里的 ⚠️ 注释：销毁已挂到控件上的字体 = 下次绘制红叉。
 
-  if ($script:fonts -and $script:fonts.Count -gt 0) {
-    foreach ($f in @($script:fonts.Values)) { $f.Dispose() }
-  }
-  $script:fonts = @{
+$script:fontCache = @{}
+
+function New-FontSet([string]$sizeKey) {
+  $k = Get-ScaleFactor $sizeKey
+  return @{
     title = New-Object System.Drawing.Font('Microsoft YaHei UI', (11 * $k), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Point)
     body  = New-Object System.Drawing.Font('Microsoft YaHei UI', (9 * $k), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
     small = New-Object System.Drawing.Font('Microsoft YaHei UI', (8 * $k), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
   }
+}
+
+function Get-FontSet([string]$sizeKey) {
+  if (-not $script:fontCache.ContainsKey($sizeKey)) {
+    $script:fontCache[$sizeKey] = New-FontSet $sizeKey
+  }
+  return $script:fontCache[$sizeKey]
+}
+
+function Set-Layout {
+  $k = Get-ScaleFactor $script:settings.size
+  $script:k = $k
+
+  # ⚠️⚠️ 字体**绝不 Dispose**（2026-10-14 踩坑，详见《环境基线》第六节 ⭐⭐⭐ 条）
+  #   曾经这里写的是「先 Dispose 旧字体、再重建」—— 结果：控件还指着一个已释放的
+  #   字体对象，GDI+ 下一次画字就抛 ArgumentException「参数无效」，WinForms 于是把
+  #   每个控件画成**红叉**（实测：6 标签 + 5 按钮 = 11 个红叉）。
+  #   而且字体 GDI+ 句柄带引用计数 → 表现**时好时坏**，极难复现（我被它骗过两次）。
+  #   正解：按尺寸缓存，每种尺寸只建一次，进程内永不释放（最多 9 个 Font，可忽略）。
+  $script:fonts = Get-FontSet $script:settings.size
   $fTitle = $script:fonts.title
   $fBody  = $script:fonts.body
   $fSmall = $script:fonts.small
@@ -893,6 +919,54 @@ if ($script:settings.rememberPos -eq 'on' -and $script:settings.posX -ge 0 -and 
 Apply-Settings
 Update-PosLabel
 Update-Metrics
+
+# ─────────────────────── 渲染检查模式（-RenderCheck）───────────────────────
+# 为什么需要它：-SelfTest **不弹窗 = 不绘制**，因此「画字失败」这类缺陷它抓不到。
+# 2026-10-14 的「满屏红叉」正是这么漏过去的 —— 补一个真开窗、只数错的回归模式。
+if ($RenderCheck) {
+  $script:settingsReadOnly = $true            # 渲染检查不写用户设置
+  $script:renderErrors = -1
+  $script:renderSize = ''
+  $shotPath = Join-Path $script:SCRIPT_DIR 'float-preview.render.png'
+  $shotTimer = New-Object System.Windows.Forms.Timer
+  $shotTimer.Interval = 900
+  $shotTimer.Add_Tick({
+    $shotTimer.Stop()
+    try {
+      $sx = $form.Left - 10
+      $sy = $form.Top - 10
+      $sw = $form.Width + 20
+      $sh = $form.Height + 20
+      $bmp = New-Object System.Drawing.Bitmap($sw, $sh)
+      $g = [System.Drawing.Graphics]::FromImage($bmp)
+      $g.CopyFromScreen($sx, $sy, 0, 0, (New-Object System.Drawing.Size($sw, $sh)))
+      $bmp.Save($shotPath, [System.Drawing.Imaging.ImageFormat]::Png)
+      $g.Dispose()
+      $bmp.Dispose()
+      Write-ZhiLog ('渲染检查截图：' + $shotPath)
+    } catch {
+      Write-ZhiLog ('[ERR] 渲染检查截图失败：' + $_.Exception.Message)
+    }
+    $script:renderSize = '' + $form.ClientSize.Width + 'x' + $form.ClientSize.Height
+    $script:renderErrors = $script:errorCount
+    $form.Close()
+  })
+  $shotTimer.Start()
+  [void]$form.ShowDialog()
+
+  Write-Host ''
+  Write-Host '=== 渲染检查（-RenderCheck）===' -ForegroundColor Cyan
+  Write-Host ("绘制期异常次数 : " + $script:renderErrors + "   （0 = 正常；每多 1 个 = 有 1 个控件会被画成红叉）")
+  Write-Host ("窗口尺寸       : " + $script:renderSize)
+  Write-Host ("截图           : " + $shotPath)
+  Write-Host ("日志           : " + $script:LOG_PATH)
+  if ($script:renderErrors -eq 0) {
+    Write-Host '结果：✅ 通过（画字正常，无红叉）' -ForegroundColor Green
+  } else {
+    Write-Host '结果：❌ 未通过 —— 见日志里的 [ERR] 行' -ForegroundColor Red
+  }
+  exit 0
+}
 
 Write-Host '=== 只只 · M3 手感验证浮窗 ===' -ForegroundColor Cyan
 Write-Host ("位置        : " + (Get-PositionLabel $Position) + "   （点「位置」按钮可轮换；开了「记住位置」就记你拖到哪）")

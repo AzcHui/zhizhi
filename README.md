@@ -78,6 +78,7 @@ pnpm typecheck   # 全量类型检查
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1                  # 右下角
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Position TopCenter
 powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest        # 自检（含处理器冒烟），不弹窗
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -RenderCheck     # 渲染回归：真开窗 0.9s，数「红叉」
 ```
 
 点浮窗里的按钮，再切到编辑器按 `Ctrl+V` —— **能粘贴 = 没抢焦点**（`WS_EX_NOACTIVATE` 生效）。

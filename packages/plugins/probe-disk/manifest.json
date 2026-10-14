@@ -1,0 +1,15 @@
+{
+  "id": "probe-disk",
+  "name": "磁盘空间采集",
+  "version": "0.1.0",
+  "type": "probe",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "用 node:fs 的 statfs 读取各盘剩余空间与占用率，零依赖。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": ["disk.read"]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "probe-mem",
+  "name": "内存采集",
+  "version": "0.1.0",
+  "type": "probe",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "用 node:os 读取物理内存占用（占用率 / 已用 / 总量），零依赖。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": ["memory.read"]
+  }
+}

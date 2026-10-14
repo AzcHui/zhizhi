@@ -1,0 +1,22 @@
+{
+  "name": "@zhizhi/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "只只的内核独立入口 —— 不需要任何外壳就能跑（M0 的验收入口）。",
+  "main": "./src/main.ts",
+  "bin": {
+    "zhizhi": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/main.ts",
+    "once": "node --disable-warning=ExperimentalWarning src/main.ts --ticks=3 --interval=1000"
+  },
+  "dependencies": {
+    "@zhizhi/core": "workspace:*",
+    "@zhizhi/plugin-sdk": "workspace:*",
+    "@zhizhi/probe-cpu": "workspace:*",
+    "@zhizhi/probe-mem": "workspace:*",
+    "@zhizhi/probe-disk": "workspace:*"
+  }
+}

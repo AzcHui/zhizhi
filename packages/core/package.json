@@ -1,0 +1,12 @@
+{
+  "name": "@zhizhi/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "只只内核 —— 事件总线 / 调度器 / 状态存储 / 四道闸门 / 分通道 / 插件注册表。零 UI 依赖、零外部依赖。",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {}
+}

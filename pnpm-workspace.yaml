@@ -1,0 +1,4 @@
+packages:
+  - "packages/*"
+  # 官方插件：每个插件一个独立包（与未来的社区插件形态一致）
+  - "packages/plugins/*"

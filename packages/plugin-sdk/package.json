@@ -1,0 +1,14 @@
+{
+  "name": "@zhizhi/plugin-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "只只插件契约 —— 社区插件只需依赖这一个包。",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@zhizhi/core": "workspace:*"
+  }
+}

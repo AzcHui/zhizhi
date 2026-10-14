@@ -1,0 +1,134 @@
+/**
+ * @zhizhi/core · types
+ *
+ * ⭐ 这是全项目**唯一**允许定义「跨插件数据结构」的地方。
+ * 铁律①：插件之间禁止互相 import —— 它们共享的类型只能来自这里
+ * （再由 plugin-sdk 转出去，插件侧只需依赖 plugin-sdk 一个包）。
+ *
+ * 判断标准：只要有两个插件需要看同一个字段，这个类型就必须住在这里。
+ */
+
+// ─────────────────────────────── 基础枚举 ───────────────────────────────
+
+/** 内核日志级别 */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+/** 事件严重度 —— M2 分通道的依据（日常走弱通道，P0 才升级） */
+export type Severity = 'info' | 'warn' | 'critical';
+
+/** 6 类扩展点（不多不少） */
+export type PluginType = 'probe' | 'rule' | 'persona' | 'channel' | 'action' | 'view';
+
+/** 插件生命周期（铁律③：插件崩溃不许带崩内核） */
+export type PluginStatus = 'discovered' | 'active' | 'failed';
+
+// ─────────────────────────────── 数据契约 ───────────────────────────────
+
+/**
+ * 指标 —— probe 的产出。
+ *
+ * ⚠️ 指标是**数据**，不是文字。「说人话」是 persona 的活儿。
+ * 这条边界守住了，采集层才能被复用（终端 / 浮窗 / 未来接别的 UI）。
+ */
+export interface Metric {
+  /** 指标名，点分命名：cpu.usage / mem.used / disk.free */
+  readonly key: string;
+  /** 数值 */
+  readonly value: number;
+  /** 单位：% / GB / MB/s */
+  readonly unit?: string;
+  /** 采集时刻（epoch ms） */
+  readonly ts: number;
+  /** 归因：谁贡献的。「多少」是报警，「谁」才是帮助 */
+  readonly source?: string;
+  /** 附加结构信息（如磁盘盘符、CPU 核心号） */
+  readonly meta?: Readonly<Record<string, string | number | boolean>>;
+}
+
+/** 一次采样中，某一个 probe 的全部产出 */
+export interface MetricBatch {
+  readonly probeId: string;
+  readonly metrics: readonly Metric[];
+}
+
+/** 事件 —— rule 消费指标后的产出 */
+export interface ZhizhiEvent {
+  readonly id: string;
+  /** 事件类型：mem.high / disk.tight / proc.suspicious，persona 按它挑台词 */
+  readonly type: string;
+  readonly severity: Severity;
+  /** 触发它的指标快照（用于归因与展示） */
+  readonly metrics: readonly Metric[];
+  /** 首次触发时刻（epoch ms） */
+  readonly ts: number;
+  /** 已被闸门压掉的次数（M2 冷却期用） */
+  readonly suppressed?: number;
+}
+
+/** 台词 —— persona 的产出。纯数据，不是代码。 */
+export interface Line {
+  readonly text: string;
+  /** 说这句话时的情绪标签：happy / tired / annoyed / sleepy */
+  readonly mood?: string;
+}
+
+/** 一条要发出去的消息（dispatcher 决定它走哪个通道） */
+export interface OutgoingMessage {
+  readonly eventId: string;
+  readonly text: string;
+  readonly severity: Severity;
+  /** 选定的通道 id：bubble / toast / tray */
+  readonly channel: string;
+}
+
+/**
+ * 反馈 —— 用户对某一句话的反应。
+ * ⚠️ 「评论」坚决不做自由输入，只用固定原因（打字成本高 100 倍，数据还更差）。
+ */
+export interface Feedback {
+  readonly eventId: string;
+  readonly vote: 'up' | 'down' | 'mute';
+  readonly reason?: 'too_frequent' | 'wrong' | 'annoying';
+  readonly ts: number;
+}
+
+// ─────────────────────────────── 插件实例契约 ───────────────────────────────
+
+/** probe（采集器）：产生指标 */
+export interface Probe {
+  readonly id: string;
+  /** 采样一次；返回空数组表示「这次没什么可汇报的」 */
+  sample(): readonly Metric[] | Promise<readonly Metric[]>;
+}
+
+/** rule（判断规则）：消费指标 → 产生事件 */
+export interface Rule {
+  readonly id: string;
+  evaluate(batch: MetricBatch): readonly ZhizhiEvent[] | Promise<readonly ZhizhiEvent[]>;
+}
+
+/** persona（台词包）：事件 + 情境 → 台词 */
+export interface Persona {
+  readonly id: string;
+  /** 给一个事件挑一句话；返回 undefined 表示「这次不说话」 */
+  speak(event: ZhizhiEvent): Line | undefined;
+}
+
+/** channel（通道）：把一句话送去哪儿 */
+export interface Channel {
+  readonly id: string;
+  /** 它愿意承载哪些严重度（分通道原则：弱互动与强提醒永不混用） */
+  readonly sends: readonly Severity[];
+  send(msg: OutgoingMessage): void | Promise<void>;
+}
+
+// ─────────────────────────────── 插件加载 ───────────────────────────────
+
+/** 一次插件加载的结果（registry 产出，供内核如实报告，不静默吞错） */
+export interface LoadOutcome {
+  readonly id: string;
+  readonly type: PluginType;
+  readonly status: PluginStatus;
+  /** status === 'failed' 时的原因 */
+  readonly error?: string;
+}

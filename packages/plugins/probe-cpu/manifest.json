@@ -1,0 +1,15 @@
+{
+  "id": "probe-cpu",
+  "name": "CPU 采集",
+  "version": "0.1.0",
+  "type": "probe",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "用 node:os 读取 CPU 占用率（两次采样差分），零依赖。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": ["cpu.read"]
+  }
+}

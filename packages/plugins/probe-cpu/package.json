@@ -1,0 +1,14 @@
+{
+  "name": "@zhizhi/probe-cpu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CPU 占用采集插件（官方插件，与社区插件同等待遇）",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@zhizhi/plugin-sdk": "workspace:*"
+  }
+}

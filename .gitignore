@@ -1,0 +1,17 @@
+node_modules/
+dist/
+out/
+build/
+*.log
+*.tsbuildinfo
+
+.DS_Store
+Thumbs.db
+
+.workbuddy/
+.vscode/
+.idea/
+
+.env
+.env.*
+!.env.example

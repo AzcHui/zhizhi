@@ -82,4 +82,7 @@ powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest      
 
 点浮窗里的按钮，再切到编辑器按 `Ctrl+V` —— **能粘贴 = 没抢焦点**（`WS_EX_NOACTIVATE` 生效）。
 
+点「**设置**」可**原地展开**基础设置：**尺寸**（小/中/大）· **透明**（细/中/实）· **置顶**（开/关）· **记住位置**（开/关）。
+改完**立即生效**，自动存到 `tools/float-preview.settings.json`（已 gitignore），下次打开自动生效。
+
 > ⚠️ 改这个 `.ps1` 时注意：**必须存成 UTF-8 带 BOM**，否则 PS 5.1 按 GBK 读、中文全乱码（详见《环境基线》第六节）。

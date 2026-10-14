@@ -13,6 +13,9 @@ Thumbs.db
 .idea/
 .tmp/
 
+# 浮窗探针的运行时设置（机器相关，不入库）
+tools/float-preview.settings.json
+
 .env
 .env.*
 !.env.example

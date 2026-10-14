@@ -6,7 +6,7 @@
 它不只报警 —— 它会说话，有自己的语气（有人味，还会吐槽你），
 而且知道**什么时候该闭嘴**。
 
-**当前状态**：🟢 **M2 已完成** —— 四道闸门 + 分通道，学会「该说才说」· 下一站 **M3 手感验证（丑浮窗）**
+**当前状态**：🟡 **M3 进行中** —— 手感验证浮窗已就绪（`tools/float-preview.ps1`）· **等你判定手感**
 
 ---
 
@@ -32,8 +32,8 @@
 
 ```
 M0   M1   M2   |  M3   M4   |  M5   M6   M7   M8   |  M9   M10
-✅   ✅   ✅   |  ⬜   ⬜   |  ⬜   ⬜   ⬜   ⬜   |  ⬜    ⬜
-               ▲ 当前位置
+✅   ✅   ✅   |  🟡   ⬜   |  ⬜   ⬜   ⬜   ⬜   |  ⬜    ⬜
+               ▲ 当前位置（M3 浮窗已交付，待你判定手感）
 └─ 内核阶段 ─┘   └─ 外观 ─┘   └──── 性格阶段 ────┘   └─ 收尾 ─┘
    纯 Node / 零安装 / 不需要 Rust        ★ 这一层才是只只
 ```
@@ -69,3 +69,17 @@ pnpm typecheck   # 全量类型检查
 | stderr | **日志** —— 带 `[模块]` 前缀，给人看 |
 
 `packages/core` 零 UI 依赖、零外部依赖 —— 它今天被 `cli` 消费，将来被 `app` 消费，内核一行不改。
+
+## 试试浮窗（M3 手感验证）
+
+一个**最丑最快**的浮窗，只为把「位置 / 遮挡 / 按钮」问明白 —— 不是正式外壳（那是 M4）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1                  # 右下角
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -Position TopCenter
+powershell -ExecutionPolicy Bypass -File tools\float-preview.ps1 -SelfTest        # 只自检，不弹窗
+```
+
+点浮窗里的按钮，再切到编辑器按 `Ctrl+V` —— **能粘贴 = 没抢焦点**（`WS_EX_NOACTIVATE` 生效）。
+
+> ⚠️ 改这个 `.ps1` 时注意：**必须存成 UTF-8 带 BOM**，否则 PS 5.1 按 GBK 读、中文全乱码（详见《环境基线》第六节）。

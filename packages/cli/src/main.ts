@@ -80,8 +80,10 @@ const store = new Store();
 const dispatcher = new Dispatcher(log.child('dispatcher'));
 const registry = new Registry();
 
-// 四道闸门（内核宪法）：持续判定与冷却期的状态全记在 store 里，插件读不到也绕不过
-const gates = createGates({ store, sustainMs, cooldownMs });
+// 四道闸门（内核宪法）：持续判定与冷却期的状态全记在 store 里，插件读不到也绕不过。
+// ⚠️ 必须把 intervalMs 交给它 —— 持续判定靠「两次见到相隔多久」推断「中间恢复没有」，
+//    不知道采样节奏就分辨不出「还在超标」和「早就恢复了」（会误报）。
+const gates = createGates({ store, intervalMs, sustainMs, cooldownMs });
 
 // ────────────────────── 加载插件：清单驱动 + 如实记账 ──────────────────────
 // 加载动作在这里（而不是 core）执行 —— 原因见 loader.ts 顶部注释（Node 的解析基准是物理位置）
@@ -232,11 +234,11 @@ log.info(
   `闸门参数：sustain=${sustainMs}ms（持续判定）· cooldown=${cooldownMs}ms（冷却期）· baseline=占位（M7 填）`,
 );
 if (intervalMs >= sustainMs) {
-  // 持续判定靠「两次见到它相隔多久」来推断中间有没有恢复，
-  // 采样比窗口还慢的话，它永远会被当成「新一轮」→ 永远不通过。
+  // 持续判定靠「两次见到它相隔多久」推断中间有没有恢复；
+  // 采样比窗口还慢的话，两个样本之间的距离就足以判定「持续够久」，持续判定名存实亡。
   log.warn(
     `采样间隔（${intervalMs}ms）没有明显小于持续判定窗口（${sustainMs}ms）——` +
-      `持续判定会永远无法通过。请把 --interval 调小，或把 --sustain-ms 调大。`,
+      `持续判定会失去意义。请把 --interval 调小，或把 --sustain-ms 调大。`,
   );
 }
 if (Number.isFinite(maxTicks)) log.info(`验收模式：跑满 ${maxTicks} 轮就退出。`);

@@ -118,6 +118,8 @@ $script:SETTINGS_PATH = Join-Path $script:SCRIPT_DIR 'float-preview.settings.jso
 #     （2026-10-14 复验实测：-RenderCheck 会把 settings.json 的 LastWriteTime 推后 → 已修）
 #     => 原则：**验收模式绝不污染用户状态。**
 $script:settingsReadOnly = [bool]($SelfTest -or $RenderCheck)
+# 验收模式下不自检模式输出交织，内核日志不镜像到控制台（照常进文件）
+$script:consoleMirror = -not $script:settingsReadOnly
 
 # ───────────────────── 日志与异常兜底（⭐ M3 踩坑后补）─────────────────────
 # 为什么要有这一套：
@@ -323,6 +325,7 @@ $script:kernel = $null        # sidecar 进程
 $script:kernelOut = $null     # stdout 的「待完成异步读」
 $script:kernelErr = $null     # stderr 的「待完成异步读」
 $script:kernelLines = 0       # 已收到几条采样
+$script:eventLines = 0        # 已收到几条「只只说的话」（stdout 的 type:"event"/"alert"）
 $script:kernelDead = $false
 $script:metricsTimer = $null  # UI 线程上的轮询定时器
 
@@ -388,6 +391,7 @@ function Apply-SampleLine([string]$line) {
   try {
     $obj = $line | ConvertFrom-Json
     if ($obj.type -eq 'event' -or $obj.type -eq 'alert') {
+      $script:eventLines++
       Apply-SaidText ([string]$obj.text)
       return
     }
@@ -412,9 +416,14 @@ function Apply-SaidText([string]$text) {
   Write-ZhiLog ('只只说了：' + $text)
 }
 
-# stderr 来了一行：日志。⚠️ M6 起**不再从这里捞「只只说的话」**（改读 stdout 的 type:"event"）——
-# 要不告警和闲聊会出现两遍。stderr 只留 ERR / WRN 转记日志。
+# stderr 来了一行：日志。
+# M6 起**镜像到控制台**（终端 = 看真实日志的地方），ERR/WRN 照旧进日志文件。
+# ⚠️ 用 [Console]::WriteLine 直写、**不用 Write-Host** —— 后者走 PowerShell 管道，
+#     在事件处理器里有 PipelineStoppedException 的前科；[Console] 绕开管道，无此风险。
 function Apply-LogLine([string]$line) {
+  if ($script:consoleMirror -and $line.Trim().Length -gt 0) {
+    try { [Console]::WriteLine($line) } catch { }
+  }
   if ($line -match 'ERR|WRN') {
     Write-ZhiLog ('内核日志：' + $line)
   }
@@ -446,6 +455,18 @@ function Feed-Idle {
     $script:kernel.StandardInput.WriteLine('{"idleMs":' + $idle + '}')
   } catch {
     Write-ZhiLog ('[ERR] 喂 idleMs 失败（闲聊会静默，监控不受影响）：' + $_.Exception.Message)
+  }
+}
+
+# 「说说」按钮：请内核现在就说一句（{"requestSay":true}）—— 用户指令，内核照样走标准出口
+function Feed-RequestSay {
+  if ($null -eq $script:kernel -or $script:kernel.HasExited) { return $false }
+  try {
+    $script:kernel.StandardInput.WriteLine('{"requestSay":true}')
+    return $true
+  } catch {
+    Write-ZhiLog ('[ERR] 发送 requestSay 失败：' + $_.Exception.Message)
+    return $false
   }
 }
 
@@ -882,7 +903,8 @@ $btnClose.Add_Click({
 
 $btnSay.Add_Click({
   try {
-    Set-StatusText '（以后这里展开详情）'
+    if (Feed-RequestSay) { Set-StatusText '（去说了，等它回话…）' }
+    else { Set-StatusText '（内核没在跑，叫不动）' }
     Write-ZhiLog '点击 说说'
   } catch { Report-HandlerError 'click:说说' $_ }
 })
@@ -1047,6 +1069,13 @@ if ($SelfTest) {
     $fed = Get-IdleMs
     Feed-Idle             # 反向通道冒烟：真往 stdin 写一行，写不进去会记日志
     Write-Host ("  反向通道     : GetLastInputInfo=" + $(if ($null -eq $fed) { '失败' } else { "$fed ms" }) + " · 已往 stdin 喂 1 次")
+    [void](Feed-RequestSay)   # 「说说」链路冒烟：应立刻回一句闲聊（走 stdout 的 type:"event"）
+    $t1 = Get-Date
+    while ($script:eventLines -lt 1 -and ((Get-Date) - $t1).TotalSeconds -lt 5) {
+      Poll-Kernel
+      Start-Sleep -Milliseconds 120
+    }
+    Write-Host ("  说说应答     : " + $(if ($script:eventLines -ge 1) { $lblSaid.Text } else { '（5 秒内没等到回话 → 异常）' }))
     Stop-Kernel
     Write-Host ("  内核已收掉   : " + ($null -eq $script:kernel))
   } else {
@@ -1204,11 +1233,8 @@ Write-Host '关闭        : 点右上角 ✕（会顺带把内核子进程收掉
 Write-Host '              ⚠️ 不要在本控制台按 Ctrl+C —— 会停止 PowerShell 管道，' -ForegroundColor Red
 Write-Host '                 之后浮窗点任何按钮都会报 PipelineStoppedException' -ForegroundColor Red
 Write-Host ("出错        : 异常会写进 " + $script:LOG_PATH + "（不弹框、不卡死）")
-Write-Host ''
-Write-Host '★ 硬指标验收（请真的做一次）：' -ForegroundColor Yellow
-Write-Host '  1. 点一下浮窗里的任意按钮' -ForegroundColor Yellow
-Write-Host '  2. 切到编辑器/输入框，按 Ctrl+V' -ForegroundColor Yellow
-Write-Host '  → 能正常粘贴 = 没抢焦点（WS_EX_NOACTIVATE 生效）' -ForegroundColor Yellow
+Write-Host '日志        : 内核日志**实时显示在下方**（同时写一份进 tools\float-preview.log）'
+Write-Host '说说        : 点浮窗「说说」= 叫它现在就说一句；闲聊节奏看 data\zhizhi.settings.json'
 Write-Host ''
 
 [void]$form.ShowDialog()

@@ -131,6 +131,11 @@ export interface Feedback {
 export interface ContextInput {
   /** 最后一次用户输入距今多少毫秒（空闲时长） */
   readonly idleMs?: number;
+  /**
+   * 用户主动要求「现在说一句」（M6：浮窗「说说」按钮经反向通道发来）。
+   * 这是**用户的明确指令**，不是遥测 —— 规则应立即安排一句（照常走 dispatcher 标准出口）。
+   */
+  readonly requestSay?: boolean;
 }
 
 // ─────────────────────────────── 插件实例契约 ───────────────────────────────

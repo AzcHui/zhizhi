@@ -31,6 +31,8 @@ let intervalMs = DEFAULT_INTERVAL_MS;
 let idleThresholdMs = DEFAULT_IDLE_MS;
 /** 上次闲聊时刻 —— 插件自己的时间状态，自守卫（一个 tick 里会按 probe 数被调多次） */
 let lastChitchatAt: number | undefined = undefined;
+/** 用户点了「说说」—— 下一次 evaluate 立即开口（用户指令优先于空闲/间隔两个条件） */
+let sayRequested = false;
 
 export default defineRule({
   id: 'rule-chitchat',
@@ -40,6 +42,7 @@ export default defineRule({
     if (typeof ctx['idleMs'] === 'number' && Number.isFinite(ctx['idleMs']) && ctx['idleMs'] >= 0) {
       idleMs = ctx['idleMs'];
     }
+    if (ctx['requestSay'] === true) sayRequested = true;
   },
 
   // 内核下发配置：只认领自己认识的键，类型不对就保持默认（宁可默认也不填错值）
@@ -55,26 +58,36 @@ export default defineRule({
   },
 
   evaluate(): readonly ZhizhiEvent[] {
+    const now = Date.now();
+
+    // 用户点了「说说」：这是明确指令，优先于空闲/间隔两个条件 —— 立即开口。
+    // 顺带把「上次闲聊」重置到现在：自动闲聊从这句话起重新计间隔。
+    // ⚠️ 只消费一次（evaluate 一个 tick 会被调多次，第一调消费掉，其余不再触发）。
+    if (sayRequested) {
+      sayRequested = false;
+      lastChitchatAt = now;
+      return [makeChitchat(now)];
+    }
+
     // 硬约束 ③：没人喂上下文 → 沉默。不是出错，是「不知道你闲不闲，所以不说」
     if (idleMs === undefined) return [];
-
-    const now = Date.now();
     if (idleMs < idleThresholdMs) return []; // 你还忙着呢，不打扰
     if (lastChitchatAt !== undefined && now - lastChitchatAt < intervalMs) return []; // 刚聊过
 
     lastChitchatAt = now;
-    const ts = now;
-    return [
-      {
-        id: `chitchat@${ts}`,
-        type: 'chitchat',
-        severity: 'info', // 「多要紧」的正确归类：critical=出事 / warn=不对劲 / info=就是说说
-        kind: 'chitchat', // 内核据此绕闸门、走 dispatcher（决策 #22）
-        metrics: [], // 闲聊没有指标证据 —— 所以更不能进告警闸门（threshold 会拦空口报）
-        ts,
-        // summary 是兜底描述：没有台词包时，只只用它说话（降级，不是故障）
-        summary: '（闲聊）你歇着呢，我陪你待会儿。',
-      },
-    ];
+    return [makeChitchat(now)];
   },
 });
+
+function makeChitchat(ts: number): ZhizhiEvent {
+  return {
+    id: `chitchat@${ts}`,
+    type: 'chitchat',
+    severity: 'info', // 「多要紧」的正确归类：critical=出事 / warn=不对劲 / info=就是说说
+    kind: 'chitchat', // 内核据此绕闸门、走 dispatcher（决策 #22）
+    metrics: [], // 闲聊没有指标证据 —— 所以更不能进告警闸门（threshold 会拦空口报）
+    ts,
+    // summary 是兜底描述：没有台词包时，只只用它说话（降级，不是故障）
+    summary: '（闲聊）你歇着呢，我陪你待会儿。',
+  };
+}

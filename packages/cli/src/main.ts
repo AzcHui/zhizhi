@@ -330,11 +330,18 @@ process.stdin.on('data', (chunk: string) => {
       try {
         const obj = JSON.parse(line) as Record<string, unknown> | null;
         const idle = obj === null || typeof obj !== 'object' ? undefined : obj['idleMs'];
-        if (typeof idle === 'number' && Number.isFinite(idle) && idle >= 0) {
-          context = { idleMs: idle };
+        const say = obj === null || typeof obj !== 'object' ? undefined : obj['requestSay'];
+        const idleOk = typeof idle === 'number' && Number.isFinite(idle) && idle >= 0;
+        if (idleOk) {
+          context = { idleMs: idle as number };
           deliverContext(context);
-        } else {
-          log.warn(`上下文行缺有效的 "idleMs"，已忽略：${line.slice(0, 80)}`);
+        }
+        if (say === true) {
+          // 用户点了「说说」—— 把请求连同最新上下文一起递给规则（规则决定怎么开口）
+          deliverContext({ ...context, requestSay: true });
+        }
+        if (!idleOk && say !== true) {
+          log.warn(`上下文行缺有效的 "idleMs"/"requestSay"，已忽略：${line.slice(0, 80)}`);
         }
       } catch {
         log.warn(`上下文行不是合法 JSON，已忽略：${line.slice(0, 80)}`);
@@ -346,8 +353,12 @@ process.stdin.on('data', (chunk: string) => {
 process.stdin.on('error', (err) => {
   log.warn('stdin 读取出错（外壳的上下文喂不进来了，闲聊将静默；监控照常）', err.message);
 });
-// ⚠️ 不让 stdin 拖住退出：验收模式（--ticks）跑满后进程要能干净退场
-process.stdin.unref();
+// ⚠️ 不让 stdin 拖住退出：验收模式（--ticks）跑满后进程要能干净退场。
+// 但 unref 只有 TTY / 管道型 stdin（Socket）才有 —— **重定向文件**时是 fs.ReadStream，
+// 没有 unref，直接调会 TypeError 启动即崩（监工复验抓到）→ 先探再调。
+if (typeof (process.stdin as { unref?: unknown }).unref === 'function') {
+  process.stdin.unref();
+}
 // 把初始上下文（含 --idle-ms 的固定值）也发一遍 —— 别让规则等到第一行 stdin 才见到它
 deliverContext(context);
 

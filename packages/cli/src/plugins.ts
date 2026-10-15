@@ -21,6 +21,8 @@ export const PLUGINS: readonly PluginSpec[] = [
   { specifier: '@zhizhi/probe-disk', type: 'probe' },
   // 判断：把指标翻译成「值得说一句」的候选事件
   { specifier: '@zhizhi/rule-threshold', type: 'rule' },
+  // 闲聊（M6）：空闲够久就主动开口 —— 独立于告警（不复用阈值/闸门，决策 #18/#22）
+  { specifier: '@zhizhi/rule-chitchat', type: 'rule' },
   // 台词：把事件翻译成「人味」的话（M5）
   //   ⭐ 台词包**不是必需品** —— 把这一行删掉，只只改用客观描述说话，不会崩。
   //   📌 想换成自己的台词？把下面这行换成一个 JSON 文件的路径就行（纯数据，不用写代码）：

@@ -1,0 +1,15 @@
+{
+  "id": "rule-chitchat",
+  "name": "闲聊规则",
+  "version": "0.1.0",
+  "type": "rule",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "空闲够久且距上次闲聊超过间隔时，产生一条 chitchat 事件（info）。绕闸门、走 dispatcher（决策 #22），零依赖。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

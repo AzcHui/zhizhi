@@ -93,6 +93,9 @@ public static class ZhizhiWin32 {
   [DllImport("user32.dll")] public static extern bool ReleaseCapture();
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 }
 '@
 }
@@ -341,6 +344,7 @@ function Start-Kernel {
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
+  $psi.RedirectStandardInput = $true      # ⚠️ M6 反向通道：外壳要把 idleMs 喂给内核（stdin 一行 JSON）
   $psi.CreateNoWindow = $true
   # ⚠️ 这两行不设，只只说的中文会被 PowerShell 按 GBK 解码 → 全成乱码（实测踩过）
   $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -376,33 +380,72 @@ function Stop-Kernel {
   $script:kernelErr = $null
 }
 
-# stdout 来了一行：一行 JSON = 一次采样
+# stdout 来了一行。⚠️ M6 起它有**两种**行（都在设计好的数据通道上）：
+#   {"tick":…,"probes":{…}}              → 采样，刷新 CPU / MEM
+#   {"type":"event","level":…,"text":…}  → 只只说的话（channel-console 发的，告警+闲聊一条路）
 function Apply-SampleLine([string]$line) {
   if (-not $line.TrimStart().StartsWith('{')) { return }   # stdout 只有数据，防一手
   try {
     $obj = $line | ConvertFrom-Json
-    $cpu = ($obj.probes.'probe-cpu' | Where-Object { $_.key -eq 'cpu.usage' } | Select-Object -First 1).value
-    $mem = ($obj.probes.'probe-mem' | Where-Object { $_.key -eq 'mem.usage' } | Select-Object -First 1).value
-    if ($null -ne $cpu) { $lblCpuV.Text = ('{0:N1}%' -f [double]$cpu) }
-    if ($null -ne $mem) { $lblMemV.Text = ('{0:N1}%' -f [double]$mem) }
-    $script:kernelLines++
-    Update-PosLabel
+    if ($obj.type -eq 'event' -or $obj.type -eq 'alert') {
+      Apply-SaidText ([string]$obj.text)
+      return
+    }
+    if ($null -ne $obj.probes) {
+      $cpu = ($obj.probes.'probe-cpu' | Where-Object { $_.key -eq 'cpu.usage' } | Select-Object -First 1).value
+      $mem = ($obj.probes.'probe-mem' | Where-Object { $_.key -eq 'mem.usage' } | Select-Object -First 1).value
+      if ($null -ne $cpu) { $lblCpuV.Text = ('{0:N1}%' -f [double]$cpu) }
+      if ($null -ne $mem) { $lblMemV.Text = ('{0:N1}%' -f [double]$mem) }
+      $script:kernelLines++
+      Update-PosLabel
+    }
   } catch {
     Write-ZhiLog ('[ERR] 采样行解析失败：' + $_.Exception.Message)
   }
 }
 
-# stderr 来了一行：日志。**只只说的话就在里面** —— 捞出来显示到窗口上
+# 把「只只说的话」摆上窗口（M6 起数据源 = stdout 的 type:"event"，不再解析 stderr 日志行）
+function Apply-SaidText([string]$text) {
+  if ([string]::IsNullOrEmpty($text)) { return }
+  if ($text.Length -gt 24) { $lblSaid.Text = $text.Substring(0, 24) + '…' }
+  else { $lblSaid.Text = $text }
+  Write-ZhiLog ('只只说了：' + $text)
+}
+
+# stderr 来了一行：日志。⚠️ M6 起**不再从这里捞「只只说的话」**（改读 stdout 的 type:"event"）——
+# 要不告警和闲聊会出现两遍。stderr 只留 ERR / WRN 转记日志。
 function Apply-LogLine([string]$line) {
-  $m = [regex]::Match($line, '只只说了［([^］]+)］：(.*)$')
-  if ($m.Success) {
-    $text = $m.Groups[2].Value
-    $script:lastSaid = $text
-    if ($text.Length -gt 24) { $lblSaid.Text = $text.Substring(0, 24) + '…' }
-    else { $lblSaid.Text = $text }
-    Write-ZhiLog ('只只说了［' + $m.Groups[1].Value + '］：' + $text)
-  } elseif ($line -match 'ERR|WRN') {
+  if ($line -match 'ERR|WRN') {
     Write-ZhiLog ('内核日志：' + $line)
+  }
+}
+
+# ── M6 反向通道：把「你闲了多久」喂给内核 ──
+# ⚠️ 不是键鼠监听：GetLastInputInfo 只返回**一个数字**（最后一次输入距今多少毫秒），
+#    根本不知道你按了什么 —— 与当初明确砍掉的键鼠钩子性质完全不同。
+function Get-IdleMs {
+  try {
+    $lii = New-Object 'ZhizhiWin32+LASTINPUTINFO'
+    $lii.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type]'ZhizhiWin32+LASTINPUTINFO')
+    if (-not [ZhizhiWin32]::GetLastInputInfo([ref]$lii)) { return $null }
+    $idle = [int64][Environment]::TickCount - [int64]$lii.dwTime
+    if ($idle -lt 0) { return $null }   # TickCount 回绕（约 25 天不重启才可能），宁可这次不喂
+    return $idle
+  } catch {
+    Write-ZhiLog ('[ERR] 取空闲时长失败：' + $_.Exception.Message)
+    return $null
+  }
+}
+
+function Feed-Idle {
+  if ($null -eq $script:kernel -or $script:kernel.HasExited) { return }
+  $idle = Get-IdleMs
+  if ($null -eq $idle) { return }
+  try {
+    # 一行一个 JSON 对象，与内核约定的上下文协议（{"idleMs":<非负毫秒>}）
+    $script:kernel.StandardInput.WriteLine('{"idleMs":' + $idle + '}')
+  } catch {
+    Write-ZhiLog ('[ERR] 喂 idleMs 失败（闲聊会静默，监控不受影响）：' + $_.Exception.Message)
   }
 }
 
@@ -919,10 +962,11 @@ $form.Add_HandleCreated({
   } catch { Report-HandlerError 'handlecreated' $_ }
 })
 
-# 关窗时：收掉内核 sidecar + 停掉轮询 + 记住位置
+# 关窗时：收掉内核 sidecar + 停掉轮询与喂食 + 记住位置
 $form.Add_FormClosing({
   try {
     if ($null -ne $script:metricsTimer) { $script:metricsTimer.Stop() }
+    if ($null -ne $script:idleTimer) { $script:idleTimer.Stop() }
     Stop-Kernel            # ⚠️ 必须收 —— 不然会在后台留一个孤儿的 node 进程
     if ($script:settings.rememberPos -eq 'on') {
       $script:settings.posX = $form.Left
@@ -1000,6 +1044,9 @@ if ($SelfTest) {
     }
     Write-Host ("  收到采样     : " + $script:kernelLines + " 条（CPU " + $lblCpuV.Text + " / MEM " + $lblMemV.Text + "）")
     Write-Host ("  只只说的话   : " + $lblSaid.Text)
+    $fed = Get-IdleMs
+    Feed-Idle             # 反向通道冒烟：真往 stdin 写一行，写不进去会记日志
+    Write-Host ("  反向通道     : GetLastInputInfo=" + $(if ($null -eq $fed) { '失败' } else { "$fed ms" }) + " · 已往 stdin 喂 1 次")
     Stop-Kernel
     Write-Host ("  内核已收掉   : " + ($null -eq $script:kernel))
   } else {
@@ -1087,6 +1134,14 @@ $script:metricsTimer.Add_Tick({
   try { Poll-Kernel } catch { Report-HandlerError 'poll-kernel' $_ }
 })
 $script:metricsTimer.Start()
+
+# M6 反向通道：每秒把空闲时长喂给内核（同样跑在 UI 线程的 Timer 上）
+$script:idleTimer = New-Object System.Windows.Forms.Timer
+$script:idleTimer.Interval = 1000
+$script:idleTimer.Add_Tick({
+  try { Feed-Idle } catch { Report-HandlerError 'feed-idle' $_ }
+})
+$script:idleTimer.Start()
 
 # ─────────────────────── 渲染检查模式（-RenderCheck）───────────────────────
 # 为什么需要它：-SelfTest **不弹窗 = 不绘制**，因此「画字失败」这类缺陷它抓不到。

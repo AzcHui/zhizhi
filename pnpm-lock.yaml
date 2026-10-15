@@ -41,6 +41,9 @@ importers:
       '@zhizhi/probe-mem':
         specifier: workspace:*
         version: link:../plugins/probe-mem
+      '@zhizhi/rule-chitchat':
+        specifier: workspace:*
+        version: link:../plugins/rule-chitchat
       '@zhizhi/rule-threshold':
         specifier: workspace:*
         version: link:../plugins/rule-threshold
@@ -84,6 +87,12 @@ importers:
         version: link:../../plugin-sdk
 
   packages/plugins/probe-mem:
+    dependencies:
+      '@zhizhi/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../plugin-sdk
+
+  packages/plugins/rule-chitchat:
     dependencies:
       '@zhizhi/plugin-sdk':
         specifier: workspace:*

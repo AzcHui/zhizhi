@@ -21,6 +21,7 @@
     "@zhizhi/probe-cpu": "workspace:*",
     "@zhizhi/probe-disk": "workspace:*",
     "@zhizhi/probe-mem": "workspace:*",
+    "@zhizhi/rule-chitchat": "workspace:*",
     "@zhizhi/rule-threshold": "workspace:*"
   }
 }

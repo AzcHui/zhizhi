@@ -16,6 +16,16 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 /** 事件严重度 —— M2 分通道的依据（日常走弱通道，P0 才升级） */
 export type Severity = 'info' | 'warn' | 'critical';
 
+/**
+ * 事件的性质（M6）—— 内核据此决定它走不走「告警的分寸系统」。
+ *
+ *   alert    告警（默认）：有指标证据、要过四道闸门（threshold/sustained/…）
+ *   chitchat 闲聊：没有指标证据、天然只冒一次 → **绕闸门、不绕 dispatcher**
+ *            （决策 #22：闸门是告警的分寸系统；dispatcher 是唯一出口，
+ *             静默时段 / 每日上限这些宪法级机制都在出口那一侧管着它）
+ */
+export type EventKind = 'alert' | 'chitchat';
+
 /** 6 类扩展点（不多不少） */
 export type PluginType = 'probe' | 'rule' | 'persona' | 'channel' | 'action' | 'view';
 
@@ -54,10 +64,15 @@ export interface MetricBatch {
 /** 事件 —— rule 消费指标后的产出 */
 export interface ZhizhiEvent {
   readonly id: string;
-  /** 事件类型：mem.high / disk.tight / proc.suspicious，persona 按它挑台词 */
+  /** 事件类型：mem.high / disk.tight / chitchat，persona 按它挑台词 */
   readonly type: string;
   readonly severity: Severity;
-  /** 触发它的指标快照（用于归因与展示） */
+  /**
+   * 事件的性质（M6）。不写 = `'alert'`。
+   * 内核据此决定：告警走四道闸门，chitchat 绕闸门但**照样走 dispatcher**。
+   */
+  readonly kind?: EventKind;
+  /** 触发它的指标快照（用于归因与展示；chitchat 没有指标证据，为空数组） */
   readonly metrics: readonly Metric[];
   /** 首次触发时刻（epoch ms） */
   readonly ts: number;
@@ -102,6 +117,22 @@ export interface Feedback {
   readonly ts: number;
 }
 
+/**
+ * 上下文输入（M6）—— 外壳喂给内核的环境信息。
+ *
+ * ⚠️ 为什么它不算「键鼠监听」：`GetLastInputInfo` /
+ *    `powerMonitor.getSystemIdleTime()` 只返回**一个数字**
+ *    （最后一次用户输入距今多少毫秒），**根本不知道你按了什么**。
+ *    与当初明确砍掉的键鼠钩子（记录按键内容）性质完全不同。
+ *
+ * 由外壳定期经**反向通道**（stdin 一行 JSON）喂进来；没有外壳喂 = 相应能力自动静默
+ * （如闲聊不触发），但监控照常、不崩、不报错 —— 与 M5「空 loadout 降级」同一原则。
+ */
+export interface ContextInput {
+  /** 最后一次用户输入距今多少毫秒（空闲时长） */
+  readonly idleMs?: number;
+}
+
 // ─────────────────────────────── 插件实例契约 ───────────────────────────────
 
 /** probe（采集器）：产生指标 */
@@ -121,13 +152,38 @@ export interface Probe {
 export interface Rule {
   readonly id: string;
   evaluate(batch: MetricBatch): readonly ZhizhiEvent[];
+  /**
+   * 可选：接收外壳喂来的上下文（M6，如 `idleMs`）。
+   * 不实现 = 不关心上下文；内核转交时会把实现里的抛错隔离掉。
+   */
+  onContext?(ctx: ContextInput): void;
+  /**
+   * 可选：接收内核下发的配置（M6，来自数据目录的设置文件）。
+   * 整份配置都递进来，插件只认领自己认识的键 —— 认领不到的保持默认。
+   * 配置只在启动时下发一次；实现里的抛错同样会被隔离。
+   */
+  configure?(config: Readonly<Record<string, unknown>>): void;
 }
 
 /** persona（台词包）：事件 + 情境 → 台词 */
 export interface Persona {
   readonly id: string;
-  /** 给一个事件挑一句话；返回 undefined 表示「这次不说话」 */
-  speak(event: ZhizhiEvent): Line | undefined;
+  /**
+   * 给一个事件挑一句话；返回 undefined 表示「这次不说话」。
+   *
+   * ⭐ M6 起配合 core/voice.ts 的**三段式**挑句（三层台词池 user > 内置 > learned，决策 #20）：
+   *   第一段（不带 options）—— 只挑该事件类型**专属**台词里「没说过」的；
+   *     全用过或没这个类型 → 返回 undefined，把机会让给下一层。
+   *   第二段（`{ useFallback: true }`）—— 只挑 `"*"` 兜底键里「没说过」的。
+   *   第三段（`{ allowRepeat: true }`）—— 全都说过了，允许重复（宁可重复也不哑巴）。
+   *
+   * 这个顺序保证：模型补的专属台词（learned）能排在内置包的 `"*"` 兜底**前面**出场，
+   * 否则兜底键会把下层整个挡死；不关心这些的实现（如写代码的台词包）忽略 options 即可。
+   */
+  speak(
+    event: ZhizhiEvent,
+    options?: { readonly allowRepeat?: boolean; readonly useFallback?: boolean },
+  ): Line | undefined;
 }
 
 /** channel（通道）：把一句话送去哪儿 */

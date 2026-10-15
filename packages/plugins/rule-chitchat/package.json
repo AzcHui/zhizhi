@@ -1,0 +1,15 @@
+{
+  "name": "@zhizhi/rule-chitchat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "闲聊规则（官方插件）：空闲够久就主动说一句 —— 独立于告警，不复用告警的阈值与闸门",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./manifest.json": "./manifest.json"
+  },
+  "dependencies": {
+    "@zhizhi/plugin-sdk": "workspace:*"
+  }
+}

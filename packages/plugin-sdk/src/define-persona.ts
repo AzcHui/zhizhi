@@ -21,8 +21,15 @@ import type { Line, Persona, ZhizhiEvent } from '@zhizhi/core';
 
 export interface PersonaDefinition {
   readonly id: string;
-  /** 挑一句话；返回 undefined = 「这次选择不说」 */
-  readonly speak: (event: ZhizhiEvent) => Line | undefined;
+  /**
+   * 挑一句话；返回 undefined = 「这次选择不说」。
+   * `options` 的三段式约定（专属新鲜 → `"*"` 兜底新鲜 → 才许重复）
+   * 见 core 里 `Persona` 契约的说明；不关心的实现忽略它即可。
+   */
+  readonly speak: (
+    event: ZhizhiEvent,
+    options?: { readonly allowRepeat?: boolean; readonly useFallback?: boolean },
+  ) => Line | undefined;
 }
 
 export function definePersona(definition: PersonaDefinition): Persona {
@@ -153,15 +160,36 @@ function fillPlaceholders(text: string, event: ZhizhiEvent): string {
 export function definePersonaFromJson(raw: unknown, source: string): Persona {
   const data = parsePersonaJson(raw, source);
 
+  // 「没说过」记录（进程内存活期）—— M6 挑句原则：**没说过 / 近期没说过的优先**。
+  // 与 core/voice.ts 的两段式配合：第一段只出新鲜的（全用过就 undefined，让给下一层），
+  // 第二段（allowRepeat）才允许重复。M7 记忆系统落地后换成持久化的「近期说过」。
+  const said = new Set<string>();
+
   return definePersona({
     id: data.id,
-    speak(event: ZhizhiEvent): Line | undefined {
-      const pool = data.lines[event.type] ?? data.lines[FALLBACK_KEY];
+    speak(
+      event: ZhizhiEvent,
+      options?: { readonly allowRepeat?: boolean; readonly useFallback?: boolean },
+    ): Line | undefined {
+      // 三段式（见 core/Persona 契约）：专属新鲜 → `"*"` 兜底新鲜 → 才许重复。
+      // ⚠️ 第一段绝不能把 `"*"` 混进来 —— 否则中层的兜底键会把下层的专属台词挡死。
+      const allowRepeat = options?.allowRepeat === true;
+      const useFallback = options?.useFallback === true;
+      const specific = data.lines[event.type];
+      const pool = useFallback
+        ? data.lines[FALLBACK_KEY]
+        : (specific ?? (allowRepeat ? data.lines[FALLBACK_KEY] : undefined));
       // 没有台词 = 「这次我不说」→ 返回 undefined，让内核用客观描述兜底。
       // ⚠️ 这里**绝不能**抛错：台词包是默认值不是必需品，缺台词不是故障。
       if (pool === undefined || pool.length === 0) return undefined;
 
-      const picked = pool[Math.floor(Math.random() * pool.length)]!;
+      const fresh = pool.filter((line) => !said.has(line));
+      const candidates = fresh.length > 0 ? fresh : allowRepeat ? pool : [];
+      // 全都说过了、又不许重复 → undefined，把机会让给下一层台词包
+      if (candidates.length === 0) return undefined;
+
+      const picked = candidates[Math.floor(Math.random() * candidates.length)]!;
+      said.add(picked);
       return { text: fillPlaceholders(picked, event) };
     },
   });

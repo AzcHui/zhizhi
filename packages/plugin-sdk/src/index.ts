@@ -26,6 +26,8 @@ export type { ManifestIssue, PluginManifest, PluginPermissions } from './manifes
 // 数据契约（转发内核定义，插件不许自己另发明一套）
 export type {
   Channel,
+  ContextInput,
+  EventKind,
   Feedback,
   Line,
   LogLevel,

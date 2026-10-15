@@ -19,6 +19,9 @@ tools/float-preview.settings.json
 # 浮窗渲染检查的截图（机器相关，不入库；运行日志由 *.log 覆盖）
 tools/float-preview.render.png
 
+# 内核数据目录（决策 #21：用户数据与代码资产物理分开，不入库）
+data/
+
 .env
 .env.*
 !.env.example

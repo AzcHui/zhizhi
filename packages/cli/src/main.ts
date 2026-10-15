@@ -16,6 +16,10 @@
  * M1 起，插件不再写死在这个文件里 —— 见 `plugins.ts`（清单）与 `loader.ts`（加载器）。
  */
 
+import { mkdirSync, readFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import {
   Bus,
   DEFAULT_COOLDOWN_MS,
@@ -30,7 +34,8 @@ import {
   runGates,
   setLogLevel,
 } from '@zhizhi/core';
-import type { Metric, MetricBatch, ZhizhiEvent } from '@zhizhi/core';
+import type { ContextInput, Metric, MetricBatch, ZhizhiEvent } from '@zhizhi/core';
+import { definePersonaFromJson } from '@zhizhi/plugin-sdk';
 
 import { loadPlugins } from './loader.ts';
 import { PLUGINS } from './plugins.ts';
@@ -69,9 +74,123 @@ for (const [name, value] of [
   }
 }
 
+// ── M6 · 数据目录与闲聊参数 ──
+// 数据目录（决策 #21）：user.json / learned.json / zhizhi.settings.json 这些**用户数据**
+// 都住这里 —— 绝不放插件包（随代码走 = git 冲突 / 重装即丢 / 污染只读区）。
+// ⚠️ 路径走配置项、不硬编码：默认按 cli 模块位置推到仓库根的 data/（与 cwd 无关，
+//    pnpm start 和浮窗拉起两种跑法落在同一处）；M4-b 打包后只改这个默认值指向 %LOCALAPPDATA%。
+const dataDirOption = option('data-dir');
+const dataDir =
+  dataDirOption === undefined
+    ? fileURLToPath(new URL('../../../data/', import.meta.url))
+    : isAbsolute(dataDirOption)
+      ? `${dataDirOption.replace(/[\\/]+$/, '')}/`
+      : resolve(process.cwd(), dataDirOption);
+
+// 固定空闲时长（**验收 / 调试用**）：省去「真得闲 10 分钟」才能验闲聊。
+// 正常运行不要传它 —— 空闲时长该由外壳经 stdin 实时喂。
+const idleOverrideOption = option('idle-ms');
+const idleOverride =
+  idleOverrideOption === undefined ? undefined : Number(idleOverrideOption);
+if (idleOverride !== undefined && (!Number.isFinite(idleOverride) || idleOverride < 0)) {
+  console.error(`--idle-ms 必须是一个非负数，收到 "${String(idleOverrideOption)}"`);
+  process.exit(2);
+}
+
 if (argv.includes('--verbose')) setLogLevel('debug');
 
 const log = createLogger('cli');
+
+// 数据目录建好（用户要往里放 user.json / 改 settings）；建不出来不拦内核，只告警
+try {
+  mkdirSync(dataDir, { recursive: true });
+} catch (err) {
+  log.warn(
+    `数据目录建不了：${dataDir} —— 用户台词池与设置文件将不可用（内核照常运行）`,
+    err instanceof Error ? err.message : err,
+  );
+}
+
+/**
+ * 读数据目录里的设置文件（`zhizhi.settings.json`）。
+ *
+ * 三条纪律（与「宁可不传也不传错」一致）：
+ *   文件不在   → 全用默认（第一次跑的正常状态，不是错）
+ *   JSON 坏了  → 整份不用，告警（不猜半个配置）
+ *   单键类型不对 → 只丢那个键，告警（其余照用）
+ */
+function loadSettings(): Record<string, unknown> {
+  const path = resolve(dataDir, 'zhizhi.settings.json');
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+    if (!missing) {
+      log.warn(`设置文件读不动：${path} —— 整份忽略，全用默认。`, err instanceof Error ? err.message : err);
+    }
+    return {};
+  }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    log.warn(`设置文件不合规：${path} —— 顶层必须是 JSON 对象。整份忽略，全用默认。`);
+    return {};
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const ok =
+      typeof value === 'number' && Number.isFinite(value) && value >= 0
+        ? true
+        : typeof value === 'boolean';
+    if (!ok) {
+      log.warn(`设置文件里 "${key}" 不是非负数或布尔（收到 ${JSON.stringify(value) ?? 'undefined'}），忽略该键`);
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+const settings = loadSettings();
+
+/**
+ * 把数据目录里的一份台词池（`user.json` / `learned.json`）登记进账本。
+ *
+ * 它们与 manifest 台词包同一种 JSON 形状（`{ id?, lines }`），但**不是插件**：
+ *   · 文件不在 = 正常状态（第一次跑本来就没有）→ debug 记一笔就走，不告警
+ *   · 坏了 / 与已有插件重名 → 告警 + 跳过（绝不静默顶掉别人的账）
+ * 入账顺序由调用方控制 —— registry 按入账顺序说话，这正是三层优先级的实现：
+ *   **user（最先）→ manifest 台词包 → learned（最后）**（决策 #20）
+ */
+function adoptDataPool(filename: string, fallbackId: string): void {
+  const path = resolve(dataDir, filename);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+    if (missing) {
+      log.debug(`用户台词池 ${filename} 不存在（正常，不是错）—— 跳过`);
+    } else {
+      log.warn(`用户台词池读不动：${path} —— 跳过（内核照常运行）`, err instanceof Error ? err.message : err);
+    }
+    return;
+  }
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj['id'] !== 'string' || obj['id'].trim() === '') obj['id'] = fallbackId;
+  }
+  try {
+    const persona = definePersonaFromJson(raw, path);
+    if (registry.hasPlugin(persona.id)) {
+      log.warn(`用户台词池 ${filename} 的 id（${persona.id}）与已有插件重名 —— 跳过（不覆盖别人的账）`);
+      return;
+    }
+    registry.adoptPersona(persona.id, persona);
+    log.info(`用户台词池已激活：${persona.id}（${path}）`);
+  } catch (err) {
+    log.warn(`用户台词池不合规：${path} —— 跳过。`, err instanceof Error ? err.message : err);
+  }
+}
 
 // ─────────────────────────── 内核 5 样立起来 ───────────────────────────
 
@@ -91,8 +210,26 @@ const gates = createGates({ store, intervalMs, sustainMs, cooldownMs });
 log.debug(
   `清单共 ${PLUGINS.length} 条：${PLUGINS.map((s) => s.specifier).join(', ')}`,
 );
+// 台词池三层（决策 #20）的第 1 层先入账：user.json（你手写的，优先级最高）
+adoptDataPool('user.json', 'persona-user');
 const outcomes = await loadPlugins(PLUGINS, registry, log.child('loader'));
+// 第 3 层最后入账：learned.json（模型补的，可删改 —— 它就是反馈的载体）
+adoptDataPool('learned.json', 'persona-learned');
 const errors = outcomes.filter((o) => o.status === 'failed');
+
+// 配置下发（M6）：数据目录设置文件 → 实现了 configure() 的规则各认领各的键。
+// 一次启动只发一次；单个规则接配置时抛错被隔离，不影响其余规则。
+for (const rule of registry.rules()) {
+  if (typeof rule.configure !== 'function') continue;
+  try {
+    rule.configure(settings);
+  } catch (err) {
+    log.error(
+      `规则 ${rule.id} 接收配置时抛错（已隔离，用自身默认值继续）`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
 
 // 通道注册进 dispatcher —— 走哪个通道由 dispatcher 按 severity 裁决，插件自己选不了
 for (const channel of registry.channels()) dispatcher.register(channel);
@@ -133,12 +270,17 @@ bus.on<MetricBatch>('metric', (batch) => {
 });
 
 bus.on<ZhizhiEvent>('event.candidate', (event) => {
-  const verdict = runGates(gates, event, { now: Date.now(), passed: passedEvents });
+  // 决策 #22：闸门是**告警**的分寸系统 —— chitchat 没有指标证据（threshold 会拦「空口报」）、
+  // 天然只冒一次（sustained 会拦）→ **绕闸门**；但 **dispatcher 不能绕**：
+  // 它是唯一出口，静默时段 / 每日上限这些宪法级机制都在出口那一侧管着闲聊。
+  if (event.kind !== 'chitchat') {
+    const verdict = runGates(gates, event, { now: Date.now(), passed: passedEvents });
 
-  if (!verdict.pass) {
-    // 「我知道，但我选择不说。」—— 下面这行 debug 就是只只的分寸所在
-    log.debug(`闸门「${verdict.blockedBy}」压下了 ${event.type}：${verdict.reason ?? ''}`);
-    return;
+    if (!verdict.pass) {
+      // 「我知道，但我选择不说。」—— 下面这行 debug 就是只只的分寸所在
+      log.debug(`闸门「${verdict.blockedBy}」压下了 ${event.type}：${verdict.reason ?? ''}`);
+      return;
+    }
   }
 
   passedEvents.push(event);
@@ -153,6 +295,61 @@ bus.on<ZhizhiEvent>('event.candidate', (event) => {
       if (sent) log.info(`只只说了［${event.severity}］：${line.text}`);
     });
 });
+
+// ─────────────────── 反向通道（M6）：外壳经 stdin 喂上下文 ───────────────────
+//
+// 协议：一行一个 JSON 对象，目前只认 `{"idleMs": <非负数>}`。
+// 没有外壳喂 = 没有上下文 → 闲聊自动静默（不崩、不报错，监控照常 —— 硬约束 ③）。
+// ⚠️ 不是键鼠监听：idleMs 只是「最后一次输入距今多少毫秒」这一个数字。
+
+let context: ContextInput = idleOverride === undefined ? {} : { idleMs: idleOverride };
+
+function deliverContext(ctx: ContextInput): void {
+  for (const rule of registry.rules()) {
+    if (typeof rule.onContext !== 'function') continue;
+    try {
+      rule.onContext(ctx);
+    } catch (err) {
+      log.error(
+        `规则 ${rule.id} 处理上下文时抛错（已隔离）`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+}
+
+let stdinBuf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk: string) => {
+  stdinBuf += chunk;
+  let idx = stdinBuf.indexOf('\n');
+  while (idx >= 0) {
+    const line = stdinBuf.slice(0, idx).trim();
+    stdinBuf = stdinBuf.slice(idx + 1);
+    if (line !== '') {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown> | null;
+        const idle = obj === null || typeof obj !== 'object' ? undefined : obj['idleMs'];
+        if (typeof idle === 'number' && Number.isFinite(idle) && idle >= 0) {
+          context = { idleMs: idle };
+          deliverContext(context);
+        } else {
+          log.warn(`上下文行缺有效的 "idleMs"，已忽略：${line.slice(0, 80)}`);
+        }
+      } catch {
+        log.warn(`上下文行不是合法 JSON，已忽略：${line.slice(0, 80)}`);
+      }
+    }
+    idx = stdinBuf.indexOf('\n');
+  }
+});
+process.stdin.on('error', (err) => {
+  log.warn('stdin 读取出错（外壳的上下文喂不进来了，闲聊将静默；监控照常）', err.message);
+});
+// ⚠️ 不让 stdin 拖住退出：验收模式（--ticks）跑满后进程要能干净退场
+process.stdin.unref();
+// 把初始上下文（含 --idle-ms 的固定值）也发一遍 —— 别让规则等到第一行 stdin 才见到它
+deliverContext(context);
 
 // ─────────────────────────────── 采样编排 ───────────────────────────────
 // 编排逻辑仍留在 cli：它是「内核进程的入口」，M4 的 app 连的是这个进程而不是重跑一份。
@@ -220,6 +417,22 @@ process.on('SIGTERM', () => shutdown(0));
 log.info(`只只已上线 —— 每 ${intervalMs} ms 采一次`);
 log.info(
   `插件在岗 ${registry.activeCount} / ${PLUGINS.length}：${registry.activeIds().join(', ') || '（无）'}`,
+);
+log.info(`数据目录：${dataDir}（user.json / learned.json / zhizhi.settings.json 住这里；--data-dir 可改）`);
+// 闲聊旋钮只做汇报 —— 真正的消费方是 rule-chitchat（configure 已下发）
+const chitchatInterval = typeof settings['chitchatIntervalMs'] === 'number' ? `${settings['chitchatIntervalMs']}ms` : '默认 30 分钟';
+const chitchatIdle = typeof settings['chitchatIdleMs'] === 'number' ? `${settings['chitchatIdleMs']}ms` : '默认 10 分钟';
+log.info(`闲聊：空闲阈值 ${chitchatIdle} · 间隔 ${chitchatInterval}（与告警完全独立）`);
+const modelEnabled = settings['modelEnabled'] === true;
+log.info(
+  modelEnabled
+    ? '模型层：设置里开了，但 M6 加餐还没实现 —— 现在先当没开（纯池子照常说话）'
+    : '模型层：关（M6 加餐；预生成挂载位已留 —— 说话永不等模型）',
+);
+log.info(
+  idleOverride === undefined
+    ? '上下文输入：等外壳经 stdin 喂 {"idleMs":N} —— 没有外壳 = 闲聊自动静默（不是故障）'
+    : `上下文输入：固定 idleMs=${idleOverride}（验收/调试用；正常该由外壳实时喂）`,
 );
 // 台词包单独说一句 —— 「0 个」是**正常降级**，不是故障，得让日志把它说清楚
 const personaIds = registry.personaIds();

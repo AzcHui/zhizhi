@@ -243,17 +243,14 @@ for (const channel of registry.channels()) dispatcher.register(channel);
 //   ① rule 只负责发现，**能不能说出口由内核闸门决定** —— 插件不掌握分寸
 //   ② 跨插件的每一次流转都走总线，没有一个插件 import 另一个（铁律①）
 
-let tickBatches: MetricBatch[] = [];
-const passedEvents: ZhizhiEvent[] = [];
-// 台词包从**账本**里取 —— 与 probe / rule / channel 走同一条加载路径。
+// 台词包从**账本**里取（见下方 composeLine 调用处）—— 与 probe / rule / channel 走同一条加载路径。
 // ⚠️ M5 硬约束：这里**不许** import 任何写死的内置台词包，否则「可整体替换」就是假的。
 //   一个台词包都没有时，composeLine 会自动降级成事件的客观描述（不崩、不哑）。
+let tickBatches: MetricBatch[] = [];
+const passedEvents: ZhizhiEvent[] = [];
 
-bus.on<MetricBatch>('metric', (batch) => {
-  // ① 汇总起来，给本 tick 的 stdout 报告用
-  tickBatches.push(batch);
-
-  // ② 交给规则去「发现」
+/** 把一个 batch 交给全部规则去「发现」；单条规则抛错被隔离，其余继续 */
+function dispatchToRules(batch: MetricBatch): void {
   for (const rule of registry.rules()) {
     let candidates: readonly ZhizhiEvent[];
     try {
@@ -267,6 +264,14 @@ bus.on<MetricBatch>('metric', (batch) => {
     }
     for (const event of candidates) bus.emit<ZhizhiEvent>('event.candidate', event);
   }
+}
+
+bus.on<MetricBatch>('metric', (batch) => {
+  // ① 汇总起来，给本 tick 的 stdout 报告用
+  tickBatches.push(batch);
+
+  // ② 交给规则去「发现」
+  dispatchToRules(batch);
 });
 
 bus.on<ZhizhiEvent>('event.candidate', (event) => {
@@ -403,6 +408,15 @@ const scheduler = new Scheduler(
   async (tick, now): Promise<void> => {
     const started = performance.now();
     const probes = await sampleAll();
+
+    // 决策 #24-⑥ 的**最小解耦**：一个 probe 都没有（没装 / 全挂）也要给规则一次心跳 ——
+    // 闲聊是**时间驱动**的，不需要任何指标；「只想让它陪聊、不想监控」正是关 probe 最自然的
+    // 动机，闲聊不该陪葬。空 batch 对 rule-threshold 无害（没有指标就无命中）。
+    // （完整的「事件评估与采集解耦」——按 probe 独立调度等 —— 仍归 M8-a。）
+    if (tickBatches.length === 0) {
+      dispatchToRules({ probeId: '(no-probe)', metrics: [] });
+    }
+
     const elapsedMs = Number((performance.now() - started).toFixed(1));
 
     const report = {
@@ -430,9 +444,22 @@ log.info(
   `插件在岗 ${registry.activeCount} / ${PLUGINS.length}：${registry.activeIds().join(', ') || '（无）'}`,
 );
 log.info(`数据目录：${dataDir}（user.json / learned.json / zhizhi.settings.json 住这里；--data-dir 可改）`);
-// 闲聊旋钮只做汇报 —— 真正的消费方是 rule-chitchat（configure 已下发）
-const chitchatInterval = typeof settings['chitchatIntervalMs'] === 'number' ? `${settings['chitchatIntervalMs']}ms` : '默认 30 分钟';
-const chitchatIdle = typeof settings['chitchatIdleMs'] === 'number' ? `${settings['chitchatIdleMs']}ms` : '默认 10 分钟';
+// 闲聊旋钮只做汇报 —— 真正的消费方是 rule-chitchat（configure 已下发）。
+// ⚠️ 汇报必须按**实际生效**口径：间隔 0 会被规则拒收（>0 才收）→ 如实报「默认」并告警，
+//    别让日志说「间隔 0ms」而实际跑 30 分钟（监工复验抓到的谎报）。
+const rawChitchatInterval = settings['chitchatIntervalMs'];
+const rawChitchatIdle = settings['chitchatIdleMs'];
+const chitchatInterval =
+  typeof rawChitchatInterval === 'number' && rawChitchatInterval > 0
+    ? `${rawChitchatInterval}ms`
+    : '默认 30 分钟';
+const chitchatIdle =
+  typeof rawChitchatIdle === 'number' && rawChitchatIdle >= 0
+    ? `${rawChitchatIdle}ms`
+    : '默认 10 分钟';
+if (rawChitchatInterval === 0) {
+  log.warn('设置 chitchatIntervalMs = 0 无效（间隔必须 > 0，否则每轮都聊）—— 按默认 30 分钟');
+}
 log.info(`闲聊：空闲阈值 ${chitchatIdle} · 间隔 ${chitchatInterval}（与告警完全独立）`);
 const modelEnabled = settings['modelEnabled'] === true;
 log.info(

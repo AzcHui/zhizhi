@@ -358,12 +358,15 @@ function Start-Kernel {
     $script:kernel = [System.Diagnostics.Process]::Start($psi)
   } catch {
     Write-ZhiLog ('[ERR] 内核启动失败：' + $_.Exception.Message)
+    Clear-StatusText    # 申明作废，回落到底色（内核停了）
     Show-ErrorHint '内核启动失败，详情见日志'
     return
   }
 
   $script:kernelOut = $script:kernel.StandardOutput.ReadLineAsync()
   $script:kernelErr = $script:kernel.StandardError.ReadLineAsync()
+  # 【申明点 ①】sidecar 启动 —— 不给超时：数据来了才算「叫起来了」（Apply-SampleLine 里清）
+  Set-StatusText '正在把内核叫起来…'
   Write-ZhiLog ('内核已作为 sidecar 启动：PID=' + $script:kernel.Id + ' 参数=' + $kernelArgs)
 }
 
@@ -381,6 +384,7 @@ function Stop-Kernel {
   $script:kernel = $null
   $script:kernelOut = $null
   $script:kernelErr = $null
+  Update-StateArea    # 底色立刻变「内核停了」（不等下一轮轮询）
 }
 
 # stdout 来了一行。⚠️ M6 起它有**两种**行（都在设计好的数据通道上）：
@@ -401,7 +405,9 @@ function Apply-SampleLine([string]$line) {
       if ($null -ne $cpu) { $lblCpuV.Text = ('{0:N1}%' -f [double]$cpu) }
       if ($null -ne $mem) { $lblMemV.Text = ('{0:N1}%' -f [double]$mem) }
       $script:kernelLines++
+      if ($script:kernelLines -eq 1) { Clear-StatusText }   # 【申明①结束】数据到了 = 内核叫起来了
       Update-PosLabel
+      Update-StateArea
     }
   } catch {
     Write-ZhiLog ('[ERR] 采样行解析失败：' + $_.Exception.Message)
@@ -500,8 +506,12 @@ function Poll-Kernel {
     Write-ZhiLog ('[ERR] 内核退出了（退出码 ' + $script:kernel.ExitCode + '）—— 数据不再更新')
     $lblCpuV.Text = '—'
     $lblMemV.Text = '—'
+    Set-StatusText '内核走了' 5   # 【申明点 ②】5s 后回落到底色「内核停了」
     Show-ErrorHint '内核退出，数据已停'
   }
+
+  # 状态区渲染口：申明到期回落、底色跟随 CPU / 空闲变化（文本没变就不动控件）
+  Update-StateArea
 }
 
 # ─────────────────────────────── 建窗 ───────────────────────────────
@@ -545,8 +555,12 @@ $lblCpuK  = New-Label 'CPU'  $cSub    'MiddleLeft'
 $lblCpuV  = New-Label '—'    $cInk    'MiddleRight'
 $lblMemK  = New-Label 'MEM'  $cSub    'MiddleLeft'
 $lblMemV  = New-Label '—'    $cInk    'MiddleRight'
-# 只只说的话（M4-a）：内核 stderr 里的「只只说了…」会显示到这里
-$lblSaid  = New-Label '（正在看着这台机器…）' $cInk 'MiddleLeft'
+# ⭐ M4-c 双区分工 = 两种时间尺度（决策 #25）：
+#   状态区（lblState）= **持续的存在感**（"在干什么"，低频、跨状态才改，弱色）
+#   发言区（lblSaid） = **瞬时的事件**（说的话，事件驱动）——
+#   ⚠️ 发言区初值必须是**空**：状态冒充发言 = 一说真话就被顶掉、再也回不来（立项理由，用户实测踩过）
+$lblState = New-Label ''     $cSub    'MiddleLeft'
+$lblSaid  = New-Label ''     $cInk    'MiddleLeft'
 
 $btnSay   = New-FlatButton '说说'
 $btnQuiet = New-FlatButton '安静'
@@ -594,7 +608,7 @@ $script:panelCtrls = @($lblSize, $lblOpa, $lblTop, $lblRem,
   $btnTopOn, $btnTopOff, $btnRemOn, $btnRemOff)
 
 $script:mainCtrls = @(
-  $lblTitle, $lblPos, $lblCpuK, $lblCpuV, $lblMemK, $lblMemV, $lblSaid,
+  $lblTitle, $lblPos, $lblCpuK, $lblCpuV, $lblMemK, $lblMemV, $lblState, $lblSaid,
   $btnSay, $btnQuiet, $btnPos, $btnSet, $btnClose
 )
 
@@ -645,8 +659,8 @@ function Set-Layout {
   $fBody  = $script:fonts.body
   $fSmall = $script:fonts.small
 
-  # 主区高度：M4-a 起多了一行「只只说的话」，146 → 170
-  $mainH = [int][Math]::Round(170 * $k)
+  # 主区高度：M4-c 又多一行「状态区」，170 → 188
+  $mainH = [int][Math]::Round(188 * $k)
   $script:mainH = $mainH
   $panelH = [int][Math]::Round(116 * $k)
   $totalH = $mainH
@@ -667,21 +681,24 @@ function Set-Layout {
   Set-Bounds $lblMemV (100 * $k) (82 * $k) (128 * $k) (22 * $k)
   $lblMemV.Font = $fBody
 
-  # 只只说的话（M4-a 新增）—— 它是这个窗口里唯一「有温度」的一行
-  Set-Bounds $lblSaid (16 * $k) (106 * $k) (212 * $k) (20 * $k)
+  # 状态区（M4-c 新增）—— "在干什么"，弱色（与发言区视觉分两区）
+  Set-Bounds $lblState (16 * $k) (106 * $k) (212 * $k) (16 * $k)
+  $lblState.Font = $fSmall
+  # 发言区 —— 只放「说的话」，事件驱动；没说话时就空着（状态归状态区管）
+  Set-Bounds $lblSaid (16 * $k) (124 * $k) (212 * $k) (20 * $k)
   $lblSaid.Font = $fSmall
 
-  Set-Bounds $btnSay   (16 * $k)  (134 * $k) (50 * $k) (26 * $k)
-  Set-Bounds $btnQuiet (70 * $k)  (134 * $k) (50 * $k) (26 * $k)
-  Set-Bounds $btnPos   (124 * $k) (134 * $k) (50 * $k) (26 * $k)
-  Set-Bounds $btnSet   (178 * $k) (134 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnSay   (16 * $k)  (152 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnQuiet (70 * $k)  (152 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnPos   (124 * $k) (152 * $k) (50 * $k) (26 * $k)
+  Set-Bounds $btnSet   (178 * $k) (152 * $k) (50 * $k) (26 * $k)
   foreach ($b in @($btnSay, $btnQuiet, $btnPos, $btnSet)) { $b.Font = $fSmall }
 
   Set-Bounds $btnClose (206 * $k) (11 * $k) (24 * $k) (22 * $k)
   $btnClose.Font = $fSmall
 
-  # —— 设置面板：行 178 / 204 / 230 / 256（M4-a 因主区多一行整体下移 24），按钮组右对齐到 228 ——
-  $rows = @(178, 204, 230, 256)
+  # —— 设置面板：行 196 / 222 / 248 / 274（M4-c 因主区多一行整体下移 18），按钮组右对齐到 228 ——
+  $rows = @(196, 222, 248, 274)
   $lbls = @($lblSize, $lblOpa, $lblTop, $lblRem)
   for ($i = 0; $i -lt 4; $i++) {
     $c = $lbls[$i]
@@ -691,8 +708,8 @@ function Set-Layout {
   # 三选一行（尺寸 / 透明）：x = 96 / 141 / 186（宽 42）
   $x3 = @(96, 141, 186)
   $three = @(
-    @{ y = 178; btns = @($btnSizeSm, $btnSizeMd, $btnSizeLg) },
-    @{ y = 204; btns = @($btnOpaThin, $btnOpaMid, $btnOpaSolid) }
+    @{ y = 196; btns = @($btnSizeSm, $btnSizeMd, $btnSizeLg) },
+    @{ y = 222; btns = @($btnOpaThin, $btnOpaMid, $btnOpaSolid) }
   )
   foreach ($g in $three) {
     for ($i = 0; $i -lt 3; $i++) {
@@ -704,8 +721,8 @@ function Set-Layout {
   # 二选一行（置顶 / 记住位置）：x = 141 / 186，对齐到三选一的后两格
   $x2 = @(141, 186)
   $two = @(
-    @{ y = 230; btns = @($btnTopOn, $btnTopOff) },
-    @{ y = 256; btns = @($btnRemOn, $btnRemOff) }
+    @{ y = 248; btns = @($btnTopOn, $btnTopOff) },
+    @{ y = 274; btns = @($btnRemOn, $btnRemOff) }
   )
   foreach ($g in $two) {
     for ($i = 0; $i -lt 2; $i++) {
@@ -770,7 +787,6 @@ function Update-PosLabel {
   # 内核活着的话，把「已经看了几轮」报出来 —— 这是窗口活着最直观的证据
   if ($script:kernelDead) { $parts += '内核已停' }
   elseif ($script:kernelLines -gt 0) { $parts += ('已看 ' + $script:kernelLines + ' 轮') }
-  if ($script:stateText) { $parts += $script:stateText }
   $lblPos.Text = ($parts -join ' · ')
 }
 
@@ -789,7 +805,6 @@ function Apply-Settings {
 $script:nodeExe   = Resolve-NodeExe $NodeExe
 if ($script:nodeExe) { $script:nodeInfo = Get-NodeScore $script:nodeExe }
 else { $script:nodeInfo = [pscustomobject]@{ Raw = 'n/a'; Score = 0 } }
-$script:stateText = ''
 
 # 内核参数（命令行给的，或默认）—— M4-a：这个窗口会自己把内核拉起来
 $script:kernelIntervalMs = 2000
@@ -825,9 +840,62 @@ function End-Drag {
 # 好处：① 处理器只剩「try/catch + 调函数」，异常无处可逃
 #       ② 自检（-SelfTest）可以直接调这些函数，不必真去点按钮
 
-function Set-StatusText([string]$text) {
-  $script:stateText = $text
-  Update-PosLabel
+# ── M4-c 状态区（决策 #25）：申明为主 + 超时回落 + 底色 ──────────────────────
+# 双区分工：状态区 = 持续的存在感（低频、跨状态才改）；发言区 = 瞬时事件。
+# ⚠️ 更新规则（照报表口径，不得改）：
+#      状态区显示 ＝ 申明未超时则用它，否则用底色
+#    → 所以**底色必须永远有值**（回落时窗口不能空白）。
+# ⚠️ 外壳申明的状态**只能用于显示** —— 不能因为外壳"觉得该安静"就真静默
+#    （静默机制是内核宪法）。requestSay 那种是「用户的明确指令」转发，不在此列。
+
+$script:declaredState = $null   # @{ Text; ExpiresAt }；ExpiresAt = $null 表示「直到被清除」
+$script:stateMood = ''          # 🪑 Line.mood 预留位（M7 亲密度才可能有值；先把位置留出来）
+
+# 申明一条状态。timeoutSec > 0 → 到点自动回落到底色（口径 3~8s）；
+# timeoutSec = 0 → 保持直到被清除（如「正在把内核叫起来…」—— 数据来了才算起来）。
+function Set-StatusText([string]$text, [int]$timeoutSec = 0) {
+  if ($text -eq '') {
+    $script:declaredState = $null
+  } else {
+    $script:declaredState = @{
+      Text = $text
+      ExpiresAt = $(if ($timeoutSec -gt 0) { [DateTime]::Now.AddSeconds($timeoutSec) } else { $null })
+    }
+  }
+  Update-StateArea
+}
+
+# 申明提前结束（不需要等超时：如内核首条数据到了，「正在叫起来」就该结束）
+function Clear-StatusText {
+  $script:declaredState = $null
+  Update-StateArea
+}
+
+# 底色（推导为辅）—— 三选一，**总有一条成立**
+function Get-BaseStateText {
+  if ($script:kernelDead -or $null -eq $script:kernel) { return '内核停了' }
+  $idle = Get-IdleMs
+  if ($null -ne $idle -and $idle -ge (10 * 60 * 1000)) { return '你闲着，我也闲着' }
+  $cpu = $lblCpuV.Text
+  if ($cpu -eq '—') { return '看着呢' }
+  return ('看着呢 —— CPU ' + $cpu)
+}
+
+# 状态区唯一渲染口。高频调用没关系：文本没变就不动控件（呼吸感，不是刷新感）
+function Update-StateArea {
+  $text = $null
+  if ($null -ne $script:declaredState) {
+    $exp = $script:declaredState.ExpiresAt
+    if ($null -eq $exp -or [DateTime]::Now -lt $exp) {
+      $text = $script:declaredState.Text
+    } else {
+      $script:declaredState = $null   # 超时 → 回落到底色
+    }
+  }
+  if ($null -eq $text) { $text = Get-BaseStateText }
+  # 🪑 mood 位（M7）：亲密度有情绪标签时挂在状态尾部；现在恒为空、零开销
+  if ($script:stateMood -ne '') { $text = $text + '　' + $script:stateMood }
+  if ($lblState.Text -ne $text) { $lblState.Text = $text }
 }
 
 function Move-NextPosition {
@@ -903,15 +971,15 @@ $btnClose.Add_Click({
 
 $btnSay.Add_Click({
   try {
-    if (Feed-RequestSay) { Set-StatusText '（去说了，等它回话…）' }
-    else { Set-StatusText '（内核没在跑，叫不动）' }
+    if (Feed-RequestSay) { Set-StatusText '去说了，等它回话…' 5 }   # 【申明点 ③】5s 回落
+    else { Set-StatusText '内核没在跑，叫不动' 5 }
     Write-ZhiLog '点击 说说'
   } catch { Report-HandlerError 'click:说说' $_ }
 })
 
 $btnQuiet.Add_Click({
   try {
-    Set-StatusText '（以后这里是静音/降频）'
+    Set-StatusText '憋着呢' 5   # 【申明点 ④】原「（以后这里是静音/降频）」落地（M4-c）
     Write-ZhiLog '点击 安静'
   } catch { Report-HandlerError 'click:安静' $_ }
 })
@@ -1065,6 +1133,7 @@ if ($SelfTest) {
       Start-Sleep -Milliseconds 120
     }
     Write-Host ("  收到采样     : " + $script:kernelLines + " 条（CPU " + $lblCpuV.Text + " / MEM " + $lblMemV.Text + "）")
+    Write-Host ("  状态区       : " + $lblState.Text + "（首条数据后「正在叫起来」应已回落）")
     Write-Host ("  只只说的话   : " + $lblSaid.Text)
     $fed = Get-IdleMs
     Feed-Idle             # 反向通道冒烟：真往 stdin 写一行，写不进去会记日志
@@ -1130,7 +1199,13 @@ if ($SelfTest) {
     ('(' + $l0.X + ',' + $l0.Y + ') -> (' + $l1.X + ',' + $l1.Y + ')  delta=(' + ($l1.X - $l0.X) + ',' + ($l1.Y - $l0.Y) + ')')
   }
 
-  Test-Step 'Set-StatusText' { Set-StatusText '（自检）'; $script:stateText }
+  Test-Step '状态区 申明'   { Set-StatusText '（自检）' 5; $lblState.Text }
+  Test-Step '状态区 超时回落' {
+    # 把申明的到期时间拨到过去 → 立即回落到底色（此刻内核已收 → 底色应为「内核停了」）
+    $script:declaredState.ExpiresAt = [DateTime]::Now.AddSeconds(-1)
+    Update-StateArea
+    $lblState.Text
+  }
 
   Write-Host ("  处理器错误累计 : '" + $script:lastError + "'  （应为空）")
   Write-Host ("  日志文件       : " + $script:LOG_PATH)

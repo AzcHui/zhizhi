@@ -225,6 +225,13 @@ function loadPersonaJson(specifier: string, registry: Registry, log: Logger): Lo
 
   try {
     const persona = definePersonaFromJson(raw, path);
+    // id 冲突查重（与 manifest 路径同一条纪律）：宁可拒绝，也不静默顶掉别人的账。
+    // ⚠️ 这是 M5 遗留的补修 —— 监工复验实测：同 id 的 .json 路径会**无声覆盖**已注册插件。
+    if (registry.hasPlugin(persona.id)) {
+      const reason = `台词包 id 冲突：${persona.id} 已被注册（${path}）`;
+      log.error(`台词包不合规：${path} —— ${reason}`);
+      return registry.reject(specifier, 'persona', 'invalid', reason);
+    }
     log.info(`台词包已激活：${persona.id}（纯数据 JSON：${path}）`);
     return registry.adoptPersona(persona.id, persona);
   } catch (err) {

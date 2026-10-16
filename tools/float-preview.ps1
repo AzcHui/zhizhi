@@ -326,6 +326,7 @@ $script:kernelOut = $null     # stdout 的「待完成异步读」
 $script:kernelErr = $null     # stderr 的「待完成异步读」
 $script:kernelLines = 0       # 已收到几条采样
 $script:kernelTrust = $null   # M7：内核报上来的亲密度（0~100；还没收到 = $null，状态区不带档位词）
+$script:posNote = ''          # 决策 #31：离开式换位后的坐标备注（空 = 显示预设名）
 $script:eventLines = 0        # 已收到几条「只只说的话」（stdout 的 type:"event"/"alert"）
 $script:kernelDead = $false
 $script:metricsTimer = $null  # UI 线程上的轮询定时器
@@ -401,6 +402,9 @@ function Apply-SampleLine([string]$line) {
     $obj = $line | ConvertFrom-Json
     if ($obj.type -eq 'event' -or $obj.type -eq 'alert') {
       $script:eventLines++
+      # 【L4 · 它自己躲开】（决策 #34）：内核裁决「戳多了」→ poked 事件 → 它自己换位。
+      # stdout 事件行不区分 kind，但 eventId 前缀区分（poked@ / say@ / chitchat@）。
+      if ($obj.eventId -like 'poked@*') { [void](Move-NextPosition) }
       Apply-SaidText ([string]$obj.text)
       return
     }
@@ -478,6 +482,18 @@ function Feed-RequestSay {
     return $true
   } catch {
     Write-ZhiLog ('[ERR] 发送 requestSay 失败：' + $_.Exception.Message)
+    return $false
+  }
+}
+
+# 「挪一挪」：向内核报一次「球被戳了」（{"poked":1}）—— 决策 #34：只报事实，裁决归内核
+function Feed-Poke {
+  if ($null -eq $script:kernel -or $script:kernel.HasExited) { return $false }
+  try {
+    $script:kernel.StandardInput.WriteLine('{"poked":1}')
+    return $true
+  } catch {
+    Write-ZhiLog ('[ERR] 发送 poked 失败（抖与挪照常，只是内核不知道）：' + $_.Exception.Message)
     return $false
   }
 }
@@ -570,7 +586,7 @@ $lblSaid  = New-Label ''     $cInk    'MiddleLeft'
 
 $btnSay   = New-FlatButton '说说'
 $btnQuiet = New-FlatButton '安静'
-$btnPos   = New-FlatButton '位置'
+$btnPos   = New-FlatButton '挪一挪'
 $btnSet   = New-FlatButton '设置'
 
 $btnClose = New-Object System.Windows.Forms.Button
@@ -774,16 +790,19 @@ function Move-ToPreset([string]$which) {
   $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
   $pt = Get-PresetPoint $which $wa $form.Width $form.Height
   $form.Location = New-Object System.Drawing.Point($pt.X, $pt.Y)
+  $script:posNote = ''   # 回到预设位 = 位置说明恢复预设名
   if ($script:settings.rememberPos -eq 'on') {
     $script:settings.posX = $pt.X
     $script:settings.posY = $pt.Y
-    Save-Settings
+    Mark-SettingsDirty   # 防抖（决策 #31 技术隐患）：不每次写盘，停 2s 或关窗时落一次
   }
   return $pt
 }
 
 function Update-PosLabel {
-  $parts = @((Get-PositionLabel $Position))
+  # 离开式换位（决策 #31）后没有预设名 —— 有坐标备注就如实报坐标，别拿旧预设名撒谎
+  if ($script:posNote -ne '') { $parts = @($script:posNote) }
+  else { $parts = @((Get-PositionLabel $Position)) }
   if ($script:nodeExe) {
     if ($script:nodeInfo.Score -lt 2218) { $parts += ('node 版本过低(' + $script:nodeInfo.Raw + ')') }
     else { $parts += ('node ' + $script:nodeInfo.Raw) }
@@ -919,16 +938,99 @@ function Update-StateArea {
 }
 
 function Move-NextPosition {
-  $order = @('BottomRight', 'TopCenter', 'Taskbar')
-  $i = -1
-  for ($n = 0; $n -lt $order.Count; $n++) {
-    if ($order[$n] -eq [string]$script:Position) { $i = $n }
+  <#
+  「挪一挪」（决策 #31 改写：**离开式随机换位**，原「预设轮换」作废）——
+  目标不是"到达某个好位置"，是"**离开当前位置**"（它只挡住了当前那一块，
+  稍微换个地方就好 —— 瞬时需求，不是配置）。规则：
+    ① 方向随机、不预设候选点  ② 位移 ≈ 浮窗自身尺寸 0.6~1.0 倍（避免挪 1 像素）
+    ③ clamp 到当前屏工作区    ④ 允许回到原位（点两下回来也有用）
+    ⑤ （可选规则）落在屏幕中央 1/3 → 重抽一次
+  #>
+  $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  $nx = $form.Left; $ny = $form.Top
+  for ($attempt = 0; $attempt -lt 2; $attempt++) {
+    $ang = (Get-Random -Minimum 0 -Maximum 360) * [Math]::PI / 180.0
+    $size = [Math]::Max($form.Width, $form.Height)
+    $dist = $size * (0.6 + ((Get-Random -Minimum 0 -Maximum 41) / 100.0))
+    $nx = [int]($form.Left + [Math]::Cos($ang) * $dist)
+    $ny = [int]($form.Top + [Math]::Sin($ang) * $dist)
+    $nx = [Math]::Max($wa.Left, [Math]::Min($nx, $wa.Right - $form.Width))
+    $ny = [Math]::Max($wa.Top, [Math]::Min($ny, $wa.Bottom - $form.Height))
+    # 中央 1/3 最容易挡人 —— 落进去就重抽一次（就一次，别跟概率较劲）
+    $cx1 = $wa.Left + [int]($wa.Width / 3);  $cx2 = $wa.Left + [int]($wa.Width * 2 / 3)
+    $cy1 = $wa.Top + [int]($wa.Height / 3);  $cy2 = $wa.Top + [int]($wa.Height * 2 / 3)
+    if (-not ($nx -ge $cx1 -and $nx -le $cx2 -and $ny -ge $cy1 -and $ny -le $cy2)) { break }
   }
-  $next = $order[($i + 1) % $order.Count]
-  $script:Position = $next
-  [void](Move-ToPreset $next)
+  $form.Location = New-Object System.Drawing.Point($nx, $ny)
+  $script:posNote = ('({0},{1})' -f $nx, $ny)   # 自由位没有预设名，如实报坐标
+  Mark-SettingsDirty                             # 防抖：停 2s 或关窗时才落盘
   Update-PosLabel
-  return $next
+  return @{ X = $nx; Y = $ny }
+}
+
+# ── L1 · 抖一下（决策 #34：点击必须有反馈，与阈值无关）───────────────────────
+# ⚠️ 用 Timer 分步抖（每次挪几像素），不 Sleep —— 事件处理器里绝不阻塞 UI 线程。
+#    状态全挂 $script:（处理器脚本块看不到函数局部变量 —— PS 作用域规则）。
+$script:shakeTimer = $null
+$script:shakeStep = 0
+$script:shakeOrigin = $null
+
+function Shake-Window {
+  if ($null -ne $script:shakeTimer) { return }   # 抖动中再点 = 忽略（防重入）
+  $script:shakeStep = 0
+  $script:shakeOrigin = @{ X = $form.Left; Y = $form.Top }
+  $script:shakeTimer = New-Object System.Windows.Forms.Timer
+  $script:shakeTimer.Interval = 30
+  $script:shakeTimer.Add_Tick({
+    try {
+      $script:shakeStep++
+      $offsets = @(-4, 4, -3, 3, 0)
+      $dx = $offsets[$script:shakeStep - 1]
+      $form.Location = New-Object System.Drawing.Point(($script:shakeOrigin.X + $dx), $script:shakeOrigin.Y)
+      if ($script:shakeStep -ge 5) {
+        $script:shakeTimer.Stop()
+        $script:shakeTimer.Dispose()
+        $script:shakeTimer = $null
+      }
+    } catch { Report-HandlerError 'shake' $_ }
+  })
+  $script:shakeTimer.Start()
+}
+
+# ── 防抖落盘（备件表那条：点着玩 = 高频写盘）────────────────────────────────
+# 挪动只做「脏标记」，停 ~2s 没再动才真正写盘；关窗时 Flush 兜底。
+$script:saveDebounce = $null
+$script:settingsDirty = $false
+
+function Mark-SettingsDirty {
+  $script:settingsDirty = $true
+  if ($null -ne $script:saveDebounce) { return }
+  $script:saveDebounce = New-Object System.Windows.Forms.Timer
+  $script:saveDebounce.Interval = 2000
+  $script:saveDebounce.Add_Tick({
+    try {
+      $t = $script:saveDebounce
+      $script:saveDebounce = $null
+      if ($null -ne $t) { $t.Stop(); $t.Dispose() }
+      if ($script:settingsDirty) {
+        $script:settingsDirty = $false
+        Save-Settings
+      }
+    } catch { Report-HandlerError 'savedebounce' $_ }
+  })
+  $script:saveDebounce.Start()
+}
+
+function Flush-SettingsIfDirty {
+  if ($null -ne $script:saveDebounce) {
+    $t = $script:saveDebounce
+    $script:saveDebounce = $null
+    $t.Stop(); $t.Dispose()
+  }
+  if ($script:settingsDirty) {
+    $script:settingsDirty = $false
+    Save-Settings
+  }
 }
 
 function Toggle-Panel {
@@ -1006,9 +1108,11 @@ $btnQuiet.Add_Click({
 
 $btnPos.Add_Click({
   try {
-    $next = Move-NextPosition
-    Write-ZhiLog ('点击 位置 → ' + $next)
-  } catch { Report-HandlerError 'click:位置' $_ }
+    Shake-Window                       # 【L1】点击必须有反馈 —— 与阈值无关（决策 #34）
+    [void](Feed-Poke)                  # 【喂事实】要不要回应由内核裁决（动作归外壳、说话归内核）
+    $pt = Move-NextPosition            # 【挪一挪】点一下就离开当前位置（决策 #31 离开式）
+    Write-ZhiLog ('点击 挪一挪 → 抖了一下 + 换位到 (' + $pt.X + ',' + $pt.Y + ')')
+  } catch { Report-HandlerError 'click:挪一挪' $_ }
 })
 
 $btnSet.Add_Click({
@@ -1083,6 +1187,7 @@ $form.Add_FormClosing({
       $script:settings.posY = $form.Top
     }
     Save-Settings
+    Flush-SettingsIfDirty  # 防抖兜底：挪动后 2s 内关窗，脏标记在这里落盘（不丢最后一次挪位）
   } catch { Report-HandlerError 'formclosing' $_ }
 })
 
@@ -1204,10 +1309,14 @@ if ($SelfTest) {
     ('EXSTYLE TOP=' + [bool]($ex -band $script:WS_EX_TOPMOST))
   }
 
-  Test-Step '位置轮换' {
-    $before = [string]$script:Position
-    $after = Move-NextPosition
-    ($before + ' -> ' + $after)
+  Test-Step '挪一挪（离开式）' {
+    $l0 = $form.Location
+    $pt = Move-NextPosition
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $moved = ([Math]::Abs($pt.X - $l0.X) + [Math]::Abs($pt.Y - $l0.Y)) -ge 1
+    $inside = ($pt.X -ge $wa.Left -and $pt.X -le $wa.Right - $form.Width -and
+               $pt.Y -ge $wa.Top -and $pt.Y -le $wa.Bottom - $form.Height)
+    ("位移({0},{1}) 在工作区内={2}" -f ($pt.X - $l0.X), ($pt.Y - $l0.Y), ($moved -and $inside))
   }
 
   Test-Step '拖拽模拟 (+120,+90)' {

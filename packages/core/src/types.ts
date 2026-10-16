@@ -24,7 +24,7 @@ export type Severity = 'info' | 'warn' | 'critical';
  *            （决策 #22：闸门是告警的分寸系统；dispatcher 是唯一出口，
  *             静默时段 / 每日上限这些宪法级机制都在出口那一侧管着它）
  */
-export type EventKind = 'alert' | 'chitchat';
+export type EventKind = 'alert' | 'chitchat' | 'poked';
 
 /** 6 类扩展点（不多不少） */
 export type PluginType = 'probe' | 'rule' | 'persona' | 'channel' | 'action' | 'view';
@@ -148,6 +148,11 @@ export interface ContextInput {
    * 规则据此自管发言节奏（按信任档位给自己定间隔区间），而不是让用户调。
    */
   readonly trust?: number;
+  /**
+   * 🆕 M4-b1（决策 #34）：外壳报「球刚被点了一下」。
+   * **只报事实** —— 要不要回应（抖 ／ 挪 ／ 说）由内核的规则裁决，外壳不自作主张。
+   */
+  readonly poked?: number;
 }
 
 // ─────────────────────────────── 插件实例契约 ───────────────────────────────

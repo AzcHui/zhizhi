@@ -1,0 +1,15 @@
+{
+  "id": "rule-poke",
+  "name": "戳着玩规则",
+  "version": "0.1.0",
+  "type": "rule",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "累计外壳报来的 poked 事实，达到随机阈值（3~7）时产生一条 poked 事件（info）。绕闸门、走 dispatcher（决策 #22）；不受 trust<10 压制、不占每日上限（决策 #34），零依赖。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

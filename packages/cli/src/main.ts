@@ -309,10 +309,22 @@ bus.on<MetricBatch>('metric', (batch) => {
 });
 
 bus.on<ZhizhiEvent>('event.candidate', (event) => {
-  // 决策 #22：闸门是**告警**的分寸系统 —— chitchat 没有指标证据（threshold 会拦「空口报」）、
-  // 天然只冒一次（sustained 会拦）→ **绕闸门**；但 **dispatcher 不能绕**：
+  // 决策 #22：闸门是**告警**的分寸系统 —— chitchat / poked 没有指标证据（threshold 会拦
+  // 「空口报」）、天然只冒一次（sustained 会拦）→ **绕闸门**；但 **dispatcher 不能绕**：
   // 它是唯一出口，静默时段 / 每日上限这些宪法级机制都在出口那一侧管着闲聊。
-  if (event.kind !== 'chitchat') {
+  if (event.kind === 'poked') {
+    // 决策 #34：poked 不受 trust<10 压制（用户主动来玩，压掉 = 把玩的入口关死）、
+    // 也不占每日上限（那是自动闲聊的额度）—— 它只在你戳的时候发生，天然有限。
+  } else if (event.kind === 'chitchat') {
+    if (memory.trust < 10 && !event.id.startsWith('say@')) {
+      // M7 亲密度档位「沉默」（0~9）：只报警（功能性），几乎不说话 —— 原设计表的行为。
+      // ⚠️ 只压**自动闲聊**，两样永不受影响：告警（功能性，沉默机制说了算，宪法不变）、
+      //    用户点名的 `say@`（明确指令 —— 而且它是 low-trust 状态唯一的回暖入口，
+      //    把它也压掉 = 死锁，trust 永远救不回来）。
+      log.debug(`亲密度 ${memory.trust}（沉默档）：压下自动闲聊 —— 它现在不想自己找话`);
+      return;
+    }
+  } else {
     const verdict = runGates(gates, event, { now: Date.now(), passed: passedEvents });
 
     if (!verdict.pass) {
@@ -320,13 +332,6 @@ bus.on<ZhizhiEvent>('event.candidate', (event) => {
       log.debug(`闸门「${verdict.blockedBy}」压下了 ${event.type}：${verdict.reason ?? ''}`);
       return;
     }
-  } else if (memory.trust < 10 && !event.id.startsWith('say@')) {
-    // M7 亲密度档位「沉默」（0~9）：只报警（功能性），几乎不说话 —— 原设计表的行为。
-    // ⚠️ 只压**自动闲聊**，两样永不受影响：告警（功能性，沉默机制说了算，宪法不变）、
-    //    用户点名的 `say@`（明确指令 —— 而且它是 low-trust 状态唯一的回暖入口，
-    //    把它也压掉 = 死锁，trust 永远救不回来）。
-    log.debug(`亲密度 ${memory.trust}（沉默档）：压下自动闲聊 —— 它现在不想自己找话`);
-    return;
   }
 
   passedEvents.push(event);
@@ -384,6 +389,7 @@ process.stdin.on('data', (chunk: string) => {
         const obj = JSON.parse(line) as Record<string, unknown> | null;
         const idle = obj === null || typeof obj !== 'object' ? undefined : obj['idleMs'];
         const say = obj === null || typeof obj !== 'object' ? undefined : obj['requestSay'];
+        const poke = obj === null || typeof obj !== 'object' ? undefined : obj['poked'];
         const idleOk = typeof idle === 'number' && Number.isFinite(idle) && idle >= 0;
         if (idleOk) {
           context = { idleMs: idle as number };
@@ -395,8 +401,13 @@ process.stdin.on('data', (chunk: string) => {
           memory.recordInteraction();
           deliverContext({ ...context, requestSay: true });
         }
-        if (!idleOk && say !== true) {
-          log.warn(`上下文行缺有效的 "idleMs"/"requestSay"，已忽略：${line.slice(0, 80)}`);
+        if (typeof poke === 'number' && Number.isFinite(poke) && poke > 0) {
+          // M4-b1（决策 #34）：外壳报「球被戳了一下」—— 只报事实，裁决归 rule-poke。
+          // ⚠️ 不加亲密度、不占每日上限 —— 玩是用户自己动手，天然有限。
+          deliverContext({ ...context, poked: poke });
+        }
+        if (!idleOk && say !== true && !(typeof poke === 'number' && poke > 0)) {
+          log.warn(`上下文行缺有效的 "idleMs"/"requestSay"/"poked"，已忽略：${line.slice(0, 80)}`);
         }
       } catch {
         log.warn(`上下文行不是合法 JSON，已忽略：${line.slice(0, 80)}`);

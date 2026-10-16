@@ -1,0 +1,15 @@
+{
+  "name": "@zhizhi/rule-poke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "戳着玩规则（官方插件）：外壳报事实、内核做裁决 —— 点够随机次数（3~7）才回应一句，阈值不写死",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./manifest.json": "./manifest.json"
+  },
+  "dependencies": {
+    "@zhizhi/plugin-sdk": "workspace:*"
+  }
+}

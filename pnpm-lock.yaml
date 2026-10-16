@@ -44,6 +44,9 @@ importers:
       '@zhizhi/rule-chitchat':
         specifier: workspace:*
         version: link:../plugins/rule-chitchat
+      '@zhizhi/rule-poke':
+        specifier: workspace:*
+        version: link:../plugins/rule-poke
       '@zhizhi/rule-threshold':
         specifier: workspace:*
         version: link:../plugins/rule-threshold
@@ -93,6 +96,12 @@ importers:
         version: link:../../plugin-sdk
 
   packages/plugins/rule-chitchat:
+    dependencies:
+      '@zhizhi/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../plugin-sdk
+
+  packages/plugins/rule-poke:
     dependencies:
       '@zhizhi/plugin-sdk':
         specifier: workspace:*

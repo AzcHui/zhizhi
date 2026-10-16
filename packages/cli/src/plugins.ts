@@ -21,6 +21,8 @@ export const PLUGINS: readonly PluginSpec[] = [
   { specifier: '@zhizhi/probe-disk', type: 'probe' },
   // 判断：把指标翻译成「值得说一句」的候选事件
   { specifier: '@zhizhi/rule-threshold', type: 'rule' },
+  // 戳着玩（M4-b1 · 决策 #34）：外壳报事实、内核做裁决 —— 点够随机次数（3~7）才回应
+  { specifier: '@zhizhi/rule-poke', type: 'rule' },
   // 闲聊（M6）：空闲够久就主动开口 —— 独立于告警（不复用阈值/闸门，决策 #18/#22）
   { specifier: '@zhizhi/rule-chitchat', type: 'rule' },
   // 台词：把事件翻译成「人味」的话（M5）

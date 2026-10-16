@@ -136,8 +136,23 @@ function loadSettings(): Record<string, unknown> {
     log.warn(`设置文件不合规：${path} —— 顶层必须是 JSON 对象。整份忽略，全用默认。`);
     return {};
   }
+  // 字符串枚举键（M6-b：话量档）—— 只收白名单里的值，别的当没写（不猜）
+  const STRING_ENUM_KEYS: Record<string, readonly string[]> = {
+    chitchatVolume: ['low', 'normal', 'high'],
+  };
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const allowed = STRING_ENUM_KEYS[key];
+    if (allowed !== undefined) {
+      if (typeof value === 'string' && allowed.includes(value)) {
+        out[key] = value;
+      } else {
+        log.warn(
+          `设置文件里 "${key}" 必须是 ${allowed.join(' / ')} 之一（收到 ${JSON.stringify(value) ?? 'undefined'}），忽略该键`,
+        );
+      }
+      continue;
+    }
     const ok =
       typeof value === 'number' && Number.isFinite(value) && value >= 0
         ? true
@@ -152,6 +167,19 @@ function loadSettings(): Record<string, unknown> {
 }
 
 const settings = loadSettings();
+
+// ── M6-b：旧旋钮下线 ──
+// 「间隔旋钮的存在本身就是失败信号」（决策 #18 改写）—— 检测到旧键就明说，
+// 然后拦下不发给规则：节奏由只只按亲密度自管，双保险不因 settings 被绕开。
+for (const legacy of ['chitchatIntervalMs', 'chitchatIdleMs'] as const) {
+  if (legacy in settings) {
+    log.warn(
+      `设置 "${legacy}" 已下线（M6-b：发言间隔与空闲门槛由只只按亲密度自管）—— 该键被忽略。` +
+        `现在手上只有 chitchatEnabled（开/关）与 chitchatVolume（low/normal/high）`,
+    );
+    delete settings[legacy];
+  }
+}
 
 // ── M7 · 记忆 + 亲密度 ──
 // 说出口的话进 events.jsonl（重启后「说过没说过」「第几次」还在）；
@@ -328,10 +356,12 @@ bus.on<ZhizhiEvent>('event.candidate', (event) => {
 let context: ContextInput = idleOverride === undefined ? {} : { idleMs: idleOverride };
 
 function deliverContext(ctx: ContextInput): void {
+  // M6-b：内核把亲密度一并注入（规则按信任档位自管节奏）—— 外壳不用喂它，也不会喂错
+  const full: ContextInput = { trust: memory.trust, ...ctx };
   for (const rule of registry.rules()) {
     if (typeof rule.onContext !== 'function') continue;
     try {
-      rule.onContext(ctx);
+      rule.onContext(full);
     } catch (err) {
       log.error(
         `规则 ${rule.id} 处理上下文时抛错（已隔离）`,
@@ -475,23 +505,18 @@ log.info(
     : '记忆：空的（第一次跑，正常）—— 说出口的话会记到 memory/events.jsonl',
 );
 log.info(`亲密度：trust=${memory.trust}（${memory.tier}档）—— 点「说说」+2 / 每天不互动 -2；只影响闲聊，告警不受影响`);
-// 闲聊旋钮只做汇报 —— 真正的消费方是 rule-chitchat（configure 已下发）。
-// ⚠️ 汇报必须按**实际生效**口径：间隔 0 会被规则拒收（>0 才收）→ 如实报「默认」并告警，
-//    别让日志说「间隔 0ms」而实际跑 30 分钟（监工复验抓到的谎报）。
-const rawChitchatInterval = settings['chitchatIntervalMs'];
-const rawChitchatIdle = settings['chitchatIdleMs'];
-const chitchatInterval =
-  typeof rawChitchatInterval === 'number' && rawChitchatInterval > 0
-    ? `${rawChitchatInterval}ms`
-    : '默认 30 分钟';
-const chitchatIdle =
-  typeof rawChitchatIdle === 'number' && rawChitchatIdle >= 0
-    ? `${rawChitchatIdle}ms`
-    : '默认 10 分钟';
-if (rawChitchatInterval === 0) {
-  log.warn('设置 chitchatIntervalMs = 0 无效（间隔必须 > 0，否则每轮都聊）—— 按默认 30 分钟');
-}
-log.info(`闲聊：空闲阈值 ${chitchatIdle} · 间隔 ${chitchatInterval}（与告警完全独立）`);
+// 闲聊旋钮（M6-b 极简化）：用户手上只有 开/关 ＋ 话量档 —— 间隔与空闲门槛由只只自管
+const chitchatEnabled = settings['chitchatEnabled'] !== false; // 不写 = 开
+const chitchatVolume =
+  typeof settings['chitchatVolume'] === 'string' ? String(settings['chitchatVolume']) : 'normal';
+const volumeWord: Record<string, string> = { low: '少', normal: '正常', high: '多' };
+log.info(
+  chitchatEnabled
+    ? `闲聊：开（话量档 ${volumeWord[chitchatVolume] ?? chitchatVolume}）—— ` +
+        `间隔与空闲门槛由只只按亲密度自管（熟悉档约 25~60 分钟一句，档内随机）`
+    : '闲聊：关 —— 一句闲聊都不说（含点名）；告警照常（它管不着告警）',
+);
+log.info('闲聊双保险（宪法，不暴露也不可设 0）：最短 10 分钟一句 · 每日自动闲聊 ≤ 24 句');
 const modelEnabled = settings['modelEnabled'] === true;
 log.info(
   modelEnabled

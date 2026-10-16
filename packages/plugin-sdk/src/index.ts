@@ -43,5 +43,9 @@ export type {
   ZhizhiEvent,
 } from '@zhizhi/core';
 
+// 内核工具函数（插件可能要用的小件 —— M6-b：闲聊按亲密度档位自管节奏）
+export { trustTier } from '@zhizhi/core';
+export type { TrustTier } from '@zhizhi/core';
+
 /** SDK 版本 —— 写进 manifest 的 sdk 字段用的就是它 */
 export const SDK_VERSION = '0.1.0';

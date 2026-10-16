@@ -1,38 +1,124 @@
 /**
- * rule-chitchat —— 闲聊规则（官方插件，M6）
+ * rule-chitchat —— 闲聊规则（官方插件，M6 立项 · M6-b 重构节奏）
  *
  * 它管的是「什么时候主动开口」，与告警**完全两回事**：
  *
  *   告警：机器出事了 → 忙时最有用   → 走阈值 + 四道闸门（内核的分寸系统）
- *   闲聊：你闲下来了 → 闲时才合适   → 只看两个数：空闲够不够久、隔了多久没聊
+ *   闲聊：你闲下来了 → 闲时才合适   → 节奏由只只**自己判断**（M6-b，决策 #18 改写）
  *
- * ⚠️ 三条硬约束（报表第三节，走歪了就白做）：
- *   ① **不得复用告警的阈值/闸门** —— `threshold` 是灵敏度（多小的问题算问题），
- *      `cooldownMs` 是告警的话量。想多说几句调的是**闲聊间隔**，不是那些。
- *      所以本插件产生的 chitchat 事件 `kind: 'chitchat'`：内核会**绕闸门、走 dispatcher**。
- *   ② 闲聊本身**永不等模型** —— 模型台词走「预生成」，后台补进 learned.json，
- *      这里只管到点挑（模型层是 M6 加餐，本插件对它一无所知）。
+ * ⚠️ 硬约束（报表第三节，走歪了就白做）：
+ *   ① **不得复用告警的阈值/闸门** —— 本插件产生的 chitchat 事件 `kind: 'chitchat'`：
+ *      内核会**绕闸门、走 dispatcher**（决策 #22）。
+ *   ② 闲聊本身**永不等模型** —— 模型台词走「预生成」，后台补进 learned.json。
  *   ③ **没外壳喂上下文 = 自动静默** —— `idleMs` 由外壳经反向通道喂进来；
  *      没人喂就不触发，但绝不报错（监控照常，与「空 loadout 降级」同一条原则）。
+ *
+ * ── M6-b · 发言节奏自控（决策 #18 改写）──────────────────────────────
+ *
+ *  用户手上只留两个键：**闲聊 开/关**（`chitchatEnabled`）＋ **话量档**
+ *  （`chitchatVolume`：low / normal / high）。**间隔与空闲门槛归只只自管**：
+ *
+ *    · 间隔 = 按信任档位给 `[min,max]` 区间、**档内均匀随机**（不线性插值 ——
+ *      「熟悉档 25~60 分钟」人一看就懂，插值出的「37.4 分钟」没人体会得到）。
+ *    · 空闲门槛也按档位自管（越亲近越早来找你）。
+ *    · **防聚集**：抽中值对**内核下限**取 max —— 不会连抽两个最短贴着说。
+ *
+ *  **内核双保险（宪法，不暴露给用户、也不该能设成 0）**：
+ *    · **最短间隔** —— 任何抽中值低于它都被**抬到底线**；
+ *    · **每日上限** —— 自动闲聊超过它当天就闭嘴（点名的 `say@` 不受此限 ——
+ *      那是用户的明确指令，与 trust 门槛同一个道理）。
+ *
+ *  ⚠️ 旧键 `chitchatIntervalMs` / `chitchatIdleMs` **已下线**（cli 会告警并忽略）——
+ *     「间隔旋钮的存在本身就是失败信号」：它说明只只自己管不好，得你来管。
+ *
+ *  🧪 `ZHIZHI_CHITCHAT_SCALE` 环境变量：**验收/调试专用**（地位同 cli 的 `--idle-ms`），
+ *     等比缩放全部闲聊时距（区间 / 双保险 / 空闲门槛）。正常运行不设它。
  */
 
-import { defineRule } from '@zhizhi/plugin-sdk';
+import { defineRule, trustTier } from '@zhizhi/plugin-sdk';
 import type { ContextInput, ZhizhiEvent } from '@zhizhi/plugin-sdk';
 
-/** 默认旋钮 —— 可被数据目录 `zhizhi.settings.json` 覆盖（cli 启动时调 configure()） */
-const DEFAULT_IDLE_MS = 10 * 60_000; // 空闲满 10 分钟才算「你闲下来了」
-const DEFAULT_INTERVAL_MS = 30 * 60_000; // 两次闲聊最少隔 30 分钟
+// ── 待定项 #7 拍板的数值（2026-10-16，改手感只动这几行常量）──────────────
+
+const MINUTE = 60_000; // 下面全部按「分钟」写，一眼能核对
+
+/** 信任档位 → 自动闲聊间隔区间（分钟）。沉默档本就被内核压掉，这里给个兜底值 */
+const TIER_GAP_MINUTES: Record<string, { min: number; max: number }> = {
+  沉默: { min: 60, max: 120 },
+  陌生: { min: 45, max: 90 },
+  熟悉: { min: 25, max: 60 },
+  亲近: { min: 12, max: 35 },
+};
+
+/** 信任档位 → 空闲门槛（分钟）：你多久没动，它才认为「你闲下来了」 */
+const TIER_IDLE_MINUTES: Record<string, number> = {
+  沉默: 20,
+  陌生: 20,
+  熟悉: 12,
+  亲近: 8,
+};
+
+/** 话量档 → 区间缩放（少 ×2 说得少 ／ 多 ×0.5 说得多；告警与它无关） */
+const VOLUME_SCALE: Record<string, number> = { low: 2, normal: 1, high: 0.5 };
+
+/** 双保险 ①：最短间隔（分钟）—— 抽中值低于它一律抬到底线 */
+const FLOOR_GAP_MINUTES = 10;
+/** 双保险 ②：每日上限（本地日内的自动闲聊句数；say@ 点名不计） */
+const DAILY_AUTO_LIMIT = 24;
+
+// ── 运行时状态 ──
 
 /** 外壳喂来的空闲时长；undefined = 没人喂 → 闲聊自动静默（硬约束 ③） */
 let idleMs: number | undefined = undefined;
-/** 距上次闲聊的最小间隔（旋钮：闲聊间隔） */
-let intervalMs = DEFAULT_INTERVAL_MS;
-/** 空闲多久才算闲（旋钮：空闲阈值；它不是告警阈值，别混） */
-let idleThresholdMs = DEFAULT_IDLE_MS;
-/** 上次闲聊时刻 —— 插件自己的时间状态，自守卫（一个 tick 里会按 probe 数被调多次） */
-let lastChitchatAt: number | undefined = undefined;
-/** 用户点了「说说」—— 下一次 evaluate 立即开口（用户指令优先于空闲/间隔两个条件） */
+/** 内核注入的亲密度（M7 记忆）；没注入（无记忆的主机）按「熟悉」对待 */
+let trust = 40;
+/** 用户点了「说说」—— 下一次 evaluate 立即开口（用户指令优先于一切节奏条件） */
 let sayRequested = false;
+
+/** 闲聊开/关（用户手上唯一必有的键；**关 = 连点名也不说** —— 零歧义） */
+let enabled = true;
+/** 话量档 */
+let volume = 'normal';
+
+/** 下次自动闲聊允许的时刻（上次开口 + 抽中的间隔）；undefined = 还没开过口 */
+let nextAllowedAt: number | undefined = undefined;
+/** 每日上限计数（本地日；跨天清零） */
+let autoCountDay = '';
+let autoCount = 0;
+
+/** 验收/调试缩放（环境变量，默认 1 = 真实节奏） */
+function timeScale(): number {
+  const raw = Number(process.env['ZHIZHI_CHITCHAT_SCALE']);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+}
+
+/** 本地时区的今天，`YYYY-MM-DD`（跨天判定用） */
+function localDay(now = new Date()): string {
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`;
+}
+
+/** 当前档位下（含话量档与验收缩放）的间隔区间，分钟 → ms */
+function gapRangeMs(): { min: number; max: number } {
+  const base = TIER_GAP_MINUTES[trustTier(trust)] ?? TIER_GAP_MINUTES['熟悉']!;
+  const vol = VOLUME_SCALE[volume] ?? 1;
+  const s = timeScale();
+  return { min: base.min * vol * MINUTE * s, max: base.max * vol * MINUTE * s };
+}
+
+/** 抽一个间隔：档内均匀随机，再对内核下限取 max（防聚集 —— 不会连抽最短贴着说） */
+function drawGapMs(): number {
+  const { min, max } = gapRangeMs();
+  const drawn = min + Math.random() * (max - min);
+  const floor = FLOOR_GAP_MINUTES * MINUTE * timeScale();
+  return Math.max(drawn, floor);
+}
+
+/** 当前档位的空闲门槛（ms） */
+function idleThresholdMs(): number {
+  const base = TIER_IDLE_MINUTES[trustTier(trust)] ?? TIER_IDLE_MINUTES['熟悉']!;
+  return base * MINUTE * timeScale();
+}
 
 export default defineRule({
   id: 'rule-chitchat',
@@ -42,41 +128,55 @@ export default defineRule({
     if (typeof ctx['idleMs'] === 'number' && Number.isFinite(ctx['idleMs']) && ctx['idleMs'] >= 0) {
       idleMs = ctx['idleMs'];
     }
+    if (typeof ctx['trust'] === 'number' && Number.isFinite(ctx['trust']) && ctx['trust'] >= 0) {
+      trust = ctx['trust'];
+    }
     if (ctx['requestSay'] === true) sayRequested = true;
   },
 
-  // 内核下发配置：只认领自己认识的键，类型不对就保持默认（宁可默认也不填错值）
+  /**
+   * 内核下发配置（M6-b 起只认领两个用户键）。
+   * ⚠️ `chitchatIntervalMs` / `chitchatIdleMs` 已下线 —— cli 检测到会告警并拦下，
+   *    这里**故意不读**它们（双保险不该能被 settings 绕开）。
+   */
   configure(config: Readonly<Record<string, unknown>>): void {
-    const interval = config['chitchatIntervalMs'];
-    if (typeof interval === 'number' && Number.isFinite(interval) && interval > 0) {
-      intervalMs = interval;
+    if (typeof config['chitchatEnabled'] === 'boolean') {
+      enabled = config['chitchatEnabled'];
     }
-    const idle = config['chitchatIdleMs'];
-    if (typeof idle === 'number' && Number.isFinite(idle) && idle >= 0) {
-      idleThresholdMs = idle;
+    const vol = config['chitchatVolume'];
+    if (typeof vol === 'string' && VOLUME_SCALE[vol] !== undefined) {
+      volume = vol;
     }
   },
 
   evaluate(): readonly ZhizhiEvent[] {
     const now = Date.now();
 
-    // 用户点了「说说」：这是明确指令，优先于空闲/间隔两个条件 —— 立即开口。
-    // 顺带把「上次闲聊」重置到现在：自动闲聊从这句话起重新计间隔。
-    // ⚠️ 只消费一次（evaluate 一个 tick 会被调多次，第一调消费掉，其余不再触发）。
-    // id 用 `say@` 前缀：内核据此区分「用户点名要说的」（不受亲密度门槛管 ——
-    // 它是明确指令；trust 再低也应答，这也是 low-trust 状态唯一的回暖入口）。
+    // 用户点了「说说」：明确指令，优先于一切节奏条件（开关关着也不理 —— 关就是关，
+    // 零歧义；想让它说一句就把开关打开）。顺带把自动节奏的时钟从这句话重起。
     if (sayRequested) {
       sayRequested = false;
-      lastChitchatAt = now;
+      if (!enabled) return [];
+      nextAllowedAt = now + drawGapMs();
       return [makeChitchat(now, true)];
     }
+    if (!enabled) return [];
 
     // 硬约束 ③：没人喂上下文 → 沉默。不是出错，是「不知道你闲不闲，所以不说」
     if (idleMs === undefined) return [];
-    if (idleMs < idleThresholdMs) return []; // 你还忙着呢，不打扰
-    if (lastChitchatAt !== undefined && now - lastChitchatAt < intervalMs) return []; // 刚聊过
+    if (idleMs < idleThresholdMs()) return []; // 你还忙着呢，不打扰
+    if (nextAllowedAt !== undefined && now < nextAllowedAt) return []; // 还没到它自己定的点儿
 
-    lastChitchatAt = now;
+    // 双保险 ②：每日上限（自动闲聊；跨天清零；say@ 点名不占额度）
+    const today = localDay(new Date(now));
+    if (today !== autoCountDay) {
+      autoCountDay = today;
+      autoCount = 0;
+    }
+    if (autoCount >= DAILY_AUTO_LIMIT) return [];
+
+    autoCount += 1;
+    nextAllowedAt = now + drawGapMs();
     return [makeChitchat(now, false)];
   },
 });

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Zhizhi.Shell</RootNamespace>
+    <AssemblyName>Zhizhi.Shell</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>只只的正式外壳（M4-b1 最小可跑壳）—— WPF 球形浮窗，自己养内核</Description>
+    <!-- 框架依赖发布：目标机已有 .NET 8 桌面 runtime（8.0.27），单 exe 只有几百 KB -->
+    <SelfContained>false</SelfContained>
+    <!-- WinExe 不弹控制台；self-test 模式用 AttachConsole 接回父控制台输出 -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+</Project>

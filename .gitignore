@@ -22,6 +22,13 @@ tools/float-preview.render.png
 # 内核数据目录（决策 #21：用户数据与代码资产物理分开，不入库）
 data/
 
+# WPF 外壳（M4-b1）的构建产物与用户态日志
+shell/Zhizhi.Shell/bin/
+shell/Zhizhi.Shell/obj/
+shell/Zhizhi.Shell/publish/
+shell/zhi-shell.render.png
+shell/zhi-shell.log
+
 .env
 .env.*
 !.env.example

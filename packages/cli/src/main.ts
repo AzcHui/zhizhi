@@ -404,7 +404,8 @@ process.stdin.on('data', (chunk: string) => {
         if (typeof poke === 'number' && Number.isFinite(poke) && poke > 0) {
           // M4-b1（决策 #34）：外壳报「球被戳了一下」—— 只报事实，裁决归 rule-poke。
           // ⚠️ 不加亲密度、不占每日上限 —— 玩是用户自己动手，天然有限。
-          deliverContext({ ...context, poked: poke });
+          // ⚠️ 不捎带 {...context}：戳与空闲无关，带上过期 idleMs 是脏数据（监工观察⑤）。
+          deliverContext({ poked: poke });
         }
         if (!idleOk && say !== true && !(typeof poke === 'number' && poke > 0)) {
           log.warn(`上下文行缺有效的 "idleMs"/"requestSay"/"poked"，已忽略：${line.slice(0, 80)}`);

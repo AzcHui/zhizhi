@@ -242,6 +242,7 @@ function Save-Settings {
   if ($script:settingsReadOnly) { return }
   try {
     $script:settings | ConvertTo-Json | Set-Content -Path $script:SETTINGS_PATH -Encoding UTF8
+    $script:settingsDirty = $false   # 写成功 = 盘上已是最新 —— 脏标记清掉（监工观察③：关窗只写一次）
     Write-ZhiLog ('设置已保存：' + $script:SETTINGS_PATH)
   } catch {
     Write-ZhiLog ('[ERR] 设置存不下：' + $_.Exception.Message)
@@ -844,9 +845,11 @@ $script:kernelCooldownMs = $CooldownMs
 #    改成纯手工拖：按下时记「光标位置 + 窗口位置」，移动时算差值。零重入、零 Win32。
 #    （user32 那两个 P/Invoke 就留着当备件，不再从处理器里调用。）
 $script:dragOrigin = $null
+$script:dragMoved = $false   # 本次按下后是否真拖动过（End-Drag 判定用，防普通点击误报坐标）
 
 function Start-Drag([int]$cx, [int]$cy) {
   $script:dragOrigin = @{ CX = $cx; CY = $cy; WX = $form.Left; WY = $form.Top }
+  $script:dragMoved = $false
 }
 
 function Move-Drag([int]$cx, [int]$cy) {
@@ -854,11 +857,21 @@ function Move-Drag([int]$cx, [int]$cy) {
   $x = $script:dragOrigin.WX + ($cx - $script:dragOrigin.CX)
   $y = $script:dragOrigin.WY + ($cy - $script:dragOrigin.CY)
   $form.Location = New-Object System.Drawing.Point($x, $y)
+  $script:dragMoved = $true
   return $true
 }
 
 function End-Drag {
+  # 监工观察④：拖拽结束位置行也要如实 —— 不然「先挪一挪再拖走」位置行仍显示旧坐标。
+  # ⚠️ 只在真拖动过才更新 —— 普通点击（按下又松开没动）不该把预设名顶成坐标。
+  $wasMoved = $script:dragMoved
   $script:dragOrigin = $null
+  $script:dragMoved = $false
+  if ($wasMoved) {
+    $script:posNote = ('({0},{1})' -f $form.Left, $form.Top)   # 自由位如实报坐标（同挪一挪）
+    Mark-SettingsDirty                                          # 持久化与「挪一挪」同待遇（防抖）
+    Update-PosLabel
+  }
 }
 
 # ── 处理器本体：全部抽成普通函数 ─────────────────────────────────────────────
@@ -973,12 +986,12 @@ function Move-NextPosition {
 #    状态全挂 $script:（处理器脚本块看不到函数局部变量 —— PS 作用域规则）。
 $script:shakeTimer = $null
 $script:shakeStep = 0
-$script:shakeOrigin = $null
+$script:shakeLastDx = 0   # 上一个 tick 已施加的偏移 —— 相对偏移抖动的关键
 
 function Shake-Window {
   if ($null -ne $script:shakeTimer) { return }   # 抖动中再点 = 忽略（防重入）
   $script:shakeStep = 0
-  $script:shakeOrigin = @{ X = $form.Left; Y = $form.Top }
+  $script:shakeLastDx = 0
   $script:shakeTimer = New-Object System.Windows.Forms.Timer
   $script:shakeTimer.Interval = 30
   $script:shakeTimer.Add_Tick({
@@ -986,7 +999,11 @@ function Shake-Window {
       $script:shakeStep++
       $offsets = @(-4, 4, -3, 3, 0)
       $dx = $offsets[$script:shakeStep - 1]
-      $form.Location = New-Object System.Drawing.Point(($script:shakeOrigin.X + $dx), $script:shakeOrigin.Y)
+      # ⚠️ 相对偏移，不是绝对坐标（监工 P0）：记「上一次施加了多少」，
+      #    本 tick 补差值 —— 抖动永远围绕**当前位置**，即使抖动中途窗口被挪走
+      #    （「抖 → 挪」组合 / 抖动中再点），也绝不把新位置拉回原点。
+      $form.Location = New-Object System.Drawing.Point(($form.Left - $script:shakeLastDx + $dx), $form.Top)
+      $script:shakeLastDx = $dx
       if ($script:shakeStep -ge 5) {
         $script:shakeTimer.Stop()
         $script:shakeTimer.Dispose()
@@ -998,13 +1015,19 @@ function Shake-Window {
 }
 
 # ── 防抖落盘（备件表那条：点着玩 = 高频写盘）────────────────────────────────
-# 挪动只做「脏标记」，停 ~2s 没再动才真正写盘；关窗时 Flush 兜底。
+# 挪动只做「脏标记」，**停 2s 没再动才真正写盘**；关窗时 Flush 兜底。
+# （监工观察②：原实现 Timer 不重建 = 每 2s 至多写一次的「节流」；现改为
+#   每次标记都重建计时 —— 行为与交付物表措辞一致。目标相同，语义修正。）
 $script:saveDebounce = $null
 $script:settingsDirty = $false
 
 function Mark-SettingsDirty {
   $script:settingsDirty = $true
-  if ($null -ne $script:saveDebounce) { return }
+  if ($null -ne $script:saveDebounce) {
+    $script:saveDebounce.Stop()
+    $script:saveDebounce.Dispose()
+    $script:saveDebounce = $null
+  }
   $script:saveDebounce = New-Object System.Windows.Forms.Timer
   $script:saveDebounce.Interval = 2000
   $script:saveDebounce.Add_Tick({
@@ -1325,7 +1348,27 @@ if ($SelfTest) {
     [void](Move-Drag 620 590)
     End-Drag
     $l1 = $form.Location
-    ('(' + $l0.X + ',' + $l0.Y + ') -> (' + $l1.X + ',' + $l1.Y + ')  delta=(' + ($l1.X - $l0.X) + ',' + ($l1.Y - $l0.Y) + ')')
+    # 监工观察④回归：拖拽结束位置行必须如实报坐标（不残留「挪一挪」那次的旧坐标）
+    $noteOk = ($script:posNote -eq ('({0},{1})' -f $l1.X, $l1.Y))
+    ('delta=({0},{1})  位置行如实={2}' -f ($l1.X - $l0.X), ($l1.Y - $l0.Y), $noteOk)
+  }
+
+  Test-Step '组合·抖动不撤销挪动（泵 400ms）' {
+    # ⭐ 监工硬要求（验收清单第 7 条）：带 Timer 的交互必须「按处理器顺序调 ＋ 跑消息泵」
+    #   才算验过 —— 单测函数证明不了按钮可用，缺陷恰恰长在顺序和时机上。
+    # 真实点击路径 = Shake-Window → Feed-Poke → Move-NextPosition（同一处理器同步跑），
+    # 随后 30ms Timer 介入。P0 回归点：抖完窗口必须停在**挪到的新位置**（不是原点）。
+    Shake-Window                          # ① 记起点、起 30ms Timer（此刻还没 tick）
+    [void](Feed-Poke)                     # ② 报事实（自检里内核已收 → 返回 $false 是正常降级）
+    $newPos = Move-NextPosition           # ③ 同步挪走 —— 30ms 后 tick 用相对偏移围绕新位置抖
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 400) {
+      [System.Windows.Forms.Application]::DoEvents()   # 消息泵：让 Timer 真正跑起来
+      Start-Sleep -Milliseconds 20
+    }
+    $l = $form.Location
+    $ok = ($l.X -eq $newPos.X -and $l.Y -eq $newPos.Y -and $script:shakeTimer -eq $null)
+    ('抖完停在({0},{1}) = 挪动目标({2},{3}) = {4}' -f $l.X, $l.Y, $newPos.X, $newPos.Y, $ok)
   }
 
   Test-Step '状态区 申明'   { Set-StatusText '（自检）' 5; $lblState.Text }

@@ -32,6 +32,8 @@ export type {
 } from './gates.ts';
 export { Dispatcher } from './dispatcher.ts';
 export { composeLine } from './voice.ts';
+export { Memory, TRUST_START, trustTier } from './memory.ts';
+export type { MemoryOptions, TrustTier, VoiceMemory } from './memory.ts';
 export { Registry } from './registry.ts';
 
 /** 内核版本 —— 外壳与插件可以据此做兼容判断 */

@@ -90,6 +90,13 @@ export interface ZhizhiEvent {
 /** 台词 —— persona 的产出。纯数据，不是代码。 */
 export interface Line {
   readonly text: string;
+  /**
+   * 这句话的**模板原文**（占位符还没填的样子）—— M7 记忆去重的键。
+   * ⚠️ 为什么不用 text 当键：`{value}` 每次都不同（CPU 95.4% / 96.1%），
+   *    按填完的文本去重永远判「没说过」→ 第 7 次还会说同一句模板，记忆就白记了。
+   * 台词包能带就带；不带时内核退回用 text 当键（纯动态生成的台词本来就无模板可言）。
+   */
+  readonly key?: string;
   /** 说这句话时的情绪标签：happy / tired / annoyed / sleepy */
   readonly mood?: string;
 }
@@ -184,10 +191,17 @@ export interface Persona {
    *
    * 这个顺序保证：模型补的专属台词（learned）能排在内置包的 `"*"` 兜底**前面**出场，
    * 否则兜底键会把下层整个挡死；不关心这些的实现（如写代码的台词包）忽略 options 即可。
+   *
+   * 🆕 M7 起 options 多一个 `isStale(key)`（内核有记忆时注入）——
+   *    「说过」以**模板原文**为键、跨重启生效；见 `Line.key` 的说明。
    */
   speak(
     event: ZhizhiEvent,
-    options?: { readonly allowRepeat?: boolean; readonly useFallback?: boolean },
+    options?: {
+      readonly allowRepeat?: boolean;
+      readonly useFallback?: boolean;
+      readonly isStale?: (key: string) => boolean;
+    },
   ): Line | undefined;
 }
 

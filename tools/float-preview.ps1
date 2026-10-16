@@ -325,6 +325,7 @@ $script:kernel = $null        # sidecar 进程
 $script:kernelOut = $null     # stdout 的「待完成异步读」
 $script:kernelErr = $null     # stderr 的「待完成异步读」
 $script:kernelLines = 0       # 已收到几条采样
+$script:kernelTrust = $null   # M7：内核报上来的亲密度（0~100；还没收到 = $null，状态区不带档位词）
 $script:eventLines = 0        # 已收到几条「只只说的话」（stdout 的 type:"event"/"alert"）
 $script:kernelDead = $false
 $script:metricsTimer = $null  # UI 线程上的轮询定时器
@@ -365,8 +366,11 @@ function Start-Kernel {
 
   $script:kernelOut = $script:kernel.StandardOutput.ReadLineAsync()
   $script:kernelErr = $script:kernel.StandardError.ReadLineAsync()
-  # 【申明点 ①】sidecar 启动 —— 不给超时：数据来了才算「叫起来了」（Apply-SampleLine 里清）
-  Set-StatusText '正在把内核叫起来…'
+  # 【申明点 ①】sidecar 启动 —— 首条数据到就清（Apply-SampleLine）；
+  # ⚠️ 但仍给 60s 宽松上限兜底（M4-c 复验抓到的「永久卡住」唯一入口）：
+  #    内核进程活着却一条数据都不出（node 卡住 / stdin 阻塞 / 被安全软件拦）时，
+  #    「结束事件」永远不来 —— 例外没兜底，状态区就永久撒谎「正在叫起来」。
+  Set-StatusText '正在把内核叫起来…' 60
   Write-ZhiLog ('内核已作为 sidecar 启动：PID=' + $script:kernel.Id + ' 参数=' + $kernelArgs)
 }
 
@@ -384,6 +388,7 @@ function Stop-Kernel {
   $script:kernel = $null
   $script:kernelOut = $null
   $script:kernelErr = $null
+  Clear-StatusText    # 🟡 修 M4-c 复验发现：内核已收还挂着「正在把内核叫起来…」—— 申明随内核一起收
   Update-StateArea    # 底色立刻变「内核停了」（不等下一轮轮询）
 }
 
@@ -404,6 +409,7 @@ function Apply-SampleLine([string]$line) {
       $mem = ($obj.probes.'probe-mem' | Where-Object { $_.key -eq 'mem.usage' } | Select-Object -First 1).value
       if ($null -ne $cpu) { $lblCpuV.Text = ('{0:N1}%' -f [double]$cpu) }
       if ($null -ne $mem) { $lblMemV.Text = ('{0:N1}%' -f [double]$mem) }
+      if ($null -ne $obj.trust) { $script:kernelTrust = [int]$obj.trust }   # M7：亲密度随采样来
       $script:kernelLines++
       if ($script:kernelLines -eq 1) { Clear-StatusText }   # 【申明①结束】数据到了 = 内核叫起来了
       Update-PosLabel
@@ -871,14 +877,28 @@ function Clear-StatusText {
   Update-StateArea
 }
 
-# 底色（推导为辅）—— 三选一，**总有一条成立**
+# 底色（推导为辅）—— 三选一，**总有一条成立**；内核活着时带亲密度档位词（M7）
+function Get-TrustWord {
+  if ($null -eq $script:kernelTrust) { return '' }
+  if ($script:kernelTrust -ge 80) { return '亲近' }
+  if ($script:kernelTrust -ge 40) { return '熟悉' }
+  if ($script:kernelTrust -ge 10) { return '陌生' }
+  return '生分了'
+}
+
 function Get-BaseStateText {
   if ($script:kernelDead -or $null -eq $script:kernel) { return '内核停了' }
+  $base = $null
   $idle = Get-IdleMs
-  if ($null -ne $idle -and $idle -ge (10 * 60 * 1000)) { return '你闲着，我也闲着' }
-  $cpu = $lblCpuV.Text
-  if ($cpu -eq '—') { return '看着呢' }
-  return ('看着呢 —— CPU ' + $cpu)
+  if ($null -ne $idle -and $idle -ge (10 * 60 * 1000)) { $base = '你闲着，我也闲着' }
+  else {
+    $cpu = $lblCpuV.Text
+    if ($cpu -eq '—') { $base = '看着呢' }
+    else { $base = ('看着呢 —— CPU ' + $cpu) }
+  }
+  $word = Get-TrustWord
+  if ($word -ne '') { $base = $base + ' · ' + $word }
+  return $base
 }
 
 # 状态区唯一渲染口。高频调用没关系：文本没变就不动控件（呼吸感，不是刷新感）

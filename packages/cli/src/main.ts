@@ -25,6 +25,7 @@ import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_SUSTAIN_MS,
   Dispatcher,
+  Memory,
   Registry,
   Scheduler,
   Store,
@@ -151,6 +152,11 @@ function loadSettings(): Record<string, unknown> {
 }
 
 const settings = loadSettings();
+
+// ── M7 · 记忆 + 亲密度 ──
+// 说出口的话进 events.jsonl（重启后「说过没说过」「第几次」还在）；
+// trust.json 记亲密度（0~100）。文件坏 / 写不进 → 记忆退化、内核照常（Memory 自己兜）。
+const memory = new Memory({ dir: dataDir, log: log.child('memory') });
 
 /**
  * 把数据目录里的一份台词池（`user.json` / `learned.json`）登记进账本。
@@ -286,18 +292,30 @@ bus.on<ZhizhiEvent>('event.candidate', (event) => {
       log.debug(`闸门「${verdict.blockedBy}」压下了 ${event.type}：${verdict.reason ?? ''}`);
       return;
     }
+  } else if (memory.trust < 10 && !event.id.startsWith('say@')) {
+    // M7 亲密度档位「沉默」（0~9）：只报警（功能性），几乎不说话 —— 原设计表的行为。
+    // ⚠️ 只压**自动闲聊**，两样永不受影响：告警（功能性，沉默机制说了算，宪法不变）、
+    //    用户点名的 `say@`（明确指令 —— 而且它是 low-trust 状态唯一的回暖入口，
+    //    把它也压掉 = 死锁，trust 永远救不回来）。
+    log.debug(`亲密度 ${memory.trust}（沉默档）：压下自动闲聊 —— 它现在不想自己找话`);
+    return;
   }
 
   passedEvents.push(event);
   if (passedEvents.length > 200) passedEvents.shift();
 
-  const line = composeLine(event, registry.personas(), log.child('voice'));
+  // 记忆进挑句：说过没说过跨重启算数 + {count}（第几次）可入台词
+  const line = composeLine(event, registry.personas(), log.child('voice'), memory.voice);
   bus.emit<ZhizhiEvent>('event.passed', event);
 
   void dispatcher
     .dispatch({ eventId: event.id, text: line.text, severity: event.severity })
     .then((sent) => {
-      if (sent) log.info(`只只说了［${event.severity}］：${line.text}`);
+      if (sent) {
+        log.info(`只只说了［${event.severity}］：${line.text}`);
+        // ⭐ 说出去了才算「说过」（压在闸门里的不算）—— 记模板 key，不记填完的文本
+        memory.recordSpoken(event, line.key ?? line.text, line.text);
+      }
     });
 });
 
@@ -342,7 +360,9 @@ process.stdin.on('data', (chunk: string) => {
           deliverContext(context);
         }
         if (say === true) {
-          // 用户点了「说说」—— 把请求连同最新上下文一起递给规则（规则决定怎么开口）
+          // 用户点了「说说」—— 把请求连同最新上下文一起递给规则（规则决定怎么开口）。
+          // M7：这是「和它对话」—— 亲密度 +2（原设计表唯一不需要反馈 UI 的加分项）
+          memory.recordInteraction();
           deliverContext({ ...context, requestSay: true });
         }
         if (!idleOk && say !== true) {
@@ -419,11 +439,15 @@ const scheduler = new Scheduler(
 
     const elapsedMs = Number((performance.now() - started).toFixed(1));
 
+    // M7：每天不互动 -2 —— 跨天后的第一个 tick 结账（没互动的日子这里就是唯一的触碰点）
+    memory.decayIfNewDay();
+
     const report = {
       tick,
       ts: new Date(now).toISOString(),
       elapsedMs,
       probes,
+      trust: memory.trust, // M7：外壳据此在状态区显示亲密度档位
     };
 
     // ⭐ stdout 只有数据，没有别的 —— M0 的验收标准，M1 继续守
@@ -444,6 +468,13 @@ log.info(
   `插件在岗 ${registry.activeCount} / ${PLUGINS.length}：${registry.activeIds().join(', ') || '（无）'}`,
 );
 log.info(`数据目录：${dataDir}（user.json / learned.json / zhizhi.settings.json 住这里；--data-dir 可改）`);
+// M7：记忆与亲密度 —— 「0 条」是第一次跑的正常状态，得说清不是故障
+log.info(
+  memory.spokenTotal > 0
+    ? `记忆：${memory.spokenTotal} 句说过的话在案（events.jsonl）—— 挑句跨重启不重复、{count} 可用`
+    : '记忆：空的（第一次跑，正常）—— 说出口的话会记到 memory/events.jsonl',
+);
+log.info(`亲密度：trust=${memory.trust}（${memory.tier}档）—— 点「说说」+2 / 每天不互动 -2；只影响闲聊，告警不受影响`);
 // 闲聊旋钮只做汇报 —— 真正的消费方是 rule-chitchat（configure 已下发）。
 // ⚠️ 汇报必须按**实际生效**口径：间隔 0 会被规则拒收（>0 才收）→ 如实报「默认」并告警，
 //    别让日志说「间隔 0ms」而实际跑 30 分钟（监工复验抓到的谎报）。
@@ -490,7 +521,7 @@ log.info(
     `gates=${gates.length} 道 · channels=${dispatcher.channelIds().length} 个`,
 );
 log.info(
-  `闸门参数：sustain=${sustainMs}ms（持续判定）· cooldown=${cooldownMs}ms（冷却期）· baseline=占位（M7 填）`,
+  `闸门参数：sustain=${sustainMs}ms（持续判定）· cooldown=${cooldownMs}ms（冷却期）· baseline=占位（M8-a 填：需指标样本历史）`,
 );
 if (intervalMs >= sustainMs) {
   // 持续判定靠「两次见到它相隔多久」推断中间有没有恢复；

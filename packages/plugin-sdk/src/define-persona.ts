@@ -25,10 +25,17 @@ export interface PersonaDefinition {
    * 挑一句话；返回 undefined = 「这次选择不说」。
    * `options` 的三段式约定（专属新鲜 → `"*"` 兜底新鲜 → 才许重复）
    * 见 core 里 `Persona` 契约的说明；不关心的实现忽略它即可。
+   *
+   * M7 起 `options.isStale(key)` 由内核注入（主机带记忆时）——
+   * 「说过」以**模板原文**为键、跨重启生效；实现不认识它时忽略即可（退回进程内判据）。
    */
   readonly speak: (
     event: ZhizhiEvent,
-    options?: { readonly allowRepeat?: boolean; readonly useFallback?: boolean },
+    options?: {
+      readonly allowRepeat?: boolean;
+      readonly useFallback?: boolean;
+      readonly isStale?: (key: string) => boolean;
+    },
   ) => Line | undefined;
 }
 
@@ -71,6 +78,7 @@ export function definePersona(definition: PersonaDefinition): Persona {
  * | `{type}` · `{severity}` | 事件类型 / 严重度 |
  * | `{key}` · `{value}` · `{unit}` | 触发它的第一个指标 |
  * | `{drive}` 等 | 该指标的 `meta` 字段（键名直接用，如磁盘的 `drive`） |
+ * | `{count}` | 🆕 M7：该类型**是第几次**（内核按记忆填，如 `都第 {count} 次了…`；主机不带记忆时原样保留） |
  */
 export interface PersonaJson {
   readonly id: string;
@@ -161,20 +169,25 @@ export function definePersonaFromJson(raw: unknown, source: string): Persona {
   const data = parsePersonaJson(raw, source);
 
   // 「没说过」记录（进程内存活期）—— M6 挑句原则：**没说过 / 近期没说过的优先**。
-  // 与 core/voice.ts 的两段式配合：第一段只出新鲜的（全用过就 undefined，让给下一层），
-  // 第二段（allowRepeat）才允许重复。M7 记忆系统落地后换成持久化的「近期说过」。
+  // M7 起内核若带记忆（composeLine 注入 isStale），「说过」跨重启仍算说过；
+  // 这里自己的 Set 继续管会话内不重复（主机不带记忆时它是唯一判据）。
   const said = new Set<string>();
 
   return definePersona({
     id: data.id,
     speak(
       event: ZhizhiEvent,
-      options?: { readonly allowRepeat?: boolean; readonly useFallback?: boolean },
+      options?: {
+        readonly allowRepeat?: boolean;
+        readonly useFallback?: boolean;
+        readonly isStale?: (key: string) => boolean;
+      },
     ): Line | undefined {
       // 三段式（见 core/Persona 契约）：专属新鲜 → `"*"` 兜底新鲜 → 才许重复。
       // ⚠️ 第一段绝不能把 `"*"` 混进来 —— 否则中层的兜底键会把下层的专属台词挡死。
       const allowRepeat = options?.allowRepeat === true;
       const useFallback = options?.useFallback === true;
+      const isStale = options?.isStale;
       const specific = data.lines[event.type];
       const pool = useFallback
         ? data.lines[FALLBACK_KEY]
@@ -183,14 +196,17 @@ export function definePersonaFromJson(raw: unknown, source: string): Persona {
       // ⚠️ 这里**绝不能**抛错：台词包是默认值不是必需品，缺台词不是故障。
       if (pool === undefined || pool.length === 0) return undefined;
 
-      const fresh = pool.filter((line) => !said.has(line));
+      // 新鲜 = 会话内没说过（本 Set）且 跨重启也没说过（内核记忆，若有）。
+      // 模板原文为键 —— 填完 {value} 的文本每次都不同，当不了「说过」的凭据。
+      const fresh = pool.filter((line) => !said.has(line) && !(isStale?.(line) ?? false));
       const candidates = fresh.length > 0 ? fresh : allowRepeat ? pool : [];
       // 全都说过了、又不许重复 → undefined，把机会让给下一层台词包
       if (candidates.length === 0) return undefined;
 
       const picked = candidates[Math.floor(Math.random() * candidates.length)]!;
       said.add(picked);
-      return { text: fillPlaceholders(picked, event) };
+      // key = 模板原文（fillPlaceholders 之前）—— 内核记忆按它记账（M7）
+      return { text: fillPlaceholders(picked, event), key: picked };
     },
   });
 }

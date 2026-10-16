@@ -63,10 +63,12 @@ export default defineRule({
     // 用户点了「说说」：这是明确指令，优先于空闲/间隔两个条件 —— 立即开口。
     // 顺带把「上次闲聊」重置到现在：自动闲聊从这句话起重新计间隔。
     // ⚠️ 只消费一次（evaluate 一个 tick 会被调多次，第一调消费掉，其余不再触发）。
+    // id 用 `say@` 前缀：内核据此区分「用户点名要说的」（不受亲密度门槛管 ——
+    // 它是明确指令；trust 再低也应答，这也是 low-trust 状态唯一的回暖入口）。
     if (sayRequested) {
       sayRequested = false;
       lastChitchatAt = now;
-      return [makeChitchat(now)];
+      return [makeChitchat(now, true)];
     }
 
     // 硬约束 ③：没人喂上下文 → 沉默。不是出错，是「不知道你闲不闲，所以不说」
@@ -75,13 +77,14 @@ export default defineRule({
     if (lastChitchatAt !== undefined && now - lastChitchatAt < intervalMs) return []; // 刚聊过
 
     lastChitchatAt = now;
-    return [makeChitchat(now)];
+    return [makeChitchat(now, false)];
   },
 });
 
-function makeChitchat(ts: number): ZhizhiEvent {
+function makeChitchat(ts: number, isUserRequested: boolean): ZhizhiEvent {
   return {
-    id: `chitchat@${ts}`,
+    // `say@` = 用户点名的（内核的亲密度门槛不压它）；`chitchat@` = 自己找话说的
+    id: `${isUserRequested ? 'say' : 'chitchat'}@${ts}`,
     type: 'chitchat',
     severity: 'info', // 「多要紧」的正确归类：critical=出事 / warn=不对劲 / info=就是说说
     kind: 'chitchat', // 内核据此绕闸门、走 dispatcher（决策 #22）

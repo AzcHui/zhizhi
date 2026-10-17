@@ -149,6 +149,13 @@ export interface ContextInput {
    */
   readonly trust?: number;
   /**
+   * 🆕 M4-b2-a：「静一下」截止时刻（epoch ms；**0 = 未静音**）—— 外壳随 idleMs 一起喂，
+   * 且**每秒都喂真值**（点「恢复」后内核不留旧的未来时刻）。
+   * 口径：**只压「它自己开口」**—— cli 在 chitchat 分流处判 `now < muteUntil` 丢弃；
+   * poked、告警、`say@` 点名一律不受影响（戳是玩、点名是明确指令，都不是它自己开口）。
+   */
+  readonly muteUntil?: number;
+  /**
    * 🆕 M4-b1（决策 #34）：外壳报「球刚被点了一下」。
    * **只报事实** —— 要不要回应（抖 ／ 挪 ／ 说）由内核的规则裁决，外壳不自作主张。
    */

@@ -75,6 +75,11 @@ let trust = 40;
 /** 用户点了「说说」—— 下一次 evaluate 立即开口（用户指令优先于一切节奏条件） */
 let sayRequested = false;
 
+/** 外壳是否喂上过第一帧 context（greeting 触发条件：喂上才算「真活了」，内核自跑不算） */
+let firstContextSeen = false;
+/** 启动招呼只说一次（同进程内） */
+let greeted = false;
+
 /** 闲聊开/关（用户手上唯一必有的键；**关 = 连点名也不说** —— 零歧义） */
 let enabled = true;
 /** 话量档 */
@@ -125,6 +130,7 @@ export default defineRule({
 
   // 外壳每秒喂一次上下文；只认「非负数」，别的宁可不更新（不猜、不静默填错）
   onContext(ctx: ContextInput): void {
+    firstContextSeen = true;   // greeting 触发条件：第一帧 context 到了（在这里只记状态，事件统一在 evaluate 产）
     if (typeof ctx['idleMs'] === 'number' && Number.isFinite(ctx['idleMs']) && ctx['idleMs'] >= 0) {
       idleMs = ctx['idleMs'];
     }
@@ -160,6 +166,18 @@ export default defineRule({
       nextAllowedAt = now + drawGapMs();
       return [makeChitchat(now, true)];
     }
+
+    // M4-b2 插队「greeting 启动打招呼」：外壳喂上第一帧 context 才算「真活了」，同进程只说一次。
+    // ⚠️ 排在 sayRequested 之后 —— 点名比「我起来了」更急，同一次 tick 点名优先；
+    // ⚠️ 不碰 nextAllowedAt —— 别把自动闲聊的时钟带着重置；
+    // ⚠️ 不判 enabled —— 闲聊开关关着也该说「我起来了」，它是启动告知不是闲聊；
+    // ⚠️ 不占每日上限、不判 idle 门槛（启动那一刻你必然在动，受门槛就永远打不出来）；
+    //    trust<10 放行与 muteUntil 照压都由 cli 在分流处判 —— 统一一处，rule 不重复。
+    if (firstContextSeen && !greeted) {
+      greeted = true;
+      return [makeGreeting(now)];
+    }
+
     if (!enabled) return [];
 
     // 硬约束 ③：没人喂上下文 → 沉默。不是出错，是「不知道你闲不闲，所以不说」
@@ -192,5 +210,19 @@ function makeChitchat(ts: number, isUserRequested: boolean): ZhizhiEvent {
     ts,
     // summary 是兜底描述：没有台词包时，只只用它说话（降级，不是故障）
     summary: '（闲聊）你歇着呢，我陪你待会儿。',
+  };
+}
+
+/** M4-b2 插队「greeting 启动打招呼」：kind 复用 chitchat（绕闸门 + 走 dispatcher，内核零改动），
+ *  eventId/type 用 greeting —— persona 按它挑台词、cli 按前缀放行沉默档。 */
+function makeGreeting(ts: number): ZhizhiEvent {
+  return {
+    id: `greeting@${ts}`,
+    type: 'greeting',
+    severity: 'info',
+    kind: 'chitchat',
+    metrics: [],
+    ts,
+    summary: '（启动）我起来了。',
   };
 }

@@ -316,12 +316,24 @@ bus.on<ZhizhiEvent>('event.candidate', (event) => {
     // 决策 #34：poked 不受 trust<10 压制（用户主动来玩，压掉 = 把玩的入口关死）、
     // 也不占每日上限（那是自动闲聊的额度）—— 它只在你戳的时候发生，天然有限。
   } else if (event.kind === 'chitchat') {
-    if (memory.trust < 10 && !event.id.startsWith('say@')) {
+    // M4-b2 greeting 插队：`say@` 与 `greeting@` 都不受沉默档压制 ——
+    // 点名是明确指令，「我起来了」是功能性告知（新用户的第一句话，压掉 = 最该说话时闭嘴）。
+    if (memory.trust < 10
+        && !event.id.startsWith('say@')
+        && !event.id.startsWith('greeting@')) {
       // M7 亲密度档位「沉默」（0~9）：只报警（功能性），几乎不说话 —— 原设计表的行为。
       // ⚠️ 只压**自动闲聊**，两样永不受影响：告警（功能性，沉默机制说了算，宪法不变）、
       //    用户点名的 `say@`（明确指令 —— 而且它是 low-trust 状态唯一的回暖入口，
       //    把它也压掉 = 死锁，trust 永远救不回来）。
       log.debug(`亲密度 ${memory.trust}（沉默档）：压下自动闲聊 —— 它现在不想自己找话`);
+      return;
+    }
+    // M4-b2-a「静一下」（b2-a 开工单 ②）：只压「它自己开口」—— say@ 点名与 poked / 告警一律放行。
+    // 外壳每秒随 idleMs 喂 muteUntil（0 = 未静音，见 ContextInput 契约），这里按当前值判：
+    // 到点自然失效、点「恢复」后下一秒就放行，不需要内核自己维护静音状态。
+    const { muteUntil } = context;
+    if (typeof muteUntil === 'number' && muteUntil > Date.now() && !event.id.startsWith('say@')) {
+      log.debug(`静音中（外壳「静一下」，至 ${new Date(muteUntil).toISOString()}）：压下自动闲聊 —— 戳与告警不受影响`);
       return;
     }
   } else {
@@ -390,9 +402,15 @@ process.stdin.on('data', (chunk: string) => {
         const idle = obj === null || typeof obj !== 'object' ? undefined : obj['idleMs'];
         const say = obj === null || typeof obj !== 'object' ? undefined : obj['requestSay'];
         const poke = obj === null || typeof obj !== 'object' ? undefined : obj['poked'];
+        // M4-b2-a「静一下」：外壳随 idleMs 每秒喂真值（0 = 未静音）—— 不喂 = 旧外壳 = 无静音，兼容
+        const mute = obj === null || typeof obj !== 'object' ? undefined : obj['muteUntil'];
+        const muteOk = typeof mute === 'number' && Number.isFinite(mute) && mute >= 0;
         const idleOk = typeof idle === 'number' && Number.isFinite(idle) && idle >= 0;
         if (idleOk) {
-          context = { idleMs: idle as number };
+          context = {
+            idleMs: idle as number,
+            ...(muteOk ? { muteUntil: mute as number } : {}),
+          };
           deliverContext(context);
         }
         if (say === true) {

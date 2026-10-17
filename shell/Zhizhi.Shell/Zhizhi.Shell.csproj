@@ -4,6 +4,8 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <!-- b2-b1 托盘：NotifyIcon 来自 WinForms —— 与 WPF 同项目必须双开 -->
+    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Zhizhi.Shell</RootNamespace>
@@ -15,5 +17,13 @@
     <!-- WinExe 不弹控制台；self-test 模式用 AttachConsole 接回父控制台输出 -->
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+
+  <!-- ⭐ WinForms 的隐式 using 会把 System.Drawing / System.Windows.Forms 注入所有文件，
+       与 WPF 的 Point / Color / Brush / MessageBox 撞名（CS0104 一片红）——
+       全局移除，用到的 WinForms 类型一律全限定名。 -->
+  <ItemGroup>
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
+  </ItemGroup>
 
 </Project>

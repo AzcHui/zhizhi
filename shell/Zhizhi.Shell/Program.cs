@@ -24,6 +24,17 @@ public static class Program
         if (args.Contains("--render-test", StringComparer.OrdinalIgnoreCase))
             return RunRenderTest();
 
+        // ── b2-b1 ① 单实例互斥：双击两次 = 两个只只、两个内核（双重告警、双重闲聊）──
+        // ⭐ 只拦**正常 UI 模式**：--self-test / --render-test 是验收工具，上面已分流，不受互斥影响。
+        //   第二实例**静默退出**（开工单「直接退出」；气泡提示是可选项 —— 弹窗/气泡反而打扰）。
+        using var singleInstance = new System.Threading.Mutex(true, @"Local\Zhizhi.Shell.SingleInstance", out var createdNew);
+        if (!createdNew)
+        {
+            ShellLog.FilePath = LogPath;
+            ShellLog.Write("已有只只在跑，第二实例静默退出（单实例互斥）");
+            return 0;
+        }
+
         // WinExe 没有控制台；日志走 zhi-shell.log（观察⑤：关键动作落盘）+ 面板 tooltip（b2 做日志窗）
         ShellLog.FilePath = LogPath;
         ShellLog.Write("外壳启动");
@@ -54,11 +65,18 @@ public static class Program
         var kernel = new KernelSidecar();
         try
         {
-            kernel.Start(repoRoot, intervalMs: 2000);
+            // ⭐ greeting 插队（2026-10-17）：招呼产自内核 evaluate tick，interval 2000 → 最坏 2s 才出，
+            //   撞验收①「1 秒内」。改 1000 与外壳 1s 喂食节奏对齐（采样每秒一次开销可忽略）。
+            kernel.Start(repoRoot, intervalMs: 1000);
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"内核启动失败：{ex.Message}", "只只", MessageBoxButton.OK, MessageBoxImage.Error);
+            // b2-b1 ④：node 启动失败换人话 —— 原样抛的是英文 Win32 异常
+            //（"An error occurred trying to start process 'node'…"）。三级定位归 b2-b3，本地玩给一句够用的。
+            var hint = ex is System.ComponentModel.Win32Exception { NativeErrorCode: 2 }
+                ? "找不到 node —— Node.js 没装或不在 PATH 里。\n本地玩需要先装 Node.js 22+（发布包会自带，归后续版本）。"
+                : ex.Message;
+            MessageBox.Show($"内核启动失败：{hint}", "只只", MessageBoxButton.OK, MessageBoxImage.Error);
             return 1;
         }
 
@@ -127,12 +145,16 @@ public static class Program
         }
 
         // ③ 反向通道端到端（⭐ P0-2 教训：原判据「戳 1 下不回应」在链路整段断掉时也通过）
+        // ⚠️ greeting 插队（2026-10-17）：喂 idleMs 会让只只打一句 greeting@ 招呼 ——
+        //   判据必须按 poked@ 前缀过滤（同下面 148 行），否则自检假红被当成「打招呼坏了」回滚。
         var fed = kernel.Feed("{\"idleMs\":600000}");
         Check("反向通道喂 idleMs", fed);
         kernel.Feed("{\"poked\":1}");
         Thread.Sleep(500);   // poked 1 次不该触发回应 —— 阈值 3~7
-        lock (saidLines) Check("戳 1 下不回应（阈值 3~7）", saidLines.Count == 0,
-            saidLines.Count == 0 ? "" : $"意外说了 {saidLines.Count} 句");
+        int strayPoked;
+        lock (saidLines) strayPoked = saidLines.Count(s => s.EventId.StartsWith("poked@", StringComparison.Ordinal));
+        Check("戳 1 下不回应（阈值 3~7）", strayPoked == 0,
+            strayPoked == 0 ? "" : $"意外 poked@ 回应 {strayPoked} 句");
         // ⭐ 再喂 7 戳（累计 8 ≥ 阈值上限 7）→ **必须**产出 poked@ 回应 —— 链路「送进去 → 裁决 → 回来」全通
         for (var i = 0; i < 7; i++)
         {

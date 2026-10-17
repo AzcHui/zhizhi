@@ -39,9 +39,8 @@ public sealed class FloatWindow : Window
 
     private int _samples;             // 已看 N 轮
     private int? _trust;              // M7：内核报上来的亲密度
-    private string _lastSaid = "";    // 最近一句（面板里也可见）
     private bool _panelOpen;
-    private bool _movingAside;        // L4 躲开动画进行中（防重入）
+    private bool _movingAside;        // L4 躲开动画进行中（防重入；watchdog 兜底防卡死）
 
     public FloatWindow(KernelSidecar kernel)
     {
@@ -93,13 +92,17 @@ public sealed class FloatWindow : Window
             Foreground = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)),
         };
         _bubble.Child = _bubbleText;
+        // ⭐ P0-3（监工 2026-10-17）：气泡贴球**正上方**（不与面板同位），且 Z 序压在面板之上 ——
+        //   「它刚说了句话」本就该盖过面板；此前气泡与面板几乎同位（Bottom 92 vs 90）且
+        //   面板后加入在上层 → 鼠标在球上（点球前提）必然开着面板 → 气泡被完整盖住，一次都看不见。
         Canvas.SetRight(_bubble, 14);
-        Canvas.SetBottom(_bubble, BallSize + 28);
+        Canvas.SetBottom(_bubble, BallSize + 20);   // 球(bottom 14 + 64)顶在 78 → 气泡底 84，留 6px 间隙
+        Panel.SetZIndex(_bubble, 10);               // 面板 Z 序默认 0 —— 气泡恒在其上
         _bubble.MouseEnter += (_, _) => ExpandPanel();   // 气泡上也算悬停（话没读完不收）
 
         _panel = MakePanel();
-        Canvas.SetRight(_panel, 14);
-        Canvas.SetBottom(_panel, BallSize + 26);
+        Canvas.SetRight(_panel, BallSize + 30);     // 面板移到球**左侧**（与气泡位置错开）
+        Canvas.SetBottom(_panel, 14);
         _panel.Visibility = Visibility.Collapsed;
         _panel.MouseLeave += (_, _) => { if (!_ball.IsMouseOver) CollapsePanel(); };
 
@@ -160,7 +163,6 @@ public sealed class FloatWindow : Window
 
     private void OnSaid(SaidLine said)
     {
-        _lastSaid = said.Text;
         ShowBubble(said.Text);
         if (_panelOpen) UpdateStatusLine();
         // L4（决策 #34）：poked@ 前缀 = 它决定「躲开」—— 外壳只做动作，说话归内核
@@ -208,6 +210,7 @@ public sealed class FloatWindow : Window
         _bubble.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180)));
         _bubbleTimer.Stop();
         _bubbleTimer.Start();       // 4.5s 后自动消失 —— 绝不永久驻留
+        AppendLog($"气泡显示：{text}");
     }
 
     private void HideBubble()
@@ -216,7 +219,20 @@ public sealed class FloatWindow : Window
         var anim = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(220));
         anim.Completed += (_, _) => _bubble.Visibility = Visibility.Collapsed;
         _bubble.BeginAnimation(OpacityProperty, anim);
+        AppendLog("气泡已隐");
     }
+
+    /// <summary>渲染冒烟专用：展开面板（复现「鼠标在球上」现场）＋ 显示气泡 —— 验证气泡不被盖住。</summary>
+    public void ShowTestBubble(string text)
+    {
+        ExpandPanel();
+        ShowBubble(text);
+    }
+
+    /// <summary>渲染冒烟专用：气泡/面板的可见性与透明度实况（诊断「为什么截图里没有」）。</summary>
+    public string DumpVisualState() =>
+        $"bubble(V={_bubble.Visibility} O={_bubble.Opacity:F2} W={_bubble.ActualWidth:F0} H={_bubble.ActualHeight:F0}) " +
+        $"panel(V={_panel.Visibility} O={_panel.Opacity:F2}) ballO={_ball.Opacity:F2}";
 
     // ───────────────────────── 悬停面板 ─────────────────────────
 
@@ -289,7 +305,13 @@ public sealed class FloatWindow : Window
     private void ShakeBall()
     {
         if (_ballShake.HasAnimatedProperties) return;  // 抖动中再点 = 忽略（防重入）
-        var kf = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(150) };
+        var kf = new DoubleAnimationUsingKeyFrames
+        {
+            Duration = TimeSpan.FromMilliseconds(150),
+            // ⭐ P0-1（监工 2026-10-17）：必须 Stop —— 默认 HoldEnd 会让时钟在动画结束后
+            //   仍持有属性 → HasAnimatedProperties 永久 True → guard 把第二次点球永久拦死。
+            FillBehavior = FillBehavior.Stop,
+        };
         // 相对偏移（监工 P0 的教训在变换域里天然成立：动的是 RenderTransform，永远不覆盖位置）
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(0, TimeSpan.Zero));
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(-4, TimeSpan.FromMilliseconds(30)));
@@ -297,6 +319,8 @@ public sealed class FloatWindow : Window
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(-3, TimeSpan.FromMilliseconds(90)));
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(3, TimeSpan.FromMilliseconds(120)));
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(0, TimeSpan.FromMilliseconds(150)));
+        // 双保险：Stop 之外再显式摘除时钟（幂等）—— 确保 guard 一定会松开
+        kf.Completed += (_, _) => _ballShake.BeginAnimation(TranslateTransform.XProperty, null);
         _ballShake.BeginAnimation(TranslateTransform.XProperty, kf);
     }
 
@@ -321,22 +345,41 @@ public sealed class FloatWindow : Window
         };
         BeginAnimation(LeftProperty, animX);
         BeginAnimation(TopProperty, animY);
+
+        // ⭐ 监工观察②：若动画被异常打断，Completed 不会来 → 标志位永久卡住 → 之后再也挪不动。
+        //   「不设超时的例外必须反问：结束事件永远不来呢？」→ 400ms 兜底强制清（幂等）。
+        var watchdog = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
+        watchdog.Tick += (_, _) =>
+        {
+            watchdog.Stop();
+            if (_movingAside)
+            {
+                _movingAside = false;
+                AppendLog("[WRN] 挪一挪动画未按时完成（watchdog 强制解锁）");
+            }
+        };
+        watchdog.Start();
     }
 
-    /// <summary>离开式随机：方向随机、位移 ≈ 自身 0.6~1.0 倍、clamp 工作区、允许回原位、中央 1/3 重抽一次。</summary>
+    /// <summary>离开式随机：方向随机、位移 ≈ 自身 0.6~1.0 倍、clamp 工作区、中央 1/3 重抽；
+    /// ⭐ clamp 吃位移防护（自检布尔判定抓到，与旧壳同源）：窗贴角落时朝角落抽会被 clamp
+    /// 全额吃掉 → 位移 0（违背「避免挪 1 像素」）→ 位移不足就重抽，最多 4 次。
+    /// （决策 #31 ④「允许回原位」仍由多次点击的随机性保证 —— 单次点击必须真的挪。）</summary>
     private Point RollAsideTarget(Rect wa)
     {
+        var minShift = Math.Max(32, Math.Max(Width, Height) * 0.3);
         for (var attempt = 0; ; attempt++)
         {
             var angle = _rng.NextDouble() * Math.PI * 2;
-            var dist = 0.6 + _rng.NextDouble() * 0.4;               // 0.6 ~ 1.0
-            var dx = Math.Cos(angle) * dist * Width;
-            var dy = Math.Sin(angle) * dist * Height;
+            var dist = (0.6 + _rng.NextDouble() * 0.4) * Math.Max(Width, Height);
+            var dx = Math.Cos(angle) * dist;
+            var dy = Math.Sin(angle) * dist;
             var x = Clamp(Left + dx, wa.Left, wa.Right - Width);
             var y = Clamp(Top + dy, wa.Top, wa.Bottom - Height);
+            var shifted = Math.Abs(x - Left) + Math.Abs(y - Top) >= minShift;
             var inCenterThird = x > wa.Left + wa.Width / 3.0 && x < wa.Left + wa.Width * 2.0 / 3.0
                              && y > wa.Top + wa.Height / 3.0 && y < wa.Top + wa.Height * 2.0 / 3.0;
-            if (!inCenterThird || attempt >= 1)                     // 落中央 1/3 → 重抽一次（倾向，不是硬约束）
+            if ((shifted && !inCenterThird) || attempt >= 3)        // 中央 1/3 重抽；位移不足也重抽
                 return new Point(x, y);
         }
     }
@@ -360,7 +403,7 @@ public sealed class FloatWindow : Window
         // 拿不到 = 「不知道你闲不闲」—— 不喂、不猜（宁可不传也不传错）
     }
 
-    // ───────────────────────── 日志（b1 进面板标题行的 tooltip，b2 再做日志窗）─────────
+    // ───────────────────────── 日志（内存环形缓冲 + 落盘；日志窗 b2 再做）─────────
     private readonly List<string> _logs = new();
     private readonly object _logLock = new();
 
@@ -371,6 +414,7 @@ public sealed class FloatWindow : Window
             _logs.Add($"[{DateTime.Now:HH:mm:ss}] {msg}");
             if (_logs.Count > 100) _logs.RemoveAt(0);
         }
+        ShellLog.Write(msg);   // ⭐ 观察⑤：关键动作落盘（点球/挪一挪/气泡显隐/内核日志都走这里）
     }
 
     public string DumpLogs()

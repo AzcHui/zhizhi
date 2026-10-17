@@ -24,7 +24,9 @@ public static class Program
         if (args.Contains("--render-test", StringComparer.OrdinalIgnoreCase))
             return RunRenderTest();
 
-        // WinExe 没有控制台；日志走全局异常兜底 + 面板 tooltip（b2 做日志窗）
+        // WinExe 没有控制台；日志走 zhi-shell.log（观察⑤：关键动作落盘）+ 面板 tooltip（b2 做日志窗）
+        ShellLog.FilePath = LogPath;
+        ShellLog.Write("外壳启动");
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss}] [FATAL] {e.ExceptionObject}\n");
         TaskScheduler.UnobservedTaskException += (_, e) =>
@@ -124,13 +126,31 @@ public static class Program
                 samples.Count > 0 ? $"CPU={samples[^1].Cpu:F1}% MEM={samples[^1].Mem:F1}%" : "");
         }
 
-        // ③ 反向通道（喂得进去 = 通道活着）
+        // ③ 反向通道端到端（⭐ P0-2 教训：原判据「戳 1 下不回应」在链路整段断掉时也通过）
         var fed = kernel.Feed("{\"idleMs\":600000}");
         Check("反向通道喂 idleMs", fed);
         kernel.Feed("{\"poked\":1}");
-        Thread.Sleep(500);   // 给 event 一点时间（poked 1 次不该触发回应 —— 阈值 3~7）
+        Thread.Sleep(500);   // poked 1 次不该触发回应 —— 阈值 3~7
         lock (saidLines) Check("戳 1 下不回应（阈值 3~7）", saidLines.Count == 0,
             saidLines.Count == 0 ? "" : $"意外说了 {saidLines.Count} 句");
+        // ⭐ 再喂 7 戳（累计 8 ≥ 阈值上限 7）→ **必须**产出 poked@ 回应 —— 链路「送进去 → 裁决 → 回来」全通
+        for (var i = 0; i < 7; i++)
+        {
+            kernel.Feed("{\"poked\":1}");
+            Thread.Sleep(120);
+        }
+        var pokeReplies = 0;
+        var deadlinePoke = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadlinePoke)
+        {
+            lock (saidLines)
+            {
+                pokeReplies = saidLines.Count(s => s.EventId.StartsWith("poked@", StringComparison.Ordinal));
+                if (pokeReplies > 0) break;
+            }
+            Thread.Sleep(100);
+        }
+        Check("连戳 8 下必有回应（端到端）", pokeReplies > 0, $"poked@ 回应 {pokeReplies} 句");
 
         // ④ 收干净
         kernel.Stop();
@@ -152,6 +172,8 @@ public static class Program
         Console.WriteLine("=== 只只 · WPF 外壳渲染冒烟 ===");
         var repo = KernelSidecar.FindRepoRoot();
         if (repo is null) { Console.WriteLine("  FAIL  没找到仓库根"); return 1; }
+        ShellLog.FilePath = LogPath;
+        ShellLog.Write("渲染冒烟开始");
 
         var kernel = new KernelSidecar();
         var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
@@ -161,20 +183,39 @@ public static class Program
 
         kernel.SampleArrived += _ => System.Threading.Interlocked.Increment(ref samples);
 
-        window.Loaded += (_, _) =>
+        // ⭐ 状态机必须用 DispatcherTimer 驱动 —— 实测教训：在 Loaded 回调里同步等待
+        //   （Thread.Sleep 或反复 Invoke(Background) 空委托）**都推不动 WPF 动画与布局**
+        //   （实测 bubble Opacity=0.00 / W=0 / H=0）—— 只有让 app.Run 的消息循环正常泵，
+        //   动画时钟、Measure/Arrange、渲染才有机会走。
+        var phase = 0;                 // 0=等采样 → 1=等动画/布局稳定 → 截图
+        var waitTicks = 0;
+        var bubbleShown = false;
+        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        timer.Tick += (_, _) =>
         {
-            // 等到至少 1 条真实采样再截图 —— 顺便验证「UI 模式下 sidecar 照常工作」
-            var deadline = DateTime.UtcNow.AddSeconds(12);
-            while (DateTime.UtcNow < deadline && Volatile.Read(ref samples) < 1)
-                System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(
-                    System.Windows.Threading.DispatcherPriority.Background, new Action(() => { }));
-            Console.WriteLine($"  UI 模式采样：{Volatile.Read(ref samples)} 条");
+            waitTicks++;
+            if (waitTicks > 240) { Console.WriteLine("  FAIL  等采样超时（12s）"); failures++; window.Close(); return; }
 
-            // 喂一条假说话的注入从简：气泡等交互效果由人眼验收（真跑模式），这里只验「真画得出」。
+            if (phase == 0)
+            {
+                if (Volatile.Read(ref samples) < 1) return;
+                Console.WriteLine($"  UI 模式采样：{Volatile.Read(ref samples)} 条");
+                // P0-3 回归：面板开着（复现「鼠标在球上」现场）＋ 气泡显示 —— 截图验遮挡
+                window.ShowTestBubble("【渲染冒烟】这条气泡应该在截图里可见 —— 不被面板盖住");
+                bubbleShown = true;
+                phase = 1;
+                waitTicks = 0;
+                return;
+            }
 
-            // 截图
+            // phase 1：等 ~1.5s（30 tick），淡入动画 + 布局 + 渲染全部稳定
+            if (waitTicks < 30) return;
+            timer.Stop();
             try
             {
+                Console.WriteLine($"  可视化状态：{window.DumpVisualState()}");
+                if (!bubbleShown) { Console.WriteLine("  FAIL  气泡未注入"); failures++; }
+
                 var w = (int)window.ActualWidth;
                 var h = (int)window.ActualHeight;
                 var rtb = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
@@ -195,6 +236,8 @@ public static class Program
             }
             window.Close();
         };
+
+        window.Loaded += (_, _) => timer.Start();
 
         try { kernel.Start(repo, intervalMs: 300); }
         catch (Exception ex) { Console.WriteLine($"  FAIL  sidecar 启动：{ex.Message}"); return 1; }

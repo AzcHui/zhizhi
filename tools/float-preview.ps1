@@ -960,8 +960,12 @@ function Move-NextPosition {
     ⑤ （可选规则）落在屏幕中央 1/3 → 重抽一次
   #>
   $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  # ⭐ clamp 吃位移问题（自检布尔判定首跑抓到）：窗贴角落时，朝角落的方向会被 clamp
+  #   全额吃掉 → 位移 0（用户原话「避免挪了 1 像素 😂」—— 0 更糟）。修法：clamp 后
+  #   位移不足（< 0.3×尺寸）就重抽，最多 4 次；极端小屏实在没地方才接受原位。
+  $minShift = [Math]::Max(32, [int]([Math]::Max($form.Width, $form.Height) * 0.3))
   $nx = $form.Left; $ny = $form.Top
-  for ($attempt = 0; $attempt -lt 2; $attempt++) {
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
     $ang = (Get-Random -Minimum 0 -Maximum 360) * [Math]::PI / 180.0
     $size = [Math]::Max($form.Width, $form.Height)
     $dist = $size * (0.6 + ((Get-Random -Minimum 0 -Maximum 41) / 100.0))
@@ -969,10 +973,12 @@ function Move-NextPosition {
     $ny = [int]($form.Top + [Math]::Sin($ang) * $dist)
     $nx = [Math]::Max($wa.Left, [Math]::Min($nx, $wa.Right - $form.Width))
     $ny = [Math]::Max($wa.Top, [Math]::Min($ny, $wa.Bottom - $form.Height))
-    # 中央 1/3 最容易挡人 —— 落进去就重抽一次（就一次，别跟概率较劲）
+    $shifted = ([Math]::Abs($nx - $form.Left) + [Math]::Abs($ny - $form.Top)) -ge $minShift
+    # 中央 1/3 最容易挡人 —— 落进去就重抽（就一次，别跟概率较劲）
     $cx1 = $wa.Left + [int]($wa.Width / 3);  $cx2 = $wa.Left + [int]($wa.Width * 2 / 3)
     $cy1 = $wa.Top + [int]($wa.Height / 3);  $cy2 = $wa.Top + [int]($wa.Height * 2 / 3)
-    if (-not ($nx -ge $cx1 -and $nx -le $cx2 -and $ny -ge $cy1 -and $ny -le $cy2)) { break }
+    $inCenter = ($nx -ge $cx1 -and $nx -le $cx2 -and $ny -ge $cy1 -and $ny -le $cy2)
+    if ($shifted -and -not $inCenter) { break }
   }
   $form.Location = New-Object System.Drawing.Point($nx, $ny)
   $script:posNote = ('({0},{1})' -f $nx, $ny)   # 自由位没有预设名，如实报坐标
@@ -1302,21 +1308,45 @@ if ($SelfTest) {
   # ── 事件处理器冒烟测试：直接调处理器本体（不弹窗、不写设置）──
   Write-Host ''
   Write-Host '--- 事件处理器冒烟测试（直接调函数，不弹窗）---' -ForegroundColor Cyan
+  # ⭐ P0-2 修复（监工 2026-10-17）：返回值为 **布尔** 时参与判定（True=OK / False=FAIL），
+  #    非布尔仍按「没抛异常」计（旧用例语义不变）；失败计数 → 自检 exit 码真实反映。
+  #    此前返回值只打印不判定 → 「全绿」只等于「没抛异常」（变异测试实证：算出 False 仍报 OK）。
+  $script:selfTestFails = 0
   function Test-Step([string]$label, [scriptblock]$body) {
     try {
       $r = & $body
-      Write-Host ("  OK    {0,-24} {1}" -f $label, $r)
+      if ($r -is [bool]) {
+        if ($r) {
+          Write-Host ("  OK    {0,-24} {1}" -f $label, $r)
+        } else {
+          $script:selfTestFails++
+          Write-Host ("  FAIL  {0,-24} {1}" -f $label, $r) -ForegroundColor Red
+        }
+      } else {
+        Write-Host ("  OK    {0,-24} {1}" -f $label, $r)
+      }
     } catch {
+      $script:selfTestFails++
       Write-Host ("  THREW {0,-24} {1}" -f $label, $_.Exception.Message) -ForegroundColor Red
     }
   }
 
-  Test-Step 'Toggle-Panel 展开' { Toggle-Panel }
-  Test-Step 'Toggle-Panel 收起' { Toggle-Panel }
+  Test-Step 'Toggle-Panel 展开' { [bool](Toggle-Panel) }    # 展开后应为 True
+  Test-Step 'Toggle-Panel 收起' { -not (Toggle-Panel) }      # 收起后应为 False
 
   $keepSize = $script:settings.size
-  Test-Step '设置项 尺寸=lg' { Set-SettingOption 'size' 'lg'; ('' + $form.ClientSize.Width + 'x' + $form.ClientSize.Height) }
-  Test-Step '设置项 尺寸=sm' { Set-SettingOption 'size' 'sm'; ('' + $form.ClientSize.Width + 'x' + $form.ClientSize.Height) }
+  Test-Step '设置项 尺寸=lg' {
+    Set-SettingOption 'size' 'lg'
+    $ok = ($form.ClientSize.Width -eq 298 -and $form.ClientSize.Height -eq 229)
+    if (-not $ok) { Write-Host ("        实际 {0}x{1}" -f $form.ClientSize.Width, $form.ClientSize.Height) }
+    $ok
+  }
+  Test-Step '设置项 尺寸=sm' {
+    Set-SettingOption 'size' 'sm'
+    $ok = ($form.ClientSize.Width -eq 200 -and $form.ClientSize.Height -eq 154)
+    if (-not $ok) { Write-Host ("        实际 {0}x{1}" -f $form.ClientSize.Width, $form.ClientSize.Height) }
+    $ok
+  }
   $script:settings.size = $keepSize
   Set-Layout
   Refresh-Toggles
@@ -1324,12 +1354,12 @@ if ($SelfTest) {
   Test-Step '设置项 置顶=off' {
     Set-SettingOption 'topmost' 'off'
     $ex = [ZhizhiWin32]::GetWindowLong($form.Handle, $script:GWL_EXSTYLE)
-    ('EXSTYLE TOP=' + [bool]($ex -band $script:WS_EX_TOPMOST))
+    -not [bool]($ex -band $script:WS_EX_TOPMOST)
   }
   Test-Step '设置项 置顶=on' {
     Set-SettingOption 'topmost' 'on'
     $ex = [ZhizhiWin32]::GetWindowLong($form.Handle, $script:GWL_EXSTYLE)
-    ('EXSTYLE TOP=' + [bool]($ex -band $script:WS_EX_TOPMOST))
+    [bool]($ex -band $script:WS_EX_TOPMOST)
   }
 
   Test-Step '挪一挪（离开式）' {
@@ -1339,7 +1369,8 @@ if ($SelfTest) {
     $moved = ([Math]::Abs($pt.X - $l0.X) + [Math]::Abs($pt.Y - $l0.Y)) -ge 1
     $inside = ($pt.X -ge $wa.Left -and $pt.X -le $wa.Right - $form.Width -and
                $pt.Y -ge $wa.Top -and $pt.Y -le $wa.Bottom - $form.Height)
-    ("位移({0},{1}) 在工作区内={2}" -f ($pt.X - $l0.X), ($pt.Y - $l0.Y), ($moved -and $inside))
+    Write-Host ("        位移({0},{1}) 工作区内={2}" -f ($pt.X - $l0.X), ($pt.Y - $l0.Y), $inside)
+    $moved -and $inside
   }
 
   Test-Step '拖拽模拟 (+120,+90)' {
@@ -1350,7 +1381,8 @@ if ($SelfTest) {
     $l1 = $form.Location
     # 监工观察④回归：拖拽结束位置行必须如实报坐标（不残留「挪一挪」那次的旧坐标）
     $noteOk = ($script:posNote -eq ('({0},{1})' -f $l1.X, $l1.Y))
-    ('delta=({0},{1})  位置行如实={2}' -f ($l1.X - $l0.X), ($l1.Y - $l0.Y), $noteOk)
+    Write-Host ("        delta=({0},{1})" -f ($l1.X - $l0.X), ($l1.Y - $l0.Y))
+    $noteOk
   }
 
   Test-Step '组合·抖动不撤销挪动（泵 400ms）' {
@@ -1367,22 +1399,25 @@ if ($SelfTest) {
       Start-Sleep -Milliseconds 20
     }
     $l = $form.Location
-    $ok = ($l.X -eq $newPos.X -and $l.Y -eq $newPos.Y -and $script:shakeTimer -eq $null)
-    ('抖完停在({0},{1}) = 挪动目标({2},{3}) = {4}' -f $l.X, $l.Y, $newPos.X, $newPos.Y, $ok)
+    $l.X -eq $newPos.X -and $l.Y -eq $newPos.Y -and $null -eq $script:shakeTimer
   }
 
-  Test-Step '状态区 申明'   { Set-StatusText '（自检）' 5; $lblState.Text }
+  Test-Step '状态区 申明'   { Set-StatusText '（自检）' 5; $lblState.Text -eq '（自检）' }
   Test-Step '状态区 超时回落' {
     # 把申明的到期时间拨到过去 → 立即回落到底色（此刻内核已收 → 底色应为「内核停了」）
     $script:declaredState.ExpiresAt = [DateTime]::Now.AddSeconds(-1)
     Update-StateArea
-    $lblState.Text
+    $lblState.Text -eq '内核停了'
   }
+  Test-Step '处理器错误累计为空' { [string]::IsNullOrEmpty($script:lastError) }
 
-  Write-Host ("  处理器错误累计 : '" + $script:lastError + "'  （应为空）")
   Write-Host ("  日志文件       : " + $script:LOG_PATH)
 
   $form.Dispose()
+  if ($script:selfTestFails -gt 0) {
+    Write-Host ("=== 自检结束：{0} 项失败（未弹窗、未写设置文件）===" -f $script:selfTestFails) -ForegroundColor Red
+    exit 1    # ⭐ P0-2：exit 码真实反映 —— 变异测试/CI 才有抓手
+  }
   Write-Host '=== 自检结束（未弹窗、未写设置文件）===' -ForegroundColor Cyan
   exit 0
 }

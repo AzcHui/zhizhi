@@ -25,30 +25,33 @@ public sealed class FloatWindow : Window
 {
     private const double BallSize = 76;   // b2-b2：64→76 —— ±5~12px 的形变才看得出来（clamp/位置/存档全是相对计算，改一处即安全）
 
-    // ══════════ b2-b2 流体态参数（第一版：平静/告警两档）—— 调手感只改这一块 ══════════
+    // ══════════ b2-b2 第一版 · 形态库 ＋ 呼吸线团（参数表照抄开工单 2026-10-19）—— 调手感只改这一块 ══════════
 
-    /// <summary>谐波：k（频率）· w（权重）· φ（初相）——
-    /// r(θ,t) = R·(1 + a·Σ w·sin(kθ + φ + ω·t·(0.6 + 0.22k)))，96 点极坐标采样，每帧重建 StreamGeometry。</summary>
-    private static readonly (double K, double W, double Phi)[] FluidHarmonics =
-        { (2, 0.45, 0.0), (3, 0.30, 1.7), (5, 0.20, 3.1), (7, 0.12, 4.6) };
-    private const int FluidPointCount = 96;
+    private const int ThreadCount = 3;                     // 线数：76px 甜点；上限 5（5 根时线宽降到 1.8，第二版再说）
+    private const double ThreadStrokeWidth = 2.2;          // 线宽：< 1.5 会虚
+    private const double HaloWidthFactor = 2.6;            // 光晕宽 = 线宽 × 2.6 = 5.7
+    private const double HaloOpacity = 0.22;               // 光晕：同色低透明（"发光"而非"描边"，深浅壁纸都自然）
+    private const double ThreadScale = BallSize * 0.255;   // 线团缩放：最大外延 ≈ BallSize×0.395（直径 60，占 76 的 79%）
+    private const double ThreadAmp = 0.55;                 // 摆动幅度 A：再大线会自交打结
+    private const double ThreadW1 = 0.80, ThreadW2 = 0.55; // 两个方向不同速 → "缠绕感"而不是"整体翻转"
+    private const int ThreadPoints = 120;                  // 每根 120 点，3 根共 360 点/帧，60fps → 2.2 万点/秒，开销极低
 
-    // 两档：速度就是情绪 —— ω / 幅度 / 帧率三者一起变（帧率本身也是情绪：慢的东西不需要高帧率）
-    private const double CalmOmega = 0.45, CalmAmp = 0.045;   private const int CalmFps = 15;   // 平静：幅度 ≤5%，盯 1 分钟不刺眼
-    private const double AlertOmega = 2.30, AlertAmp = 0.175; private const int AlertFps = 60;   // 告警：明显更快、更大幅
-    private const double FluidBlendPerFrame = 0.1;             // 切档平滑：ω/a 每帧向目标逼近 10%（别秒切，否则像抽风）
-
+    // 情绪档（速度＝情绪）：平静 0 ↔ 告警 1（静音/活跃档归第二版）；帧率分档保留 —— 帧率本身也是情绪
+    private const double IntensityBlendPerFrame = 0.1;     // 每帧向目标逼近 10%（别秒切，否则像抽风）
+    private const int CalmFps = 15, AlertFps = 60;
     private const double AlertCpuThreshold = 80;                                     // CPU ≥ 80 → 告警档
     private static readonly TimeSpan AlertHoldAfterSaid = TimeSpan.FromSeconds(10);  // 告警级台词后的保持期
 
-    // 颜色连续插值 —— ⛔ 必须 HSL：RGB 插值青绿→橙的中点是灰绿泥巴 #707665；
-    // HSL 且色相 180→16 递减 = 绿→黄绿→黄→橙（热力图经典路径，中点鲜亮黄绿）
-    private const double ColorApproachPerFrame = 0.05;  // 每帧向目标色逼近 5%（约 0.6s 走完；不用 ColorAnimation——每帧都改会打架）
+    // 颜色：线条只有一个主色 ＋ 同色光晕（不再需要渐变/色停）—— HSL 逼近管线沿用，色相 180→16 递减
+    private const double ColorApproachPerFrame = 0.05;     // 每帧向目标色逼近 5%（约 0.6s 走完）
     private const double HueCalm = 180, HueAlert = 16;
     private const double SatCalm = 1.00, SatAlert = 0.71;    // #008080 → #E06C4A
     private const double LumCalm = 0.25, LumAlert = 0.58;
-    private const double StopLighten = 0.24, StopDarken = 0.21;  // 球内三色停：亮度 +24% / 本色 / −21%
     private const double GrayLum = 0.50;                             // 无数据 = 灰（饱和度归零）
+    private const double ColorDeadZoneLow = 40;                      // 色相死区（开工单⑥）：t = clamp01((cpu−40)/50)
+    private const double ColorDeadZoneSpan = 50;
+
+    private const double FormFadeMs = 300;                 // 交叉淡入时长（开工单⑤：硬切会像"闪屏"）
 
     private const double DragThreshold = 4;   // 位移 < 4px 松手 = 戳，≥ 4px = 拖（与系统 MinimumHorizontalDragDistance 同量级）
     // 球在窗口 Canvas 里的边距（单一事实源 —— Canvas 定位与 clamp 都用它们）
@@ -60,7 +63,8 @@ public sealed class FloatWindow : Window
     private readonly KernelSidecar _kernel;
     private readonly DispatcherTimer _idleTimer;      // 每秒喂 idleMs
     private readonly DispatcherTimer _bubbleTimer;    // 气泡自动消失
-    private readonly System.Windows.Shapes.Path _ball;  // b2-b2：Ellipse → Path（流体形变 = 每帧重建 StreamGeometry）
+    private readonly System.Windows.Controls.Canvas _ballHost;  // 球的容器（抖动变换挂它身上；内部=视觉层+命中层）
+    private readonly System.Windows.Shapes.Ellipse _hitArea;    // ⭐ 命中层：不可见但可命中（线条只有 2.2px 宽，命不中）
     private readonly TranslateTransform _ballShake;   // L1 抖动 = 球的视觉反应
     private readonly Border _bubble;
     private readonly TextBlock _bubbleText;
@@ -70,15 +74,22 @@ public sealed class FloatWindow : Window
     private TextBlock _memText = null!;
     private readonly Random _rng = new();
 
-    // ── b2-b2 流体态运行时状态 ──
+    // ── b2-b2 形态库运行时状态 ──
     private readonly System.Diagnostics.Stopwatch _fluidClock = System.Diagnostics.Stopwatch.StartNew();
-    private DispatcherTimer _fluidTimer = null!;      // 形变驱动（Interval = 当前档帧率 —— 帧率是情绪的一部分）
-    private RadialGradientBrush _ballBrush = null!;   // 持有**未 Freeze** 的画刷，每帧只改色停 —— 冻了就改不动了
-    private double _curOmega = CalmOmega, _curAmp = CalmAmp;      // 当前值（向目标平滑逼近）
-    private double _targetOmega = CalmOmega, _targetAmp = CalmAmp;
+    private DispatcherTimer _fluidTimer = null!;      // 形态驱动（Interval = 当前档帧率 —— 帧率是情绪的一部分）
+    private System.Windows.Media.SolidColorBrush _mainBrush = null!;  // 主色（持有**未 Freeze** 实例，每帧只改 Color）
+    private double _curIntensity, _targetIntensity;               // 情绪强度 0~1（平静→0，告警→1；平滑逼近）
     private double _curHue = HueCalm, _curSat = SatCalm, _curLum = LumCalm;   // 当前色（HSL，向目标逼近 5%/帧）
     private double? _lastCpu;                          // 最近采样 CPU —— 驱动颜色连续插值 + 档位
     private DateTime _alertHoldUntil = DateTime.MinValue;              // 告警级台词后的保持期
+
+    // ── 形态注册表 ＋ 双槽交叉淡入（开工单④⑤）──
+    private readonly IBallForm[] _forms = { new ThreadBallForm(), new DebugRingForm() };
+    private readonly System.Windows.Shapes.Path?[] _strokes = new System.Windows.Shapes.Path?[2];  // 每槽一条描边
+    private readonly System.Windows.Shapes.Path?[] _halos = new System.Windows.Shapes.Path?[2];    // 每槽一条光晕（同色）
+    private readonly IBallForm?[] _slotForm = new IBallForm?[2];   // 各槽当前挂的形态（null = 空槽不更新）
+    private int _frontSlot;        // 正在展示的槽位
+    private bool _fading;          // 交叉淡入进行中（切换防重入）
 
     private int _samples;             // 已看 N 轮
     private int? _trust;              // M7：内核报上来的亲密度
@@ -121,26 +132,61 @@ public sealed class FloatWindow : Window
         var canvas = new Canvas();
 
         _ballShake = new TranslateTransform();
-        _ballBrush = MakeBallBrush();
-        _ball = new System.Windows.Shapes.Path
+        _mainBrush = new System.Windows.Media.SolidColorBrush(HslToColor(HueCalm, SatCalm, LumCalm));
+        _ballHost = new System.Windows.Controls.Canvas
         {
-            Data = BuildBallGeometry(),   // 初始形状（流体 timer 在 Loaded 启动后每帧重建）
-            Fill = _ballBrush,
+            Width = BallSize,
+            Height = BallSize,
+            RenderTransform = _ballShake,   // 戳的抖动 = 整个球容器一起抖
+        };
+        // 双槽（开工单⑤）：每槽 = (光晕, 描边) 共用同一条 geometry，只差 StrokeThickness；
+        // 槽 0 = 前台（常态线团），槽 1 = 备用（交叉淡入时接新形态）。
+        for (var slot = 0; slot < 2; slot++)
+        {
+            _halos[slot] = new System.Windows.Shapes.Path
+            {
+                Stroke = _mainBrush,
+                StrokeThickness = ThreadStrokeWidth * HaloWidthFactor,
+                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+                IsHitTestVisible = false,     // ⭐ 开工单③：视觉层只负责画，不接收鼠标
+                Opacity = slot == 0 ? HaloOpacity : 0,
+            };
+            _strokes[slot] = new System.Windows.Shapes.Path
+            {
+                Stroke = _mainBrush,
+                StrokeThickness = ThreadStrokeWidth,
+                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+                IsHitTestVisible = false,
+                Opacity = slot == 0 ? 1 : 0,
+            };
+            _ballHost.Children.Add(_halos[slot]!);   // 光晕垫底、描边在上
+            _ballHost.Children.Add(_strokes[slot]!);
+        }
+        _slotForm[0] = ResolveForm(FormIdForState());
+        _strokes[0]!.Data = _slotForm[0]!.Build(0, 0);
+        _halos[0]!.Data = _strokes[0]!.Data;
+        // ⭐ 命中区独立（开工单③）：改成只有描边之后命中只剩 2.2px 线本身 → 点不到。
+        //   命中层不可见但可命中 —— ⚠️ Fill 必须给 Brushes.Transparent，给 null 不参与命中。
+        _hitArea = new System.Windows.Shapes.Ellipse
+        {
+            Width = BallSize,
+            Height = BallSize,
+            Fill = Brushes.Transparent,
             Cursor = Cursors.Hand,
-            RenderTransform = _ballShake,
             ToolTip = "戳一下",
         };
-        Canvas.SetRight(_ball, BallRightMargin);
-        Canvas.SetBottom(_ball, BallBottomMargin);
-        // ⭐ 悬停 + 拖动 + 戳三合一（2026-10-17 修复：拖动是旧壳有、WPF 移植时漏掉的）：
-        //   按下捕获鼠标 → 位移 ≥4px = 拖（拖起来顺带收面板）；位移 <4px 松手 = 戳。
+        _ballHost.Children.Add(_hitArea);   // 命中层在视觉层之上（后加 = 顶层）
+        Canvas.SetRight(_ballHost, BallRightMargin);
+        Canvas.SetBottom(_ballHost, BallBottomMargin);
+        // ⭐ 6 个鼠标事件 + CaptureMouse/ReleaseMouseCapture 全部从 _ball 平移到 _hitArea（开工单③）。
+        //   悬停 + 拖动 + 戳三合一：按下捕获鼠标 → 位移 ≥4px = 拖（拖起来顺带收面板）；位移 <4px 松手 = 戳。
         //   MouseLeave 走 300ms 宽限收起 —— 球↔面板往返不闪断，往别处移走就收。
-        _ball.MouseEnter += (_, _) => { _panelCloseTimer.Stop(); ExpandPanel(); };
-        _ball.MouseLeave += (_, _) => StartPanelCloseGrace();
-        _ball.MouseLeftButtonDown += OnBallDragStart;
-        _ball.MouseMove += OnBallDragMove;
-        _ball.MouseLeftButtonUp += OnBallDragEnd;
-        _ball.LostMouseCapture += (_, _) => EndDrag();           // 捕获被系统抢走也走同一收尾（观察③）
+        _hitArea.MouseEnter += (_, _) => { _panelCloseTimer.Stop(); ExpandPanel(); };
+        _hitArea.MouseLeave += (_, _) => StartPanelCloseGrace();
+        _hitArea.MouseLeftButtonDown += OnBallDragStart;
+        _hitArea.MouseMove += OnBallDragMove;
+        _hitArea.MouseLeftButtonUp += OnBallDragEnd;
+        _hitArea.LostMouseCapture += (_, _) => EndDrag();        // 捕获被系统抢走也走同一收尾（观察③）
 
         _bubble = new Border
         {
@@ -176,7 +222,7 @@ public sealed class FloatWindow : Window
 
         canvas.Children.Add(_bubble);
         canvas.Children.Add(_panel);
-        canvas.Children.Add(_ball);
+        canvas.Children.Add(_ballHost);
         Content = canvas;
 
         // 窗口本身也要悬停展开（球之外还有气泡/面板 —— 移动到它们上面不能收）
@@ -198,7 +244,7 @@ public sealed class FloatWindow : Window
         _panelCloseTimer.Tick += (_, _) =>
         {
             _panelCloseTimer.Stop();
-            if (!_ball.IsMouseOver && !_panel.IsMouseOver && !_bubble.IsMouseOver) CollapsePanel();
+            if (!_hitArea.IsMouseOver && !_panel.IsMouseOver && !_bubble.IsMouseOver) CollapsePanel();
         };
 
         // 内核事件（回调不在 UI 线程 → 一律 BeginInvoke 切回）
@@ -269,75 +315,170 @@ public sealed class FloatWindow : Window
         }
     }
 
-    // ───────────────────────── b2-b2 流体形变 + 颜色连续插值 ─────────────────────────
+    // ───────────────────────── b2-b2 形态库驱动 + 颜色连续插值 ─────────────────────────
 
     private static double Clamp01(double v) => Math.Min(1, Math.Max(0, v));
 
-    /// <summary>档位目标（平静/告警）：CPU ≥ 阈值 或 告警级台词保持期内 → 告警档；帧率一起切（帧率是情绪）。</summary>
+    /// <summary>情绪档目标（平静/告警）：CPU ≥ 阈值 或 告警级台词保持期内 → 告警（intensity→1）；帧率一起切（帧率是情绪）。</summary>
     private void UpdateFluidTarget()
     {
         var alert = _alertHoldUntil > DateTime.Now || (_lastCpu is { } c && c >= AlertCpuThreshold);
-        _targetOmega = alert ? AlertOmega : CalmOmega;
-        _targetAmp = alert ? AlertAmp : CalmAmp;
+        _targetIntensity = alert ? 1 : 0;
         _fluidTimer.Interval = TimeSpan.FromMilliseconds(1000.0 / (alert ? AlertFps : CalmFps));
     }
 
-    /// <summary>流体驱动（每帧）：ω/a 向目标逼近 10% → 重建 StreamGeometry → 色停向目标逼近 5%。
-    /// ⭐ 画刷是持有的**未 Freeze** 实例 —— 每帧只改 GradientStop.Color（冻了就改不动了）。</summary>
+    /// <summary>形态驱动（每帧）：intensity 向目标逼近 10% → 各「还看得见」的槽重建 geometry → 主色 HSL 逼近 5%（带死区）。</summary>
     private void FluidTick()
     {
-        _curOmega += (_targetOmega - _curOmega) * FluidBlendPerFrame;
-        _curAmp += (_targetAmp - _curAmp) * FluidBlendPerFrame;
-        _ball.Data = BuildBallGeometry();
+        _curIntensity += (_targetIntensity - _curIntensity) * IntensityBlendPerFrame;
+        var t = _fluidClock.Elapsed.TotalSeconds;
 
-        // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减）；无数据 = 灰（饱和度归零）
-        var t = _lastCpu is { } c ? Clamp01(c / 100.0) : double.NaN;
-        var tgtH = double.IsNaN(t) ? _curHue : HueCalm + (HueAlert - HueCalm) * t;
-        var tgtS = double.IsNaN(t) ? 0 : SatCalm + (SatAlert - SatCalm) * t;
-        var tgtL = double.IsNaN(t) ? GrayLum : LumCalm + (LumAlert - LumCalm) * t;
+        // 形状：交叉淡入期间两槽都在动，各槽跟着自己的形态重建（Freeze 后提交渲染）
+        for (var slot = 0; slot < 2; slot++)
+        {
+            var form = _slotForm[slot];
+            if (form is null || _strokes[slot]!.Opacity <= 0.01) continue;   // 空槽/已淡出 = 停更（省帧）
+            var geo = form.Build(t, _curIntensity);
+            _strokes[slot]!.Data = geo;
+            _halos[slot]!.Data = geo;
+        }
+
+        // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减），带死区 t = clamp01((cpu−40)/50)；无数据 = 灰
+        var ct = _lastCpu is { } c ? Clamp01((c - ColorDeadZoneLow) / ColorDeadZoneSpan) : double.NaN;
+        var tgtH = double.IsNaN(ct) ? _curHue : HueCalm + (HueAlert - HueCalm) * ct;
+        var tgtS = double.IsNaN(ct) ? 0 : SatCalm + (SatAlert - SatCalm) * ct;
+        var tgtL = double.IsNaN(ct) ? GrayLum : LumCalm + (LumAlert - LumCalm) * ct;
         _curHue += (tgtH - _curHue) * ColorApproachPerFrame;
         _curSat += (tgtS - _curSat) * ColorApproachPerFrame;
         _curLum += (tgtL - _curLum) * ColorApproachPerFrame;
-        var stops = _ballBrush.GradientStops;
-        stops[0].Color = HslToColor(_curHue, _curSat, Clamp01(_curLum + StopLighten));
-        stops[1].Color = HslToColor(_curHue, _curSat, _curLum);
-        stops[2].Color = HslToColor(_curHue, _curSat, Clamp01(_curLum - StopDarken));
+        _mainBrush.Color = HslToColor(_curHue, _curSat, Clamp01(_curLum));   // 光晕同色 —— 发光感来自 Opacity 0.22
     }
 
-    /// <summary>极坐标谐波叠加 → 96 点闭合 StreamGeometry（每帧新建，Freeze 后交渲染）。</summary>
-    private System.Windows.Media.StreamGeometry BuildBallGeometry()
+    // ───────────────────────── 形态注册表（开工单④：形态只产 geometry，不碰颜色/命中/交互）─────────
+
+    /// <summary>状态 → 形态映射（本版写死常态线团；波动环与按状态查表归第二版）。</summary>
+    private string FormIdForState() => "thread";
+
+    private IBallForm ResolveForm(string id) => _forms.First(f => f.Id == id);
+
+    /// <summary>一个球形态：只负责「给时间 t 和情绪强度，产出一条 geometry」。不碰颜色、命中、交互。</summary>
+    private interface IBallForm
     {
-        var t = _fluidClock.Elapsed.TotalSeconds;
-        var geo = new System.Windows.Media.StreamGeometry();
-        using (var ctx = geo.Open())
+        string Id { get; }
+
+        /// <param name="intensity">0~1 情绪强度（平静→0，告警→1）</param>
+        Geometry Build(double t, double intensity);
+    }
+
+    /// <summary>呼吸线团（常态形态）：3 根线相互缠绕 —— 一条 StreamGeometry 三个 figure。
+    /// ⚠️ BeginFigure(p, isFilled: false, isClosed: false) —— 描边不需要填充/闭合（开工单④）。</summary>
+    private sealed class ThreadBallForm : IBallForm
+    {
+        public string Id => "thread";
+
+        public Geometry Build(double t, double intensity)
         {
-            var cx = BallSize / 2.0;
-            var cy = BallSize / 2.0;
-            for (var i = 0; i < FluidPointCount; i++)
+            var spin = t * (0.6 + 1.8 * intensity);         // 速度＝情绪
+            var amp = ThreadAmp * (0.75 + 0.5 * intensity); // 幅度也随情绪
+            var c = BallSize / 2.0;
+            var geo = new System.Windows.Media.StreamGeometry();
+            using (var ctx = geo.Open())
             {
-                var theta = Math.PI * 2 * i / FluidPointCount;
-                var wobble = 0.0;
-                foreach (var (k, w, phi) in FluidHarmonics)
-                    wobble += w * Math.Sin(k * theta + phi + _curOmega * t * (0.6 + 0.22 * k));
-                var r = BallSize / 2.0 * (1 + _curAmp * wobble);
-                var p = new Point(cx + r * Math.Cos(theta), cy + r * Math.Sin(theta));
-                if (i == 0) ctx.BeginFigure(p, true, true);
-                else ctx.LineTo(p, true, false);
+                for (var k = 0; k < ThreadCount; k++)
+                {
+                    var phase = k * (2 * Math.PI / ThreadCount);   // 每根相位偏移 k·(2π/3) —— 转过整根线（缠绕朝向各不同）
+                    for (var i = 0; i <= ThreadPoints; i++)
+                    {
+                        var u = 2 * Math.PI * i / ThreadPoints + phase;
+                        var p = new Point(
+                            c + (Math.Cos(u) + amp * Math.Cos(3 * u + spin * ThreadW1)) * ThreadScale,
+                            c + (Math.Sin(u) + amp * Math.Sin(2 * u + spin * ThreadW2)) * ThreadScale);
+                        if (i == 0) ctx.BeginFigure(p, false, false);
+                        else ctx.LineTo(p, true, false);
+                    }
+                }
             }
+            geo.Freeze();   // geometry 每帧新建可以冻；画刷（_mainBrush）绝不能冻
+            return geo;
         }
-        geo.Freeze();   // 几何每帧新建可以冻 —— 画刷是持有的，绝不能冻
-        return geo;
     }
 
-    /// <summary>初始画刷（常态青绿三色停）。返回**未 Freeze** 的实例 —— FluidTick 每帧改色停。</summary>
-    private static RadialGradientBrush MakeBallBrush()
+    /// <summary>调试形态：正圆环 —— 唯一用途是让交叉淡入框架被真实验证
+    /// （开工单⑤：只有线团一个形态时，切换逻辑永远跑不到，等于没验证）。</summary>
+    private sealed class DebugRingForm : IBallForm
     {
-        var brush = new RadialGradientBrush();
-        brush.GradientStops.Add(new GradientStop(HslToColor(HueCalm, SatCalm, LumCalm + StopLighten), 0.0));
-        brush.GradientStops.Add(new GradientStop(HslToColor(HueCalm, SatCalm, LumCalm), 0.75));
-        brush.GradientStops.Add(new GradientStop(HslToColor(HueCalm, SatCalm, LumCalm - StopDarken), 1.0));
-        return brush;
+        public string Id => "debug-ring";
+        private Geometry? _cached;   // 静态圆，算一次就够
+
+        public Geometry Build(double t, double intensity)
+        {
+            if (_cached is { } g) return g;
+            var c = BallSize / 2.0;
+            var r = BallSize * 0.35;
+            var geo = new System.Windows.Media.StreamGeometry();
+            using (var ctx = geo.Open())
+            {
+                var p0 = new Point(c + r, c);
+                ctx.BeginFigure(p0, false, false);
+                for (var i = 1; i <= ThreadPoints; i++)
+                {
+                    var a = 2 * Math.PI * i / ThreadPoints;
+                    ctx.LineTo(new Point(c + r * Math.Cos(a), c + r * Math.Sin(a)), true, false);
+                }
+            }
+            geo.Freeze();
+            _cached = geo;
+            return geo;
+        }
     }
+
+    /// <summary>切形态（交叉淡入，开工单⑤）：新形态载入背槽 → 300ms 淡入淡出 → 交换槽位、旧槽停更。
+    /// ⚠️ 动画 FillBehavior.Stop + Completed 显式落定（抖动/挪一挪同款双保险 —— 默认 HoldEnd 会锁住 Opacity）。</summary>
+    private void SwitchForm(string id)
+    {
+        if (_fading) return;
+        var next = ResolveForm(id);
+        if (next.Id == _slotForm[_frontSlot]?.Id) return;   // 就是它，不切
+        var back = 1 - _frontSlot;
+        _slotForm[back] = next;
+        _strokes[back]!.Data = next.Build(_fluidClock.Elapsed.TotalSeconds, _curIntensity);
+        _halos[back]!.Data = _strokes[back]!.Data;
+        _fading = true;
+        AppendLog($"形态切换：{_slotForm[_frontSlot]?.Id} → {next.Id}（{FormFadeMs:F0}ms 交叉淡入）");
+
+        var dur = TimeSpan.FromMilliseconds(FormFadeMs);
+        var strokeIn = new DoubleAnimation(0, 1, dur) { FillBehavior = FillBehavior.Stop };
+        var haloIn = new DoubleAnimation(0, HaloOpacity, dur) { FillBehavior = FillBehavior.Stop };
+        var strokeOut = new DoubleAnimation(1, 0, dur) { FillBehavior = FillBehavior.Stop };
+        var haloOut = new DoubleAnimation(HaloOpacity, 0, dur) { FillBehavior = FillBehavior.Stop };
+        var done = 0;
+        void Finish()
+        {
+            if (++done < 4) return;   // 四条动画全走完才收尾
+            _strokes[_frontSlot]!.Opacity = 0;
+            _halos[_frontSlot]!.Opacity = 0;
+            _slotForm[_frontSlot] = null;    // 旧槽停更（FluidTick 跳过 null/透明槽）
+            _frontSlot = back;
+            _strokes[_frontSlot]!.Opacity = 1;
+            _halos[_frontSlot]!.Opacity = HaloOpacity;
+            _fading = false;
+            AppendLog($"形态切换完成：当前 {_slotForm[_frontSlot]!.Id}");
+        }
+        strokeIn.Completed += (_, _) => Finish();
+        haloIn.Completed += (_, _) => Finish();
+        strokeOut.Completed += (_, _) => Finish();
+        haloOut.Completed += (_, _) => Finish();
+        _strokes[back]!.BeginAnimation(OpacityProperty, strokeIn);
+        _halos[back]!.BeginAnimation(OpacityProperty, haloIn);
+        _strokes[_frontSlot]!.BeginAnimation(OpacityProperty, strokeOut);
+        _halos[_frontSlot]!.BeginAnimation(OpacityProperty, haloOut);
+    }
+
+    /// <summary>渲染冒烟专用：切到调试形态 —— 交叉淡入框架的机器侧验证入口（开工单⑤）。</summary>
+    public void SwitchFormForTest() => SwitchForm("debug-ring");
+
+    /// <summary>当前展示的形态 Id（冒烟自查用）。</summary>
+    public string ActiveFormId => _slotForm[_frontSlot]?.Id ?? "?";
 
     /// <summary>HSL → RGB（色相 0~360，S/L 0~1）—— 颜色插值只走 HSL，别碰 RGB Lerp。</summary>
     private static Color HslToColor(double h, double s, double l)
@@ -422,7 +563,8 @@ public sealed class FloatWindow : Window
     /// <summary>渲染冒烟专用：气泡/面板的可见性与透明度实况（诊断「为什么截图里没有」）。</summary>
     public string DumpVisualState() =>
         $"bubble(V={_bubble.Visibility} O={_bubble.Opacity:F2} W={_bubble.ActualWidth:F0} H={_bubble.ActualHeight:F0}) " +
-        $"panel(V={_panel.Visibility} O={_panel.Opacity:F2}) ballO={_ball.Opacity:F2}";
+        $"panel(V={_panel.Visibility} O={_panel.Opacity:F2}) form={ActiveFormId} " +
+        $"slotO(F={_strokes[_frontSlot]!.Opacity:F2} B={_strokes[1 - _frontSlot]!.Opacity:F2}) ballO={_ballHost.Opacity:F2}";
 
     // ───────────────────────── 悬停面板 ─────────────────────────
 
@@ -523,7 +665,7 @@ public sealed class FloatWindow : Window
         _dragging = true;
         _dragMoved = false;
         _panelCloseTimer.Stop();       // 观察②：拖动期间面板别闪
-        _ball.CaptureMouse();          // 捕获后 Move/Up 全路由给球，鼠标滑出球也不丢事件
+        _hitArea.CaptureMouse();       // 捕获后 Move/Up 全路由给命中层，鼠标滑出球也不丢事件
     }
 
     private void OnBallDragMove(object sender, MouseEventArgs e)
@@ -555,16 +697,16 @@ public sealed class FloatWindow : Window
     {
         if (!_dragging) return;
         _dragging = false;
-        if (Mouse.Captured == _ball) _ball.ReleaseMouseCapture();
+        if (Mouse.Captured == _hitArea) _hitArea.ReleaseMouseCapture();
         if (!_dragMoved)
         {
             Poke();                            // 原地单击 = 戳（位移没过阈值）
-            if (_ball.IsMouseOver) ExpandPanel();   // 点完球面板就该在（悬停球 = 面板开 的不变式）
+            if (_hitArea.IsMouseOver) ExpandPanel();   // 点完球面板就该在（悬停球 = 面板开 的不变式）
             return;
         }
         AppendLog($"拖动结束 → ({Left:F0},{Top:F0})");
         SaveSettings();   // ⭐ b2-a ①：拖动结束时写一次位置（写盘点只有这里和关窗，绝不在 MouseMove 里写）
-        if (_ball.IsMouseOver) ExpandPanel();       // 拖完鼠标还在球上 → 面板立刻回来，不用移出再移回
+        if (_hitArea.IsMouseOver) ExpandPanel();       // 拖完鼠标还在球上 → 面板立刻回来，不用移出再移回
     }
 
     // ───────────────────────── 戳一下（决策 #30：点球 = 戳）─────────────────────────
@@ -715,8 +857,8 @@ public sealed class FloatWindow : Window
         if (needFlipY != _ballTopAnchored)
         {
             _ballTopAnchored = needFlipY;
-            if (needFlipY) { Canvas.SetBottom(_ball, double.NaN); Canvas.SetTop(_ball, BallTopMargin); }
-            else { Canvas.SetTop(_ball, double.NaN); Canvas.SetBottom(_ball, BallBottomMargin); }
+            if (needFlipY) { Canvas.SetBottom(_ballHost, double.NaN); Canvas.SetTop(_ballHost, BallTopMargin); }
+            else { Canvas.SetTop(_ballHost, double.NaN); Canvas.SetBottom(_ballHost, BallBottomMargin); }
             AppendLog($"覆盖物方向 Y：{(needFlipY ? "翻转（球贴窗顶 → 气泡/面板挂球下方）" : "常规（球贴窗底）")}");
         }
 
@@ -724,8 +866,8 @@ public sealed class FloatWindow : Window
         if (needFlipX != _ballLeftAnchored)
         {
             _ballLeftAnchored = needFlipX;
-            if (needFlipX) { Canvas.SetRight(_ball, double.NaN); Canvas.SetLeft(_ball, BallLeftMargin); }
-            else { Canvas.SetLeft(_ball, double.NaN); Canvas.SetRight(_ball, BallRightMargin); }
+            if (needFlipX) { Canvas.SetRight(_ballHost, double.NaN); Canvas.SetLeft(_ballHost, BallLeftMargin); }
+            else { Canvas.SetLeft(_ballHost, double.NaN); Canvas.SetRight(_ballHost, BallRightMargin); }
             AppendLog($"覆盖物方向 X：{(needFlipX ? "翻转（球贴窗左 → 面板挂球右侧）" : "常规（球贴窗右 → 面板球左）")}");
         }
 
@@ -990,5 +1132,5 @@ public sealed class FloatWindow : Window
     }
 
     // ───────────────────────── 小工具 ─────────────────────────
-    // （旧 MakeBallBrush(Color)/Lighten/Clamp255 已被 b2-b2 的 HSL 管线取代 —— MakeBallBrush() 移至流体节）
+    // （旧 MakeBallBrush/Lighten/Clamp255 已被 b2-b2 的 HSL 管线取代；流体几何已被形态库取代 —— 形态类在「形态注册表」节）
 }

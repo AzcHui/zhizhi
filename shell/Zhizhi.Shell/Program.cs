@@ -231,29 +231,71 @@ public static class Program
             }
 
             // phase 1：等 ~1.5s（30 tick），淡入动画 + 布局 + 渲染全部稳定
-            if (waitTicks < 30) return;
+            if (phase == 1)
+            {
+                if (waitTicks < 30) return;
+                try
+                {
+                    Console.WriteLine($"  可视化状态：{window.DumpVisualState()}");
+                    if (!bubbleShown) { Console.WriteLine("  FAIL  气泡未注入"); failures++; }
+
+                    var w = (int)window.ActualWidth;
+                    var h = (int)window.ActualHeight;
+                    var rtb = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
+                    rtb.Render(window);
+                    var enc = new PngBitmapEncoder();
+                    enc.Frames.Add(BitmapFrame.Create(rtb));
+                    var shotPath = Path.Combine(repo, "shell", "zhi-shell.render.png");
+                    using var fs = File.Create(shotPath);
+                    enc.Save(fs);
+                    Console.WriteLine($"  截图已存：{shotPath}");
+                    Console.WriteLine($"  EXSTYLE 自查：NOACTIVATE 位 = " +
+                        ((Win32.GetExStyle(new System.Windows.Interop.WindowInteropHelper(window).Handle) & Win32.WS_EX_NOACTIVATE) != 0));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  FAIL  截图失败：{ex.Message}");
+                    failures++;
+                }
+
+                // ⭐ b2-b2 开工单⑤：交叉淡入的真验证 —— 线团 → 调试形态（正圆环），300ms 淡入走完再查槽位。
+                //   硬切看不出问题；必须走淡入再看。
+                window.SwitchFormForTest();
+                phase = 2;
+                waitTicks = 0;
+                return;
+            }
+
+            // phase 2：等 ~700ms（14 tick > 300ms 淡入），交叉淡入应已完成并交换槽位
+            if (waitTicks < 14) return;
             timer.Stop();
             try
             {
-                Console.WriteLine($"  可视化状态：{window.DumpVisualState()}");
-                if (!bubbleShown) { Console.WriteLine("  FAIL  气泡未注入"); failures++; }
-
-                var w = (int)window.ActualWidth;
-                var h = (int)window.ActualHeight;
-                var rtb = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
-                rtb.Render(window);
-                var enc = new PngBitmapEncoder();
-                enc.Frames.Add(BitmapFrame.Create(rtb));
-                var shotPath = Path.Combine(repo, "shell", "zhi-shell.render.png");
-                using var fs = File.Create(shotPath);
-                enc.Save(fs);
-                Console.WriteLine($"  截图已存：{shotPath}");
-                Console.WriteLine($"  EXSTYLE 自查：NOACTIVATE 位 = " +
-                    ((Win32.GetExStyle(new System.Windows.Interop.WindowInteropHelper(window).Handle) & Win32.WS_EX_NOACTIVATE) != 0));
+                Console.WriteLine($"  形态切换后：{window.DumpVisualState()}");
+                if (window.ActiveFormId != "debug-ring")
+                {
+                    Console.WriteLine("  FAIL  交叉淡入未完成（前台形态不是调试环）");
+                    failures++;
+                }
+                else
+                {
+                    Console.WriteLine("  OK    交叉淡入完成：thread → debug-ring，槽位已交换");
+                }
+                // 第二张截图存**另一个文件** —— 首图（线团）不被覆盖，两图可对照
+                var w2 = (int)window.ActualWidth;
+                var h2 = (int)window.ActualHeight;
+                var rtb2 = new RenderTargetBitmap(w2, h2, 96, 96, PixelFormats.Pbgra32);
+                rtb2.Render(window);
+                var enc2 = new PngBitmapEncoder();
+                enc2.Frames.Add(BitmapFrame.Create(rtb2));
+                var shot2 = Path.Combine(repo, "shell", "zhi-shell.render2.png");
+                using var fs2 = File.Create(shot2);
+                enc2.Save(fs2);
+                Console.WriteLine($"  切换后截图已存：{shot2}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  FAIL  截图失败：{ex.Message}");
+                Console.WriteLine($"  FAIL  形态切换检查失败：{ex.Message}");
                 failures++;
             }
             window.Close();

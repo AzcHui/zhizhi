@@ -25,20 +25,33 @@ public sealed class FloatWindow : Window
 {
     private const double BallSize = 76;   // b2-b2：64→76 —— ±5~12px 的形变才看得出来（clamp/位置/存档全是相对计算，改一处即安全）
 
-    // ══════════ b2-b2 第一版 · 形态库 ＋ 呼吸线团（参数表照抄开工单 2026-10-19）—— 调手感只改这一块 ══════════
+    // ══════════ b2-b2 第一版 · 形态库 ＋ 陀螺仪（照抄开工单 2026-10-19 14:12 B 版）—— 调手感只改这一块 ══════════
+    // ⛔ 禁忌 a：环不自转 —— 环上取点 a 不加时间（绕自己法线转看不见，坑 1）；
+    // ⛔ 禁忌 b：三个环倾角必须两两不同（同倾角 = 对全局旋转响应相同 = 看起来是死的）。
+    // 可见的运动只有两个来源：全局 rotY（三环共用）＋ 各环独立的进动（倾角慢漂移）。
 
-    private const int ThreadCount = 3;                     // 线数：76px 甜点；上限 5（5 根时线宽降到 1.8，第二版再说）
+    /// <summary>三环参数表（倾角基准 X/Y/Z · 半径比 · 线宽 · 亮度 · 进动 pf/pp · 亮点 spin/head）—— 全部照抄，倾角与 pf 别动。</summary>
+    private sealed record GyroRing(double Tx0, double Ty0, double Tz0, double Radius, double Width, double Lum, double Pf, double Pp, double DotSpin, double DotHead);
+    private static readonly GyroRing[] GyroRings =
+    {
+        new(1.20,  0.00,  0.00, 1.00, 2.2, 1.00, 0.31, 0.0,  0.55, 0.0),   // 环①
+        new(-0.55, 0.75,  0.30, 0.72, 1.9, 0.74, 0.24, 2.3, -0.36, 2.1),   // 环②（亮点反向）
+        new(0.35, -0.90,  1.10, 0.47, 1.6, 0.52, 0.19, 4.4,  0.22, 4.2),   // 环③
+    };
+
+    private const double GyroRadius = BallSize * 0.335;   // 基准半径 25.5 —— 三环分别再乘 1.00/0.72/0.47
+    private const double GyroRotX = -0.22;                // 全局视角俯仰（固定）
+    private const double GyroVySpeed = 0.17;              // 全局 rotY 速度（B 版定案；≈37s 一圈）—— 环的可见运动全靠这个
+    private const double GyroFc = 5.2;                    // 透视焦距（相对 R）：s = Fc/(Fc+z)
+    private const double GyroDepthLo = 0.86;              // 深度映射：dz = clamp01((s − 0.86) / 0.34)
+    private const double GyroDepthSpan = 0.34;
+    private const int GyroDepthBands = 6;                 // 深度分 6 档合并（坑 3：别逐段 stroke——三环×96 段 ≈290 段）
+    private const int GyroPointsPerRing = 96;             // 每环 96 点
+    private const double GyroPrecessX = 0.13, GyroPrecessY = 0.17, GyroPrecessZ = 0.10;   // 进动幅度（照抄）
+    // ⭐ 三环 pf 互质（0.31/0.24/0.19）→ 三环相对姿态永不重新对齐；同 pf 会同步点头 = 又变回"一个东西"
+
     private const double HaloWidthFactor = 2.6;            // 光晕宽 = 线宽 × 2.6
     private const double HaloOpacity = 0.22;               // 光晕：同色低透明（"发光"而非"描边"，深浅壁纸都自然）
-    private const double ThreadScale = BallSize * 0.255;   // 线团缩放：最大外延 ≈ BallSize×0.395（直径 60，占 76 的 79%）
-    private const double ThreadAmp = 0.55;                 // 摆动幅度 A：再大线会自交打结
-    private const double ThreadW1 = 0.80, ThreadW2 = 0.55; // 两个方向不同速 → "缠绕感"而不是"整体翻转"
-    private const int ThreadPoints = 120;                  // 每根 120 点，3 根共 360 点/帧，60fps → 2.2 万点/秒，开销极低
-    // ⭐ 同色分层（监工 2026-10-19：同色同粗细在 76px 下读成"一团"，分层后才有"丝线缠绕"的结构感）
-    private static readonly double[] ThreadWidths = { 2.2, 1.9, 1.6 };   // 线宽递减
-    private static readonly int[] ThreadAlphas = { 255, 185, 115 };      // 浓度递减（0~255，走 Path.Opacity）
-    // ⭐ 每根不同频率 fx=3+k、fy=2+k（3/2、4/3、5/4）—— 监工勘误：相位偏移对**闭合曲线**无效
-    //   （u+Δ 只是沿曲线滑动，点集不变，换任何角度都重合），只有频率不同才分得开。
 
     // 情绪档（速度＝情绪）：平静 0 ↔ 告警 1（静音/活跃档归第二版）；帧率分档保留 —— 帧率本身也是情绪
     private const double IntensityBlendPerFrame = 0.1;     // 每帧向目标逼近 10%（别秒切，否则像抽风）
@@ -88,7 +101,7 @@ public sealed class FloatWindow : Window
     private DateTime _alertHoldUntil = DateTime.MinValue;              // 告警级台词后的保持期
 
     // ── 形态注册表 ＋ 双槽交叉淡入（开工单④⑤）──
-    private readonly IBallForm[] _forms = { new ThreadBallForm(), new DebugRingForm() };
+    private readonly IBallForm[] _forms = { new GyroForm(), new DebugRingForm() };
     private readonly System.Windows.Controls.Canvas?[] _slotHosts = new System.Windows.Controls.Canvas?[2];  // 每槽一个容器 —— 交叉淡入淡容器，槽内线的粗细浓淡是各 Path 自己的基值
     private readonly System.Windows.Shapes.Path?[][] _slotStrokes = new System.Windows.Shapes.Path?[2][];
     private readonly System.Windows.Shapes.Path?[][] _slotHalos = new System.Windows.Shapes.Path?[2][];
@@ -346,6 +359,12 @@ public sealed class FloatWindow : Window
             var form = _slotForm[slot];
             if (form is null || _slotHosts[slot]!.Opacity <= 0.01) continue;   // 空槽/已淡出 = 停更（省帧）
             var layers = form.Build(t, _curIntensity);
+            // 防御：层数对不上（形态切换/未来形态层不固定）→ 重建槽，绝不越界
+            if (_slotStrokes[slot] is null || _slotStrokes[slot]!.Length != layers.Length)
+            {
+                PopulateSlot(slot, layers);
+                continue;
+            }
             for (var i = 0; i < layers.Length; i++)
             {
                 _slotStrokes[slot][i].Data = layers[i].Geo;
@@ -356,8 +375,8 @@ public sealed class FloatWindow : Window
 
     // ───────────────────────── 形态注册表（开工单④：形态只产 geometry，不碰颜色/命中/交互）─────────
 
-    /// <summary>状态 → 形态映射（本版写死常态线团；波动环与按状态查表归第二版）。</summary>
-    private string FormIdForState() => "thread";
+    /// <summary>状态 → 形态映射（本版写死常态陀螺仪；波动环与按状态查表归第二版）。</summary>
+    private string FormIdForState() => "gyro";
 
     private IBallForm ResolveForm(string id) => _forms.First(f => f.Id == id);
 
@@ -374,40 +393,131 @@ public sealed class FloatWindow : Window
         BallLayer[] Build(double t, double intensity);
     }
 
-    /// <summary>呼吸线团（常态形态）：3 根线相互缠绕 —— 每根一层（独立 geometry，因为线宽/浓度逐根不同）。
-    /// ⚠️ 每根**不同频率** fx=3+k、fy=2+k —— 相位偏移对闭合曲线无效（u+Δ 点集不变），频率不同才分得开。
-    ///   BeginFigure(p, isFilled: false, isClosed: false) —— 描边不需要填充/闭合（开工单④）。</summary>
-    private sealed class ThreadBallForm : IBallForm
+    /// <summary>陀螺仪（常态形态，B 版定案）：三个异倾角的环共用一个全局旋转，各环独立进动。
+    /// ⛔ 环不自转（绕自己法线转看不见——坑 1）；三环倾角两两不同 = "各转各的"的全部来源。
+    /// 性能：每环 96 点按深度分 6 档合并成一条 StreamGeometry（坑 3：290 段逐段 stroke 会掉帧）。
+    ///   ⚠️ 合并按「环 × 档」分组（3×6=18 条）而非跨环 6 条 —— 三环 base 线宽/亮度各不相同，跨环合并会失真。</summary>
+    private sealed class GyroForm : IBallForm
     {
-        public string Id => "thread";
+        public string Id => "gyro";
 
         public BallLayer[] Build(double t, double intensity)
         {
-            var spin = t * (0.6 + 1.8 * intensity);         // 速度＝情绪
-            var amp = ThreadAmp * (0.75 + 0.5 * intensity); // 幅度也随情绪
-            var c = BallSize / 2.0;
-            var layers = new BallLayer[ThreadCount];
-            for (var k = 0; k < ThreadCount; k++)
+            var vy = t * GyroVySpeed;   // 全局 rotY（三环共用同一 vy —— 差异只由倾角产生）
+            var layers = new List<BallLayer>();
+            foreach (var ring in GyroRings)
             {
-                var fx = 3 + k;   // 3/4/5
-                var fy = 2 + k;   // 2/3/4 —— x/y 频率也不同 → 缠绕而非重合
-                var geo = new System.Windows.Media.StreamGeometry();
-                using (var ctx = geo.Open())
+                // 进动：三个独立的慢漂移（顺序固定 X → Y → Z，不能换）
+                var tx = ring.Tx0 + GyroPrecessX * Math.Sin(t * ring.Pf + ring.Pp);
+                var ty = ring.Ty0 + GyroPrecessY * Math.Sin(t * ring.Pf * 0.80 + ring.Pp * 1.7);
+                var tz = ring.Tz0 + GyroPrecessZ * Math.Sin(t * ring.Pf * 1.30 + ring.Pp * 0.6);
+
+                // 环上取点（⛔ a 不加时间）→ 投影 → 按深度分档
+                var pts = new Point[GyroPointsPerRing + 1];   // +1 = 回到起点（闭合段也参与分档连线）
+                var bands = new List<int>[GyroDepthBands];
+                for (var i = 0; i <= GyroPointsPerRing; i++)
                 {
-                    for (var i = 0; i <= ThreadPoints; i++)
-                    {
-                        var u = 2 * Math.PI * i / ThreadPoints;
-                        var p = new Point(
-                            c + (Math.Cos(u) + amp * Math.Cos(fx * u + spin * ThreadW1)) * ThreadScale,
-                            c + (Math.Sin(u) + amp * Math.Sin(fy * u + spin * ThreadW2)) * ThreadScale);
-                        if (i == 0) ctx.BeginFigure(p, false, false);
-                        else ctx.LineTo(p, true, false);
-                    }
+                    var a = 2 * Math.PI * i / GyroPointsPerRing;
+                    pts[i] = Project(ring.Radius * Math.Cos(a), ring.Radius * Math.Sin(a), 0, tx, ty, tz, vy, out var dz);
+                    var band = Math.Min(GyroDepthBands - 1, (int)(dz * GyroDepthBands));
+                    (bands[band] ??= new List<int>()).Add(i);
                 }
-                geo.Freeze();   // geometry 每帧新建可以冻；画刷（_mainBrush）绝不能冻
-                layers[k] = new BallLayer(geo, ThreadWidths[k], ThreadAlphas[k] / 255.0);
+                for (var b = 0; b < GyroDepthBands; b++)
+                {
+                    // ⭐ 空档也要占位（补空 geometry）—— 层数恒 3×6+3=21：深度档占用随姿态变化，
+                    //   若按「有货才出层」，FluidTick 里 Path 数组会越界（首帧建槽数 ≠ 后续帧层数）
+                    var idxs = bands[b];
+                    var dzMid = (b + 0.5) / GyroDepthBands;   // 档中值（6 档在 2px 下看不出跳变；3 档才会"带状"）
+                    layers.Add(new BallLayer(
+                        idxs is { Count: > 0 } ? BuildPolylineGeometry(idxs, pts) : EmptyGeometry(),
+                        ring.Width * (0.45 + 0.65 * dzMid),           // 线宽 = base·(0.45 + 0.65·dz) —— 背面细
+                        Clamp01(ring.Lum * (0.16 + 0.84 * dzMid))));  // 浓度 = base·(0.16 + 0.84·dz) —— 背面暗
+                }
+
+                // 环上亮点（每环 1 个；②③ spin 反向 —— 点在环上转是看得见的，与"环自转"两码事）
+                var ha = ring.DotHead + ring.DotSpin * t;
+                var dp = Project(ring.Radius * Math.Cos(ha), ring.Radius * Math.Sin(ha), 0, tx, ty, tz, vy, out var dDz);
+                layers.Add(new BallLayer(
+                    BuildDotGeometry(dp),                             // 零长度线段＋圆头笔帽 = 点（坑 2，不用改类型）
+                    ring.Width * (0.45 + 0.65 * dDz),
+                    1.0));                                            // "亮点"字面义 = 全亮（参数表没给点样式）
             }
-            return layers;
+            return layers.ToArray();
+        }
+
+        /// <summary>环上一点 → 屏幕坐标：环倾角（X→Y→Z）→ 全局视角（rotX 固定 ＋ rotY(t)）→ 透视。</summary>
+        private static Point Project(double x, double y, double z, double tx, double ty, double tz, double vy, out double dz)
+        {
+            RotX(ref x, ref y, ref z, tx);
+            RotY(ref x, ref y, ref z, ty);
+            RotZ(ref x, ref y, ref z, tz);
+            RotX(ref x, ref y, ref z, GyroRotX);
+            RotY(ref x, ref y, ref z, vy);
+            var s = GyroFc / (GyroFc + z);
+            dz = Clamp01((s - GyroDepthLo) / GyroDepthSpan);
+            return new Point(BallSize / 2.0 + x * GyroRadius * s, BallSize / 2.0 + y * GyroRadius * s);
+        }
+
+        private static void RotX(ref double x, ref double y, ref double z, double a)
+        {
+            var c = Math.Cos(a); var s = Math.Sin(a);
+            (y, z) = (y * c - z * s, y * s + z * c);
+        }
+        private static void RotY(ref double x, ref double y, ref double z, double a)
+        {
+            var c = Math.Cos(a); var s = Math.Sin(a);
+            (x, z) = (x * c + z * s, -x * s + z * c);
+        }
+        private static void RotZ(ref double x, ref double y, ref double z, double a)
+        {
+            var c = Math.Cos(a); var s = Math.Sin(a);
+            (x, y) = (x * c - y * s, x * s + y * c);
+        }
+
+        /// <summary>同档点集 → 一条 geometry：**连续**的点连成 figure（跨档断开处另起 figure，绝不跨档连线）；
+        /// 孤立点补 0.01 线段（圆头笔帽画点的前提）。</summary>
+        private static StreamGeometry BuildPolylineGeometry(List<int> idxs, Point[] pts)
+        {
+            var geo = new StreamGeometry();
+            using (var ctx = geo.Open())
+            {
+                var prev = -2;
+                foreach (var i in idxs)
+                {
+                    if (i != prev + 1) ctx.BeginFigure(pts[i], false, false);   // ⚠️ 描边：不填充、不闭合
+                    else ctx.LineTo(pts[i], true, false);
+                    if (prev == -2 || i != prev + 1)
+                    {
+                        // 新 figure 的第一个点：若是孤立点（下一点不同档），补 0.01 线段让它可见
+                        var nextSameBand = idxs.Contains(i + 1);
+                        if (!nextSameBand) ctx.LineTo(new Point(pts[i].X + 0.01, pts[i].Y), true, false);
+                    }
+                    prev = i;
+                }
+            }
+            geo.Freeze();
+            return geo;
+        }
+
+        private static StreamGeometry BuildDotGeometry(Point p)
+        {
+            var geo = new StreamGeometry();
+            using (var ctx = geo.Open())
+            {
+                ctx.BeginFigure(p, false, false);
+                ctx.LineTo(new Point(p.X + 0.01, p.Y), true, false);   // 零长度线段＋圆头 = 点
+            }
+            geo.Freeze();
+            return geo;
+        }
+
+        /// <summary>空 geometry（无 figure）—— 深度空档占位用：层总数恒定，FluidTick 的 Path 数组才不会越界。</summary>
+        private static StreamGeometry EmptyGeometry()
+        {
+            var geo = new StreamGeometry();
+            using (geo.Open()) { }   // 开了不画 = 空
+            geo.Freeze();
+            return geo;
         }
     }
 
@@ -429,9 +539,9 @@ public sealed class FloatWindow : Window
                 {
                     var p0 = new Point(c + r, c);
                     ctx.BeginFigure(p0, false, false);
-                    for (var i = 1; i <= ThreadPoints; i++)
+                    for (var i = 1; i <= GyroPointsPerRing; i++)
                     {
-                        var a = 2 * Math.PI * i / ThreadPoints;
+                        var a = 2 * Math.PI * i / GyroPointsPerRing;
                         ctx.LineTo(new Point(c + r * Math.Cos(a), c + r * Math.Sin(a)), true, false);
                     }
                 }
@@ -513,7 +623,14 @@ public sealed class FloatWindow : Window
     }
 
     /// <summary>渲染冒烟专用：切到调试形态 —— 交叉淡入框架的机器侧验证入口（开工单⑤）。</summary>
-    public void SwitchFormForTest() => SwitchForm("debug-ring");
+    public void SwitchFormForTest()
+    {
+        BeforeSwitchFormId = ActiveFormId;   // 冒烟日志用（切之前的形态 id，别再硬编码形态名）
+        SwitchForm("debug-ring");
+    }
+
+    /// <summary>渲染冒烟专用：切之前的形态 Id。</summary>
+    public string BeforeSwitchFormId { get; private set; } = "?";
 
     /// <summary>当前展示的形态 Id（冒烟自查用）。</summary>
     public string ActiveFormId => _slotForm[_frontSlot]?.Id ?? "?";

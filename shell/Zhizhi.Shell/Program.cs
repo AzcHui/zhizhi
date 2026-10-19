@@ -279,7 +279,7 @@ public static class Program
                 }
                 else
                 {
-                    Console.WriteLine("  OK    交叉淡入完成：thread → debug-ring，槽位已交换");
+                    Console.WriteLine($"  OK    交叉淡入完成：{window.BeforeSwitchFormId} → debug-ring，槽位已交换");
                 }
                 // 第二张截图存**另一个文件** —— 首图（线团）不被覆盖，两图可对照
                 var w2 = (int)window.ActualWidth;

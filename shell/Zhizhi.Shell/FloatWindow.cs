@@ -28,13 +28,17 @@ public sealed class FloatWindow : Window
     // ══════════ b2-b2 第一版 · 形态库 ＋ 呼吸线团（参数表照抄开工单 2026-10-19）—— 调手感只改这一块 ══════════
 
     private const int ThreadCount = 3;                     // 线数：76px 甜点；上限 5（5 根时线宽降到 1.8，第二版再说）
-    private const double ThreadStrokeWidth = 2.2;          // 线宽：< 1.5 会虚
-    private const double HaloWidthFactor = 2.6;            // 光晕宽 = 线宽 × 2.6 = 5.7
+    private const double HaloWidthFactor = 2.6;            // 光晕宽 = 线宽 × 2.6
     private const double HaloOpacity = 0.22;               // 光晕：同色低透明（"发光"而非"描边"，深浅壁纸都自然）
     private const double ThreadScale = BallSize * 0.255;   // 线团缩放：最大外延 ≈ BallSize×0.395（直径 60，占 76 的 79%）
     private const double ThreadAmp = 0.55;                 // 摆动幅度 A：再大线会自交打结
     private const double ThreadW1 = 0.80, ThreadW2 = 0.55; // 两个方向不同速 → "缠绕感"而不是"整体翻转"
     private const int ThreadPoints = 120;                  // 每根 120 点，3 根共 360 点/帧，60fps → 2.2 万点/秒，开销极低
+    // ⭐ 同色分层（监工 2026-10-19：同色同粗细在 76px 下读成"一团"，分层后才有"丝线缠绕"的结构感）
+    private static readonly double[] ThreadWidths = { 2.2, 1.9, 1.6 };   // 线宽递减
+    private static readonly int[] ThreadAlphas = { 255, 185, 115 };      // 浓度递减（0~255，走 Path.Opacity）
+    // ⭐ 每根不同频率 fx=3+k、fy=2+k（3/2、4/3、5/4）—— 监工勘误：相位偏移对**闭合曲线**无效
+    //   （u+Δ 只是沿曲线滑动，点集不变，换任何角度都重合），只有频率不同才分得开。
 
     // 情绪档（速度＝情绪）：平静 0 ↔ 告警 1（静音/活跃档归第二版）；帧率分档保留 —— 帧率本身也是情绪
     private const double IntensityBlendPerFrame = 0.1;     // 每帧向目标逼近 10%（别秒切，否则像抽风）
@@ -64,7 +68,7 @@ public sealed class FloatWindow : Window
     private readonly DispatcherTimer _idleTimer;      // 每秒喂 idleMs
     private readonly DispatcherTimer _bubbleTimer;    // 气泡自动消失
     private readonly System.Windows.Controls.Canvas _ballHost;  // 球的容器（抖动变换挂它身上；内部=视觉层+命中层）
-    private readonly System.Windows.Shapes.Ellipse _hitArea;    // ⭐ 命中层：不可见但可命中（线条只有 2.2px 宽，命不中）
+    private readonly System.Windows.Shapes.Rectangle _hitArea;  // ⭐ 命中层：矩形 84×84（圆的四角天然不命中——监工打点实测）
     private readonly TranslateTransform _ballShake;   // L1 抖动 = 球的视觉反应
     private readonly Border _bubble;
     private readonly TextBlock _bubbleText;
@@ -85,8 +89,9 @@ public sealed class FloatWindow : Window
 
     // ── 形态注册表 ＋ 双槽交叉淡入（开工单④⑤）──
     private readonly IBallForm[] _forms = { new ThreadBallForm(), new DebugRingForm() };
-    private readonly System.Windows.Shapes.Path?[] _strokes = new System.Windows.Shapes.Path?[2];  // 每槽一条描边
-    private readonly System.Windows.Shapes.Path?[] _halos = new System.Windows.Shapes.Path?[2];    // 每槽一条光晕（同色）
+    private readonly System.Windows.Controls.Canvas?[] _slotHosts = new System.Windows.Controls.Canvas?[2];  // 每槽一个容器 —— 交叉淡入淡容器，槽内线的粗细浓淡是各 Path 自己的基值
+    private readonly System.Windows.Shapes.Path?[][] _slotStrokes = new System.Windows.Shapes.Path?[2][];
+    private readonly System.Windows.Shapes.Path?[][] _slotHalos = new System.Windows.Shapes.Path?[2][];
     private readonly IBallForm?[] _slotForm = new IBallForm?[2];   // 各槽当前挂的形态（null = 空槽不更新）
     private int _frontSlot;        // 正在展示的槽位
     private bool _fading;          // 交叉淡入进行中（切换防重入）
@@ -139,43 +144,35 @@ public sealed class FloatWindow : Window
             Height = BallSize,
             RenderTransform = _ballShake,   // 戳的抖动 = 整个球容器一起抖
         };
-        // 双槽（开工单⑤）：每槽 = (光晕, 描边) 共用同一条 geometry，只差 StrokeThickness；
+        // 双槽（开工单⑤）：每槽一个容器（交叉淡入淡容器 Opacity），槽内 = 每根线一层（光晕+描边）。
         // 槽 0 = 前台（常态线团），槽 1 = 备用（交叉淡入时接新形态）。
         for (var slot = 0; slot < 2; slot++)
         {
-            _halos[slot] = new System.Windows.Shapes.Path
+            _slotHosts[slot] = new System.Windows.Controls.Canvas
             {
-                Stroke = _mainBrush,
-                StrokeThickness = ThreadStrokeWidth * HaloWidthFactor,
-                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
                 IsHitTestVisible = false,     // ⭐ 开工单③：视觉层只负责画，不接收鼠标
-                Opacity = slot == 0 ? HaloOpacity : 0,
-            };
-            _strokes[slot] = new System.Windows.Shapes.Path
-            {
-                Stroke = _mainBrush,
-                StrokeThickness = ThreadStrokeWidth,
-                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
-                IsHitTestVisible = false,
                 Opacity = slot == 0 ? 1 : 0,
             };
-            _ballHost.Children.Add(_halos[slot]!);   // 光晕垫底、描边在上
-            _ballHost.Children.Add(_strokes[slot]!);
+            _ballHost.Children.Add(_slotHosts[slot]!);
         }
         _slotForm[0] = ResolveForm(FormIdForState());
-        _strokes[0]!.Data = _slotForm[0]!.Build(0, 0);
-        _halos[0]!.Data = _strokes[0]!.Data;
+        PopulateSlot(0, _slotForm[0]!.Build(0, 0));
         // ⭐ 命中区独立（开工单③）：改成只有描边之后命中只剩 2.2px 线本身 → 点不到。
         //   命中层不可见但可命中 —— ⚠️ Fill 必须给 Brushes.Transparent，给 null 不参与命中。
-        _hitArea = new System.Windows.Shapes.Ellipse
+        //   b2-b2 复验（监工 2026-10-19）：Ellipse 的**四角天然不命中**（打点实测 (10,10)/(70,70) 都在圆外）
+        //   → 线团视觉只占中间 79%，用户移到"看着像球、实际在圆外"就感觉空白无效。
+        //   改**矩形**且比视觉大一圈（76→84，各边多 4）—— 细线的点击目标该比视觉宽容。
+        _hitArea = new System.Windows.Shapes.Rectangle
         {
-            Width = BallSize,
-            Height = BallSize,
+            Width = BallSize + 8,
+            Height = BallSize + 8,
             Fill = Brushes.Transparent,
             Cursor = Cursors.Hand,
             ToolTip = "戳一下",
         };
-        _ballHost.Children.Add(_hitArea);   // 命中层在视觉层之上（后加 = 顶层）
+        Canvas.SetLeft(_hitArea, -4);       // 84 在 76 容器里居中：各边出 4
+        Canvas.SetTop(_hitArea, -4);
+        _ballHost.Children.Add(_hitArea);   // 命中层最后加 = 顶层（在两个槽容器之上）
         Canvas.SetRight(_ballHost, BallRightMargin);
         Canvas.SetBottom(_ballHost, BallBottomMargin);
         // ⭐ 6 个鼠标事件 + CaptureMouse/ReleaseMouseCapture 全部从 _ball 平移到 _hitArea（开工单③）。
@@ -333,16 +330,6 @@ public sealed class FloatWindow : Window
         _curIntensity += (_targetIntensity - _curIntensity) * IntensityBlendPerFrame;
         var t = _fluidClock.Elapsed.TotalSeconds;
 
-        // 形状：交叉淡入期间两槽都在动，各槽跟着自己的形态重建（Freeze 后提交渲染）
-        for (var slot = 0; slot < 2; slot++)
-        {
-            var form = _slotForm[slot];
-            if (form is null || _strokes[slot]!.Opacity <= 0.01) continue;   // 空槽/已淡出 = 停更（省帧）
-            var geo = form.Build(t, _curIntensity);
-            _strokes[slot]!.Data = geo;
-            _halos[slot]!.Data = geo;
-        }
-
         // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减），带死区 t = clamp01((cpu−40)/50)；无数据 = 灰
         var ct = _lastCpu is { } c ? Clamp01((c - ColorDeadZoneLow) / ColorDeadZoneSpan) : double.NaN;
         var tgtH = double.IsNaN(ct) ? _curHue : HueCalm + (HueAlert - HueCalm) * ct;
@@ -351,7 +338,20 @@ public sealed class FloatWindow : Window
         _curHue += (tgtH - _curHue) * ColorApproachPerFrame;
         _curSat += (tgtS - _curSat) * ColorApproachPerFrame;
         _curLum += (tgtL - _curLum) * ColorApproachPerFrame;
-        _mainBrush.Color = HslToColor(_curHue, _curSat, Clamp01(_curLum));   // 光晕同色 —— 发光感来自 Opacity 0.22
+        _mainBrush.Color = HslToColor(_curHue, _curSat, Clamp01(_curLum));   // 光晕同色 —— 发光感来自低透明光晕层
+
+        // 形状：交叉淡入期间两槽都在动，各槽跟着自己的形态逐层重建（Freeze 后提交渲染）
+        for (var slot = 0; slot < 2; slot++)
+        {
+            var form = _slotForm[slot];
+            if (form is null || _slotHosts[slot]!.Opacity <= 0.01) continue;   // 空槽/已淡出 = 停更（省帧）
+            var layers = form.Build(t, _curIntensity);
+            for (var i = 0; i < layers.Length; i++)
+            {
+                _slotStrokes[slot][i].Data = layers[i].Geo;
+                _slotHalos[slot][i].Data = layers[i].Geo;
+            }
+        }
     }
 
     // ───────────────────────── 形态注册表（开工单④：形态只产 geometry，不碰颜色/命中/交互）─────────
@@ -361,45 +361,53 @@ public sealed class FloatWindow : Window
 
     private IBallForm ResolveForm(string id) => _forms.First(f => f.Id == id);
 
-    /// <summary>一个球形态：只负责「给时间 t 和情绪强度，产出一条 geometry」。不碰颜色、命中、交互。</summary>
+    /// <summary>一层线：几何＋线宽＋浓度（0~1）。一个形态可返回多层（线团 3 层／调试环 1 层）——
+    /// ⭐ 分层是监工 2026-10-19 的要求：同色不同粗细浓淡，76px 下才读得出"丝线缠绕"而不是"一团"。</summary>
+    private sealed record BallLayer(Geometry Geo, double Width, double Alpha);
+
+    /// <summary>一个球形态：只负责「给时间 t 和情绪强度，产出若干层线」。不碰颜色、命中、交互。</summary>
     private interface IBallForm
     {
         string Id { get; }
 
         /// <param name="intensity">0~1 情绪强度（平静→0，告警→1）</param>
-        Geometry Build(double t, double intensity);
+        BallLayer[] Build(double t, double intensity);
     }
 
-    /// <summary>呼吸线团（常态形态）：3 根线相互缠绕 —— 一条 StreamGeometry 三个 figure。
-    /// ⚠️ BeginFigure(p, isFilled: false, isClosed: false) —— 描边不需要填充/闭合（开工单④）。</summary>
+    /// <summary>呼吸线团（常态形态）：3 根线相互缠绕 —— 每根一层（独立 geometry，因为线宽/浓度逐根不同）。
+    /// ⚠️ 每根**不同频率** fx=3+k、fy=2+k —— 相位偏移对闭合曲线无效（u+Δ 点集不变），频率不同才分得开。
+    ///   BeginFigure(p, isFilled: false, isClosed: false) —— 描边不需要填充/闭合（开工单④）。</summary>
     private sealed class ThreadBallForm : IBallForm
     {
         public string Id => "thread";
 
-        public Geometry Build(double t, double intensity)
+        public BallLayer[] Build(double t, double intensity)
         {
             var spin = t * (0.6 + 1.8 * intensity);         // 速度＝情绪
             var amp = ThreadAmp * (0.75 + 0.5 * intensity); // 幅度也随情绪
             var c = BallSize / 2.0;
-            var geo = new System.Windows.Media.StreamGeometry();
-            using (var ctx = geo.Open())
+            var layers = new BallLayer[ThreadCount];
+            for (var k = 0; k < ThreadCount; k++)
             {
-                for (var k = 0; k < ThreadCount; k++)
+                var fx = 3 + k;   // 3/4/5
+                var fy = 2 + k;   // 2/3/4 —— x/y 频率也不同 → 缠绕而非重合
+                var geo = new System.Windows.Media.StreamGeometry();
+                using (var ctx = geo.Open())
                 {
-                    var phase = k * (2 * Math.PI / ThreadCount);   // 每根相位偏移 k·(2π/3) —— 转过整根线（缠绕朝向各不同）
                     for (var i = 0; i <= ThreadPoints; i++)
                     {
-                        var u = 2 * Math.PI * i / ThreadPoints + phase;
+                        var u = 2 * Math.PI * i / ThreadPoints;
                         var p = new Point(
-                            c + (Math.Cos(u) + amp * Math.Cos(3 * u + spin * ThreadW1)) * ThreadScale,
-                            c + (Math.Sin(u) + amp * Math.Sin(2 * u + spin * ThreadW2)) * ThreadScale);
+                            c + (Math.Cos(u) + amp * Math.Cos(fx * u + spin * ThreadW1)) * ThreadScale,
+                            c + (Math.Sin(u) + amp * Math.Sin(fy * u + spin * ThreadW2)) * ThreadScale);
                         if (i == 0) ctx.BeginFigure(p, false, false);
                         else ctx.LineTo(p, true, false);
                     }
                 }
+                geo.Freeze();   // geometry 每帧新建可以冻；画刷（_mainBrush）绝不能冻
+                layers[k] = new BallLayer(geo, ThreadWidths[k], ThreadAlphas[k] / 255.0);
             }
-            geo.Freeze();   // geometry 每帧新建可以冻；画刷（_mainBrush）绝不能冻
-            return geo;
+            return layers;
         }
     }
 
@@ -410,29 +418,66 @@ public sealed class FloatWindow : Window
         public string Id => "debug-ring";
         private Geometry? _cached;   // 静态圆，算一次就够
 
-        public Geometry Build(double t, double intensity)
+        public BallLayer[] Build(double t, double intensity)
         {
-            if (_cached is { } g) return g;
-            var c = BallSize / 2.0;
-            var r = BallSize * 0.35;
-            var geo = new System.Windows.Media.StreamGeometry();
-            using (var ctx = geo.Open())
+            if (_cached is null)
             {
-                var p0 = new Point(c + r, c);
-                ctx.BeginFigure(p0, false, false);
-                for (var i = 1; i <= ThreadPoints; i++)
+                var c = BallSize / 2.0;
+                var r = BallSize * 0.35;
+                var geo = new System.Windows.Media.StreamGeometry();
+                using (var ctx = geo.Open())
                 {
-                    var a = 2 * Math.PI * i / ThreadPoints;
-                    ctx.LineTo(new Point(c + r * Math.Cos(a), c + r * Math.Sin(a)), true, false);
+                    var p0 = new Point(c + r, c);
+                    ctx.BeginFigure(p0, false, false);
+                    for (var i = 1; i <= ThreadPoints; i++)
+                    {
+                        var a = 2 * Math.PI * i / ThreadPoints;
+                        ctx.LineTo(new Point(c + r * Math.Cos(a), c + r * Math.Sin(a)), true, false);
+                    }
                 }
+                geo.Freeze();
+                _cached = geo;
             }
-            geo.Freeze();
-            _cached = geo;
-            return geo;
+            return new[] { new BallLayer(_cached, 2.2, 1.0) };
+        }
+    }
+
+    /// <summary>把形态的各层落到槽容器里（层结构随形态不同：线团 3 层／调试环 1 层）。
+    /// 槽内逐层：光晕垫底、描边在上；线宽/浓度是各 Path 自己的基值（同色分层），容器 Opacity 只管淡入淡出。</summary>
+    private void PopulateSlot(int slot, BallLayer[] layers)
+    {
+        var host = _slotHosts[slot]!;
+        host.Children.Clear();
+        _slotStrokes[slot] = new System.Windows.Shapes.Path[layers.Length];
+        _slotHalos[slot] = new System.Windows.Shapes.Path[layers.Length];
+        for (var i = 0; i < layers.Length; i++)
+        {
+            var layer = layers[i];
+            var halo = new System.Windows.Shapes.Path
+            {
+                Data = layer.Geo,
+                Stroke = _mainBrush,
+                StrokeThickness = layer.Width * HaloWidthFactor,
+                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+                Opacity = HaloOpacity * layer.Alpha,   // 光晕浓度跟线走（分层后逐层不同）
+            };
+            var stroke = new System.Windows.Shapes.Path
+            {
+                Data = layer.Geo,
+                Stroke = _mainBrush,
+                StrokeThickness = layer.Width,
+                StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+                Opacity = layer.Alpha,
+            };
+            _slotHalos[slot][i] = halo;
+            _slotStrokes[slot][i] = stroke;
+            host.Children.Add(halo);
+            host.Children.Add(stroke);
         }
     }
 
     /// <summary>切形态（交叉淡入，开工单⑤）：新形态载入背槽 → 300ms 淡入淡出 → 交换槽位、旧槽停更。
+    /// ⭐ 淡的是**槽容器** —— 槽内每根线的粗细/浓度是各 Path 自己的基值，动画不碰它们。
     /// ⚠️ 动画 FillBehavior.Stop + Completed 显式落定（抖动/挪一挪同款双保险 —— 默认 HoldEnd 会锁住 Opacity）。</summary>
     private void SwitchForm(string id)
     {
@@ -441,37 +486,30 @@ public sealed class FloatWindow : Window
         if (next.Id == _slotForm[_frontSlot]?.Id) return;   // 就是它，不切
         var back = 1 - _frontSlot;
         _slotForm[back] = next;
-        _strokes[back]!.Data = next.Build(_fluidClock.Elapsed.TotalSeconds, _curIntensity);
-        _halos[back]!.Data = _strokes[back]!.Data;
+        PopulateSlot(back, next.Build(_fluidClock.Elapsed.TotalSeconds, _curIntensity));
         _fading = true;
         AppendLog($"形态切换：{_slotForm[_frontSlot]?.Id} → {next.Id}（{FormFadeMs:F0}ms 交叉淡入）");
 
         var dur = TimeSpan.FromMilliseconds(FormFadeMs);
-        var strokeIn = new DoubleAnimation(0, 1, dur) { FillBehavior = FillBehavior.Stop };
-        var haloIn = new DoubleAnimation(0, HaloOpacity, dur) { FillBehavior = FillBehavior.Stop };
-        var strokeOut = new DoubleAnimation(1, 0, dur) { FillBehavior = FillBehavior.Stop };
-        var haloOut = new DoubleAnimation(HaloOpacity, 0, dur) { FillBehavior = FillBehavior.Stop };
+        var fadeIn = new DoubleAnimation(0, 1, dur) { FillBehavior = FillBehavior.Stop };
+        var fadeOut = new DoubleAnimation(1, 0, dur) { FillBehavior = FillBehavior.Stop };
         var done = 0;
         void Finish()
         {
-            if (++done < 4) return;   // 四条动画全走完才收尾
-            _strokes[_frontSlot]!.Opacity = 0;
-            _halos[_frontSlot]!.Opacity = 0;
+            if (++done < 2) return;   // 两条动画全走完才收尾
+            _slotHosts[_frontSlot]!.Opacity = 0;
             _slotForm[_frontSlot] = null;    // 旧槽停更（FluidTick 跳过 null/透明槽）
+            _slotStrokes[_frontSlot] = null;
+            _slotHalos[_frontSlot] = null;
             _frontSlot = back;
-            _strokes[_frontSlot]!.Opacity = 1;
-            _halos[_frontSlot]!.Opacity = HaloOpacity;
+            _slotHosts[_frontSlot]!.Opacity = 1;
             _fading = false;
             AppendLog($"形态切换完成：当前 {_slotForm[_frontSlot]!.Id}");
         }
-        strokeIn.Completed += (_, _) => Finish();
-        haloIn.Completed += (_, _) => Finish();
-        strokeOut.Completed += (_, _) => Finish();
-        haloOut.Completed += (_, _) => Finish();
-        _strokes[back]!.BeginAnimation(OpacityProperty, strokeIn);
-        _halos[back]!.BeginAnimation(OpacityProperty, haloIn);
-        _strokes[_frontSlot]!.BeginAnimation(OpacityProperty, strokeOut);
-        _halos[_frontSlot]!.BeginAnimation(OpacityProperty, haloOut);
+        fadeIn.Completed += (_, _) => Finish();
+        fadeOut.Completed += (_, _) => Finish();
+        _slotHosts[back]!.BeginAnimation(OpacityProperty, fadeIn);
+        _slotHosts[_frontSlot]!.BeginAnimation(OpacityProperty, fadeOut);
     }
 
     /// <summary>渲染冒烟专用：切到调试形态 —— 交叉淡入框架的机器侧验证入口（开工单⑤）。</summary>
@@ -564,7 +602,7 @@ public sealed class FloatWindow : Window
     public string DumpVisualState() =>
         $"bubble(V={_bubble.Visibility} O={_bubble.Opacity:F2} W={_bubble.ActualWidth:F0} H={_bubble.ActualHeight:F0}) " +
         $"panel(V={_panel.Visibility} O={_panel.Opacity:F2}) form={ActiveFormId} " +
-        $"slotO(F={_strokes[_frontSlot]!.Opacity:F2} B={_strokes[1 - _frontSlot]!.Opacity:F2}) ballO={_ballHost.Opacity:F2}";
+        $"slotO(F={_slotHosts[_frontSlot]!.Opacity:F2} B={_slotHosts[1 - _frontSlot]!.Opacity:F2}) ballO={_ballHost.Opacity:F2}";
 
     // ───────────────────────── 悬停面板 ─────────────────────────
 

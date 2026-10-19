@@ -23,7 +23,33 @@ namespace Zhizhi.Shell;
 /// </summary>
 public sealed class FloatWindow : Window
 {
-    private const double BallSize = 64;
+    private const double BallSize = 76;   // b2-b2：64→76 —— ±5~12px 的形变才看得出来（clamp/位置/存档全是相对计算，改一处即安全）
+
+    // ══════════ b2-b2 流体态参数（第一版：平静/告警两档）—— 调手感只改这一块 ══════════
+
+    /// <summary>谐波：k（频率）· w（权重）· φ（初相）——
+    /// r(θ,t) = R·(1 + a·Σ w·sin(kθ + φ + ω·t·(0.6 + 0.22k)))，96 点极坐标采样，每帧重建 StreamGeometry。</summary>
+    private static readonly (double K, double W, double Phi)[] FluidHarmonics =
+        { (2, 0.45, 0.0), (3, 0.30, 1.7), (5, 0.20, 3.1), (7, 0.12, 4.6) };
+    private const int FluidPointCount = 96;
+
+    // 两档：速度就是情绪 —— ω / 幅度 / 帧率三者一起变（帧率本身也是情绪：慢的东西不需要高帧率）
+    private const double CalmOmega = 0.45, CalmAmp = 0.045;   private const int CalmFps = 15;   // 平静：幅度 ≤5%，盯 1 分钟不刺眼
+    private const double AlertOmega = 2.30, AlertAmp = 0.175; private const int AlertFps = 60;   // 告警：明显更快、更大幅
+    private const double FluidBlendPerFrame = 0.1;             // 切档平滑：ω/a 每帧向目标逼近 10%（别秒切，否则像抽风）
+
+    private const double AlertCpuThreshold = 80;                                     // CPU ≥ 80 → 告警档
+    private static readonly TimeSpan AlertHoldAfterSaid = TimeSpan.FromSeconds(10);  // 告警级台词后的保持期
+
+    // 颜色连续插值 —— ⛔ 必须 HSL：RGB 插值青绿→橙的中点是灰绿泥巴 #707665；
+    // HSL 且色相 180→16 递减 = 绿→黄绿→黄→橙（热力图经典路径，中点鲜亮黄绿）
+    private const double ColorApproachPerFrame = 0.05;  // 每帧向目标色逼近 5%（约 0.6s 走完；不用 ColorAnimation——每帧都改会打架）
+    private const double HueCalm = 180, HueAlert = 16;
+    private const double SatCalm = 1.00, SatAlert = 0.71;    // #008080 → #E06C4A
+    private const double LumCalm = 0.25, LumAlert = 0.58;
+    private const double StopLighten = 0.24, StopDarken = 0.21;  // 球内三色停：亮度 +24% / 本色 / −21%
+    private const double GrayLum = 0.50;                             // 无数据 = 灰（饱和度归零）
+
     private const double DragThreshold = 4;   // 位移 < 4px 松手 = 戳，≥ 4px = 拖（与系统 MinimumHorizontalDragDistance 同量级）
     // 球在窗口 Canvas 里的边距（单一事实源 —— Canvas 定位与 clamp 都用它们）
     private const double BallRightMargin = 18;    // 球右缘距窗右（X 右锚）
@@ -34,7 +60,7 @@ public sealed class FloatWindow : Window
     private readonly KernelSidecar _kernel;
     private readonly DispatcherTimer _idleTimer;      // 每秒喂 idleMs
     private readonly DispatcherTimer _bubbleTimer;    // 气泡自动消失
-    private readonly Ellipse _ball;
+    private readonly System.Windows.Shapes.Path _ball;  // b2-b2：Ellipse → Path（流体形变 = 每帧重建 StreamGeometry）
     private readonly TranslateTransform _ballShake;   // L1 抖动 = 球的视觉反应
     private readonly Border _bubble;
     private readonly TextBlock _bubbleText;
@@ -43,6 +69,16 @@ public sealed class FloatWindow : Window
     private TextBlock _cpuText = null!;
     private TextBlock _memText = null!;
     private readonly Random _rng = new();
+
+    // ── b2-b2 流体态运行时状态 ──
+    private readonly System.Diagnostics.Stopwatch _fluidClock = System.Diagnostics.Stopwatch.StartNew();
+    private DispatcherTimer _fluidTimer = null!;      // 形变驱动（Interval = 当前档帧率 —— 帧率是情绪的一部分）
+    private RadialGradientBrush _ballBrush = null!;   // 持有**未 Freeze** 的画刷，每帧只改色停 —— 冻了就改不动了
+    private double _curOmega = CalmOmega, _curAmp = CalmAmp;      // 当前值（向目标平滑逼近）
+    private double _targetOmega = CalmOmega, _targetAmp = CalmAmp;
+    private double _curHue = HueCalm, _curSat = SatCalm, _curLum = LumCalm;   // 当前色（HSL，向目标逼近 5%/帧）
+    private double? _lastCpu;                          // 最近采样 CPU —— 驱动颜色连续插值 + 档位
+    private DateTime _alertHoldUntil = DateTime.MinValue;              // 告警级台词后的保持期
 
     private int _samples;             // 已看 N 轮
     private int? _trust;              // M7：内核报上来的亲密度
@@ -70,7 +106,7 @@ public sealed class FloatWindow : Window
         _kernel = kernel;
 
         Title = "只只";
-        Width = 320;
+        Width = 330;   // b2-b2：320→330 —— BallSize 76 后 X 左锚分支的面板挂球右 [124,330] 才放得下（206 DIP）
         Height = 250;
         WindowStyle = WindowStyle.None;
         AllowsTransparency = true;
@@ -85,11 +121,11 @@ public sealed class FloatWindow : Window
         var canvas = new Canvas();
 
         _ballShake = new TranslateTransform();
-        _ball = new Ellipse
+        _ballBrush = MakeBallBrush();
+        _ball = new System.Windows.Shapes.Path
         {
-            Width = BallSize,
-            Height = BallSize,
-            Fill = MakeBallBrush(Colors.Teal),
+            Data = BuildBallGeometry(),   // 初始形状（流体 timer 在 Loaded 启动后每帧重建）
+            Fill = _ballBrush,
             Cursor = Cursors.Hand,
             RenderTransform = _ballShake,
             ToolTip = "戳一下",
@@ -151,6 +187,8 @@ public sealed class FloatWindow : Window
         _idleTimer.Tick += (_, _) => FeedIdle();
         _bubbleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4.5) };
         _bubbleTimer.Tick += (_, _) => HideBubble();
+        _fluidTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000.0 / CalmFps) };
+        _fluidTimer.Tick += (_, _) => FluidTick();
 
         // 面板宽限收起（2026-10-17 修复）：球/面板/气泡任一 MouseLeave → 300ms 后收；
         // 宽限期内摸回来（球↔面板之间的 30px 空隙、面板→球等路径）→ Tick 一查还悬停着 → 取消。
@@ -175,12 +213,14 @@ public sealed class FloatWindow : Window
         {
             LoadSettingsOrCorner();  // b2-a ①：读 shell.json 恢复位置（越界回落右下角），没有才默认角落
             _idleTimer.Start();
+            _fluidTimer.Start();     // b2-b2：流体形变开跑（隐藏时停 = 帧率 0，省电）
             FeedIdle();              // greeting 插队：立即喂第一帧 context —— 打招呼零延迟（否则要等 1s）
         };
         Closing += (_, _) =>
         {
             _idleTimer.Stop();
             _bubbleTimer.Stop();
+            _fluidTimer.Stop();      // b2-b2：流体停
             SaveSettings();          // ⭐ b2-a ①②：关窗写位置 + 静音（写盘点只有拖动结束与此处）
             if (_tray is { } tray)   // ⭐ 不收托盘 = 残留幽灵图标（要鼠标划过才消失）
             {
@@ -210,8 +250,9 @@ public sealed class FloatWindow : Window
         _cpuText.Text = s.Cpu is { } c ? $"{c:F1}%" : "—";
         _memText.Text = s.Mem is { } m ? $"{m:F1}%" : "—";
         if (_panelOpen) UpdateStatusLine();
-        // 状态变化 → 球色（已定动效口径：动的是颜色，不是形状；b1 用直接换色，过渡 b2）
-        _ball.Fill = MakeBallBrush(BallColor(s));
+        // b2-b2：颜色不再换画刷 —— CPU 存起来，由 FluidTick 每帧 HSL 连续插值（形状档位也由它驱动）
+        _lastCpu = s.Cpu;
+        UpdateFluidTarget();
     }
 
     private void OnSaid(SaidLine said)
@@ -220,15 +261,102 @@ public sealed class FloatWindow : Window
         if (_panelOpen) UpdateStatusLine();
         // L4（决策 #34）：poked@ 前缀 = 它决定「躲开」—— 外壳只做动作，说话归内核
         if (said.EventId.StartsWith("poked@", StringComparison.Ordinal)) MoveAside();
+        // b2-b2：告警级台词 → 告警档保持一段时间（活跃期结束后平滑回落，FluidTick 逼近）
+        if (said.Level is "warn" or "critical")
+        {
+            _alertHoldUntil = DateTime.Now + AlertHoldAfterSaid;
+            UpdateFluidTarget();
+        }
     }
 
-    // ───────────────────────── M4-c 状态机制（原样复用）─────────────────────────
+    // ───────────────────────── b2-b2 流体形变 + 颜色连续插值 ─────────────────────────
 
-    private static Color BallColor(Sample s)
+    private static double Clamp01(double v) => Math.Min(1, Math.Max(0, v));
+
+    /// <summary>档位目标（平静/告警）：CPU ≥ 阈值 或 告警级台词保持期内 → 告警档；帧率一起切（帧率是情绪）。</summary>
+    private void UpdateFluidTarget()
     {
-        if (s.Cpu is not { } cpu) return Colors.Gray;                       // 还没数据 = 假寐（灰）
-        if (cpu >= 80) return Color.FromRgb(0xE0, 0x6C, 0x4A);              // 偏暖（忙）
-        return Colors.Teal;                                                 // 平常
+        var alert = _alertHoldUntil > DateTime.Now || (_lastCpu is { } c && c >= AlertCpuThreshold);
+        _targetOmega = alert ? AlertOmega : CalmOmega;
+        _targetAmp = alert ? AlertAmp : CalmAmp;
+        _fluidTimer.Interval = TimeSpan.FromMilliseconds(1000.0 / (alert ? AlertFps : CalmFps));
+    }
+
+    /// <summary>流体驱动（每帧）：ω/a 向目标逼近 10% → 重建 StreamGeometry → 色停向目标逼近 5%。
+    /// ⭐ 画刷是持有的**未 Freeze** 实例 —— 每帧只改 GradientStop.Color（冻了就改不动了）。</summary>
+    private void FluidTick()
+    {
+        _curOmega += (_targetOmega - _curOmega) * FluidBlendPerFrame;
+        _curAmp += (_targetAmp - _curAmp) * FluidBlendPerFrame;
+        _ball.Data = BuildBallGeometry();
+
+        // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减）；无数据 = 灰（饱和度归零）
+        var t = _lastCpu is { } c ? Clamp01(c / 100.0) : double.NaN;
+        var tgtH = double.IsNaN(t) ? _curHue : HueCalm + (HueAlert - HueCalm) * t;
+        var tgtS = double.IsNaN(t) ? 0 : SatCalm + (SatAlert - SatCalm) * t;
+        var tgtL = double.IsNaN(t) ? GrayLum : LumCalm + (LumAlert - LumCalm) * t;
+        _curHue += (tgtH - _curHue) * ColorApproachPerFrame;
+        _curSat += (tgtS - _curSat) * ColorApproachPerFrame;
+        _curLum += (tgtL - _curLum) * ColorApproachPerFrame;
+        var stops = _ballBrush.GradientStops;
+        stops[0].Color = HslToColor(_curHue, _curSat, Clamp01(_curLum + StopLighten));
+        stops[1].Color = HslToColor(_curHue, _curSat, _curLum);
+        stops[2].Color = HslToColor(_curHue, _curSat, Clamp01(_curLum - StopDarken));
+    }
+
+    /// <summary>极坐标谐波叠加 → 96 点闭合 StreamGeometry（每帧新建，Freeze 后交渲染）。</summary>
+    private System.Windows.Media.StreamGeometry BuildBallGeometry()
+    {
+        var t = _fluidClock.Elapsed.TotalSeconds;
+        var geo = new System.Windows.Media.StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            var cx = BallSize / 2.0;
+            var cy = BallSize / 2.0;
+            for (var i = 0; i < FluidPointCount; i++)
+            {
+                var theta = Math.PI * 2 * i / FluidPointCount;
+                var wobble = 0.0;
+                foreach (var (k, w, phi) in FluidHarmonics)
+                    wobble += w * Math.Sin(k * theta + phi + _curOmega * t * (0.6 + 0.22 * k));
+                var r = BallSize / 2.0 * (1 + _curAmp * wobble);
+                var p = new Point(cx + r * Math.Cos(theta), cy + r * Math.Sin(theta));
+                if (i == 0) ctx.BeginFigure(p, true, true);
+                else ctx.LineTo(p, true, false);
+            }
+        }
+        geo.Freeze();   // 几何每帧新建可以冻 —— 画刷是持有的，绝不能冻
+        return geo;
+    }
+
+    /// <summary>初始画刷（常态青绿三色停）。返回**未 Freeze** 的实例 —— FluidTick 每帧改色停。</summary>
+    private static RadialGradientBrush MakeBallBrush()
+    {
+        var brush = new RadialGradientBrush();
+        brush.GradientStops.Add(new GradientStop(HslToColor(HueCalm, SatCalm, LumCalm + StopLighten), 0.0));
+        brush.GradientStops.Add(new GradientStop(HslToColor(HueCalm, SatCalm, LumCalm), 0.75));
+        brush.GradientStops.Add(new GradientStop(HslToColor(HueCalm, SatCalm, LumCalm - StopDarken), 1.0));
+        return brush;
+    }
+
+    /// <summary>HSL → RGB（色相 0~360，S/L 0~1）—— 颜色插值只走 HSL，别碰 RGB Lerp。</summary>
+    private static Color HslToColor(double h, double s, double l)
+    {
+        h = ((h % 360) + 360) % 360;
+        var c = (1 - Math.Abs(2 * Clamp01(l) - 1)) * Clamp01(s);
+        var x = c * (1 - Math.Abs(h / 60 % 2 - 1));
+        var m = Clamp01(l) - c / 2;
+        double r, g, b;
+        switch ((int)(h / 60))
+        {
+            case 1: r = x; g = c; b = 0; break;
+            case 2: r = 0; g = c; b = x; break;
+            case 3: r = 0; g = x; b = c; break;
+            case 4: r = x; g = 0; b = c; break;
+            case 5: r = c; g = 0; b = x; break;
+            default: r = c; g = x; b = 0; break;   // 0~60°
+        }
+        return Color.FromRgb((byte)Math.Round((r + m) * 255), (byte)Math.Round((g + m) * 255), (byte)Math.Round((b + m) * 255));
     }
 
     private static string TrustWord(int? trust) => trust switch
@@ -789,11 +917,13 @@ public sealed class FloatWindow : Window
         {
             Hide();
             _idleTimer.Stop();
+            _fluidTimer.Stop();   // b2-b2：帧率 0（完全停）—— 省电，也省形变计算
         }
         else
         {
             Show();
             _idleTimer.Start();
+            _fluidTimer.Start();
             FeedIdle();   // 立即恢复喂食 —— 静音真值 / idleMs 同步刷新
         }
         if (_trayShowItem is { } item) item.Text = _ballHidden ? "显示球" : "隐藏球";
@@ -860,21 +990,5 @@ public sealed class FloatWindow : Window
     }
 
     // ───────────────────────── 小工具 ─────────────────────────
-
-    private static Brush MakeBallBrush(Color c) => new RadialGradientBrush
-    {
-        GradientStops =
-        {
-            new GradientStop(Lighten(c, 0.35), 0.0),
-            new GradientStop(c, 0.75),
-            new GradientStop(Lighten(c, -0.25), 1.0),
-        },
-    };
-
-    private static Color Lighten(Color c, double amount) => Color.FromRgb(
-        (byte)Clamp255(c.R + 255 * amount),
-        (byte)Clamp255(c.G + 255 * amount),
-        (byte)Clamp255(c.B + 255 * amount));
-
-    private static double Clamp255(double v) => Math.Min(255, Math.Max(0, v));
+    // （旧 MakeBallBrush(Color)/Lighten/Clamp255 已被 b2-b2 的 HSL 管线取代 —— MakeBallBrush() 移至流体节）
 }

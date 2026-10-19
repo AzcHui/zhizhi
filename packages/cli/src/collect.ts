@@ -168,11 +168,15 @@ export async function calibrateProbes(
   const path = resolve(dataDir, CALIBRATION_FILE);
   const signature = signatureOf(probes);
 
-  // ① 先看缓存：签名一致 → 直接用（#24 ④：不做持续学习 —— 同机器耗时不怎么变）
+  // ① 先看缓存：签名一致 → **逐条目**命中直接用（#24 ④：不做持续学习 —— 同机器耗时不怎么变）。
+  //   ⭐ M8-b 实测修正：原来是「全命中才用，缺一个就全部重测」—— 但校准失败的 probe
+  //   （如沙箱里 reg 被拦）永远进不了缓存 → **每次启动都全量重测**。改为：命中的用缓存，
+  //   只实测缺失的条目。
   if (existsSync(path)) {
     try {
       const cached = JSON.parse(readFileSync(path, 'utf8')) as CalibFileShape;
       if (cached.signature === signature && cached.probes !== null && typeof cached.probes === 'object') {
+        const missing: string[] = [];
         for (const probe of probes) {
           const hit = cached.probes[probe.id];
           if (typeof hit?.medianMs === 'number' && Number.isFinite(hit.medianMs) && hit.medianMs >= 0) {
@@ -181,15 +185,17 @@ export async function calibrateProbes(
               minIntervalMs: Math.max(Math.round(hit.medianMs * MIN_INTERVAL_FACTOR), MIN_INTERVAL_FLOOR),
               fromCache: true,
             });
+          } else {
+            missing.push(probe.id);
           }
         }
-        if (result.size === probes.length) {
+        if (missing.length === 0) {
           log.info(
             `采集校准：命中缓存（${CALIBRATION_FILE}，签名一致）—— ${probes.map((p) => `${p.id} ${result.get(p.id)!.medianMs.toFixed(1)}ms`).join(' / ')}；删该文件可强制重新校准`,
           );
           return result;
         }
-        log.warn(`采集校准：缓存缺条目（${probes.length - result.size} 个）—— 全部重新实测`);
+        log.info(`采集校准：缓存命中 ${result.size} 个，缺 ${missing.length} 个（${missing.join(', ')}）—— 只实测缺失项`);
       } else {
         log.info(`采集校准：probe 集合变了（缓存签名 ${cached.signature} ≠ 现算 ${signature}）—— 重新实测`);
       }
@@ -198,8 +204,9 @@ export async function calibrateProbes(
     }
   }
 
-  // ② 现测：每个 probe 采 CALIBRATION_RUNS 次取中位数
+  // ② 现测：只测 result 里还没有的 probe（缓存命中的不重跑 —— 见 ① 的修正说明）
   for (const probe of probes) {
+    if (result.has(probe.id)) continue;
     try {
       const samples: number[] = [];
       for (let i = 0; i < CALIBRATION_RUNS; i++) samples.push(await measureOnce(probe));
@@ -226,9 +233,17 @@ export async function calibrateProbes(
   }
   try {
     writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`, 'utf8');
-    log.info(
-      `采集校准：实测 ${CALIBRATION_RUNS} 次取中位数 —— ${probes.map((p) => `${p.id} ${result.get(p.id)!.medianMs.toFixed(1)}ms → 底线 ${result.get(p.id)!.minIntervalMs}ms`).join(' / ')}（已缓存到 ${CALIBRATION_FILE}）`,
-    );
+    // fromCache 混合场景（部分命中部分重测）分组措辞，别把缓存命中的也说成「实测」
+    const measured = probes.filter((p) => result.get(p.id)!.fromCache === false && Number.isFinite(result.get(p.id)!.medianMs));
+    const cachedPart = probes.filter((p) => result.get(p.id)!.fromCache === true);
+    const fmt = (list: readonly Probe[]) =>
+      list.map((p) => `${p.id} ${result.get(p.id)!.medianMs.toFixed(1)}ms → 底线 ${result.get(p.id)!.minIntervalMs}ms`).join(' / ');
+    const parts: string[] = [];
+    if (measured.length > 0) parts.push(`实测 ${CALIBRATION_RUNS} 次取中位数 —— ${fmt(measured)}`);
+    if (cachedPart.length > 0) parts.push(`沿用缓存 —— ${fmt(cachedPart)}`);
+    const failed = probes.length - measured.length - cachedPart.length;
+    if (failed > 0) parts.push(`${failed} 个实测失败（底线按 ${MIN_INTERVAL_FLOOR}ms，不入缓存）`);
+    log.info(`采集校准：${parts.join('；')}（已缓存到 ${CALIBRATION_FILE}）`);
   } catch (err) {
     log.warn(`采集校准：缓存写不进去（${path}）—— 下次启动会重新实测`, err instanceof Error ? err.message : err);
   }

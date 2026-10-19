@@ -286,6 +286,20 @@ for (const rule of registry.rules()) {
   }
 }
 
+// 🆕 M8-b：probe 的 configure —— 下发 dataDir（需要持久化状态的 probe 由此拿路径，
+//   如哨兵的基线文件）。⚠️ 必须在**校准之前**：校准会试采 sample()，基线要就位。
+for (const probe of registry.probes()) {
+  if (typeof probe.configure !== 'function') continue;
+  try {
+    probe.configure({ dataDir, settings });
+  } catch (err) {
+    log.error(
+      `插件 ${probe.id} 接收配置时抛错（已隔离）`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
 // 通道注册进 dispatcher —— 走哪个通道由 dispatcher 按 severity 裁决，插件自己选不了
 for (const channel of registry.channels()) dispatcher.register(channel);
 

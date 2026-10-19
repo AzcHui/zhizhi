@@ -1,0 +1,15 @@
+{
+  "id": "rule-sentinel",
+  "name": "安全哨兵规则",
+  "version": "0.1.0",
+  "type": "rule",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "把 probe-sentinel 的自启项变化翻译成告警事件（新增=warn 瞬时事实，消失=info）。",
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "exec": [],
+    "sys": []
+  }
+}

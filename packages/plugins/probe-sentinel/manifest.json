@@ -1,0 +1,15 @@
+{
+  "id": "probe-sentinel",
+  "name": "安全哨兵采集",
+  "version": "0.1.0",
+  "type": "probe",
+  "sdk": "^0.1.0",
+  "entry": "./src/index.ts",
+  "description": "开机自启项（HKCU Run）基线快照与对比 —— 子进程类（cmd + reg.exe），慢 probe，依赖 M8-a 的档位与底线机制。",
+  "permissions": {
+    "fs": ["data.write"],
+    "net": [],
+    "exec": ["cmd.exe"],
+    "sys": ["registry.read"]
+  }
+}

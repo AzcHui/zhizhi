@@ -19,8 +19,13 @@ export const PLUGINS: readonly PluginSpec[] = [
   { specifier: '@zhizhi/probe-cpu', type: 'probe' },
   { specifier: '@zhizhi/probe-mem', type: 'probe' },
   { specifier: '@zhizhi/probe-disk', type: 'probe' },
+  // 安全哨兵（M8-b）：自启项基线对比 —— 子进程类慢 probe（reg ~270ms，底线机制自动兜住节奏）；
+  //   默认 normal 会被抬到底线（~5.4s 一采），一分钟内告警的验收绰绰有余；嫌勤可设 slow
+  { specifier: '@zhizhi/probe-sentinel', type: 'probe' },
   // 判断：把指标翻译成「值得说一句」的候选事件
   { specifier: '@zhizhi/rule-threshold', type: 'rule' },
+  // 安全哨兵规则（M8-b）：自启项新增 = warn 瞬时事实（出现即告，不攒持续不冷却）
+  { specifier: '@zhizhi/rule-sentinel', type: 'rule' },
   // 戳着玩（M4-b1 · 决策 #34）：外壳报事实、内核做裁决 —— 点够随机次数（3~7）才回应
   { specifier: '@zhizhi/rule-poke', type: 'rule' },
   // 闲聊（M6）：空闲够久就主动开口 —— 独立于告警（不复用阈值/闸门，决策 #18/#22）

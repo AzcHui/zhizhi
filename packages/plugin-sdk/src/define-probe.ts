@@ -11,6 +11,11 @@ export interface ProbeDefinition {
   readonly id: string;
   /** 采样一次。返回空数组 = 「这次没什么可汇报的」 */
   readonly sample: () => readonly Metric[] | Promise<readonly Metric[]>;
+  /**
+   * 🆕 M8-b：可选，接收内核下发的启动配置（含 dataDir 用户数据目录路径）——
+   * 需要持久化状态的 probe（如哨兵的基线文件）从这里拿路径。只在启动时调一次。
+   */
+  readonly configure?: (config: Readonly<Record<string, unknown>>) => void;
 }
 
 export function defineProbe(definition: ProbeDefinition): Probe {
@@ -23,5 +28,7 @@ export function defineProbe(definition: ProbeDefinition): Probe {
   return {
     id: definition.id,
     sample: definition.sample,
+    // 实现了才挂（与 defineRule 的可选能力同款纪律）
+    ...(typeof definition.configure === 'function' ? { configure: definition.configure } : {}),
   };
 }

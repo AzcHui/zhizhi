@@ -120,6 +120,9 @@ export function createGates(options: GateOptions): readonly Gate[] {
     {
       name: 'sustained',
       check: (event, ctx) => {
+        // 🆕 M8-b：瞬时事实事件（ephemeral）—— 出现即成立，没有「持续」可言。
+        //   哨兵一分钟内必须告警；攒持续时长只会把安全事件憋成马后炮。
+        if (event.ephemeral === true) return { pass: true };
         const key = sustainKey(event.type);
         const prev = store.get<SustainState>(key);
 
@@ -161,6 +164,9 @@ export function createGates(options: GateOptions): readonly Gate[] {
     {
       name: 'cooldown',
       check: (event, ctx) => {
+        // 🆕 M8-b：瞬时事实事件不冷却 —— 两个新增自启项挨着发生也该各报各的
+        //   （「15 分钟同类只报一次」是给连续状态的去抖，不是给离散事实的）。
+        if (event.ephemeral === true) return { pass: true };
         const key = cooldownKey(event.type);
         const lastAt = store.get<number>(key);
 

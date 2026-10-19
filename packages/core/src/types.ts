@@ -91,6 +91,13 @@ export interface ZhizhiEvent {
   readonly summary?: string;
   /** 已被闸门压掉的次数（M2 冷却期用） */
   readonly suppressed?: number;
+  /**
+   * 🆕 M8-b：**瞬时事实事件**（如「检测到新增开机自启项」）—— 出现即成立，不是「连续超标的
+   * 状态」。sustained（要攒持续时长）与 cooldown（同类型 15 分钟只报一次）的语义对它**不适用**
+   * （哨兵一分钟内必须告警；两个新增项挨着发生也该各报各的）。置 true 后 gates 跳过这两道，
+   * **threshold 证据校验照跑**（空口报照样拦）。不填 = 常规事件（默认走全四道）。
+   */
+  readonly ephemeral?: boolean;
 }
 
 /** 台词 —— persona 的产出。纯数据，不是代码。 */
@@ -175,6 +182,12 @@ export interface Probe {
   readonly id: string;
   /** 采样一次；返回空数组表示「这次没什么可汇报的」 */
   sample(): readonly Metric[] | Promise<readonly Metric[]>;
+  /**
+   * 🆕 M8-b：可选，接收内核下发的启动配置（对称 `Rule.configure`）。
+   * cli 会把 `dataDir`（用户数据目录路径）一并递进来 —— 需要持久化状态的 probe
+   * （如哨兵的基线文件）从这里拿路径。只在启动时下发一次；抛错被隔离。
+   */
+  configure?(config: Readonly<Record<string, unknown>>): void;
 }
 
 /**

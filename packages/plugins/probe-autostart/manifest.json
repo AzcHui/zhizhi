@@ -1,5 +1,5 @@
 {
-  "id": "probe-sentinel",
+  "id": "probe-autostart",
   "name": "安全哨兵采集",
   "version": "0.1.0",
   "type": "probe",

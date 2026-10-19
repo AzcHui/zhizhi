@@ -1,9 +1,9 @@
 {
-  "name": "@zhizhi/rule-sentinel",
+  "name": "@zhizhi/probe-autostart",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "安全哨兵规则插件（官方插件）—— 自启项变化翻译成告警事件（M8-b）",
+  "description": "安全哨兵采集插件（官方插件）—— 自启项基线对比，子进程类（M8-b）",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",

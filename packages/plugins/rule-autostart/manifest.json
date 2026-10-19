@@ -1,5 +1,5 @@
 {
-  "id": "rule-sentinel",
+  "id": "rule-autostart",
   "name": "安全哨兵规则",
   "version": "0.1.0",
   "type": "rule",

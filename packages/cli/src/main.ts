@@ -287,11 +287,12 @@ for (const rule of registry.rules()) {
 }
 
 // 🆕 M8-b：probe 的 configure —— 下发 dataDir（需要持久化状态的 probe 由此拿路径，
-//   如哨兵的基线文件）。⚠️ 必须在**校准之前**：校准会试采 sample()，基线要就位。
+//   如哨兵的基线文件）与 logger（哨兵自己的话要能上日志：「首次建立基线」「单源失效」）。
+//   ⚠️ 必须在**校准之前**：校准会试采 sample()，基线要就位。
 for (const probe of registry.probes()) {
   if (typeof probe.configure !== 'function') continue;
   try {
-    probe.configure({ dataDir, settings });
+    probe.configure({ dataDir, settings, log: (msg: string) => log.info(`[哨兵] ${msg}`) });
   } catch (err) {
     log.error(
       `插件 ${probe.id} 接收配置时抛错（已隔离）`,

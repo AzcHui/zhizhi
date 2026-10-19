@@ -45,8 +45,14 @@ public sealed class FloatWindow : Window
     private const double GyroFc = 5.2;                    // 透视焦距（相对 R）：s = Fc/(Fc+z)
     private const int GyroDepthBands = 6;                 // 深度分 6 档合并（坑 3：别逐段 stroke——三环×96 段 ≈290 段）
     // （开工单的深度映射 s∈[0.86,1.14] 已按复验观察 2 改为「各环本帧实际 s 范围归一化」—— 小半径环动态范围不再缩水）
-    private const double GyroSpeedGain = 0.50;            // ⭐ intensity 接线（复验观察 1）：情绪增益 —— 告警（intensity→1）时
-                                                          //   一切角速度（全局旋转/进动/亮点）×1.5；平静 = ×1.0（B 版基准不变）
+
+    // ══════════ intensity 接线 · 二·R 定案（2026-10-19 15:35 用户拍板）══════════
+    // 用户实测推翻 ×1.5 二档方案：「速度没有任何变化」（CPU 40~79 全在悬崖下）＋「×1 和 ×3 肉眼难辨」
+    // → 连续倍率 ×1→×5 ＋ 固定 30fps（越忙越提帧是在抢机器算力：60fps 单核 16.6% vs 30fps 8.3%）
+    private const double GyroSpeedGain = 4.0;             // 倍率上限：gain = 1 + 4·intensity → ×1.00 ~ ×5.00
+    private const int FrameFps = 30;                      // 帧率固定（废 15/60 双档 —— 单核占用稳定 ≈8%，不随负载抖）
+    private const double IntensityTauRise = 0.6;          // intensity 平滑：上升 τ（快 —— 忙起来立刻有感觉）
+    private const double IntensityTauFall = 3.0;          //   下降 τ（慢 —— 「电脑忙完还喘一会儿」的余温感；CPU 探针本身是 5s 均值）
     private const int GyroPointsPerRing = 96;             // 每环 96 点
     private const double GyroPrecessX = 0.13, GyroPrecessY = 0.17, GyroPrecessZ = 0.10;   // 进动幅度（照抄）
     // ⭐ 三环 pf 互质（0.31/0.24/0.19）→ 三环相对姿态永不重新对齐；同 pf 会同步点头 = 又变回"一个东西"
@@ -54,11 +60,7 @@ public sealed class FloatWindow : Window
     private const double HaloWidthFactor = 2.6;            // 光晕宽 = 线宽 × 2.6
     private const double HaloOpacity = 0.22;               // 光晕：同色低透明（"发光"而非"描边"，深浅壁纸都自然）
 
-    // 情绪档（速度＝情绪）：平静 0 ↔ 告警 1（静音/活跃档归第二版）；帧率分档保留 —— 帧率本身也是情绪
-    private const double IntensityBlendPerFrame = 0.1;     // 每帧向目标逼近 10%（别秒切，否则像抽风）
-    private const int CalmFps = 15, AlertFps = 60;
-    private const double AlertCpuThreshold = 80;                                     // CPU ≥ 80 → 告警档
-    private static readonly TimeSpan AlertHoldAfterSaid = TimeSpan.FromSeconds(10);  // 告警级台词后的保持期
+    private static readonly TimeSpan AlertHoldAfterSaid = TimeSpan.FromSeconds(10);  // 告警级台词后的保持期（保留 —— 内存/磁盘告警时 CPU 可能很低，但「有事发生」球该兴奋）
 
     // 颜色：线条只有一个主色 ＋ 同色光晕（不再需要渐变/色停）—— HSL 逼近管线沿用，色相 180→16 递减
     private const double ColorApproachPerFrame = 0.05;     // 每帧向目标色逼近 5%（约 0.6s 走完）
@@ -96,7 +98,10 @@ public sealed class FloatWindow : Window
     private readonly System.Diagnostics.Stopwatch _fluidClock = System.Diagnostics.Stopwatch.StartNew();
     private DispatcherTimer _fluidTimer = null!;      // 形态驱动（Interval = 当前档帧率 —— 帧率是情绪的一部分）
     private System.Windows.Media.SolidColorBrush _mainBrush = null!;  // 主色（持有**未 Freeze** 实例，每帧只改 Color）
-    private double _curIntensity, _targetIntensity;               // 情绪强度 0~1（平静→0，告警→1；平滑逼近）
+    private double _curIntensity, _targetIntensity;               // 情绪强度 0~1（连续跟随 CPU ＋ 告警保持，二·R ①）
+    private double _lastFluidT;                       // 上一帧 FluidTick 时刻（时间基平滑的 dt 基准）
+    private int _lastIntensityLevel = -1;             // 已记日志的 0.5 档序号（跨档才记，不刷屏）
+    private bool _lastAlertState;                     // 告警保持期上次状态（翻转才记日志）
     private double _curHue = HueCalm, _curSat = SatCalm, _curLum = LumCalm;   // 当前色（HSL，向目标逼近 5%/帧）
     private double? _lastCpu;                          // 最近采样 CPU —— 驱动颜色连续插值 + 档位
     private DateTime _alertHoldUntil = DateTime.MinValue;              // 告警级台词后的保持期
@@ -244,7 +249,7 @@ public sealed class FloatWindow : Window
         _idleTimer.Tick += (_, _) => FeedIdle();
         _bubbleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4.5) };
         _bubbleTimer.Tick += (_, _) => HideBubble();
-        _fluidTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000.0 / CalmFps) };
+        _fluidTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000.0 / FrameFps) };   // 二·R ③：帧率恒 30 —— 不再随负载调
         _fluidTimer.Tick += (_, _) => FluidTick();
 
         // 面板宽限收起（2026-10-17 修复）：球/面板/气泡任一 MouseLeave → 300ms 后收；
@@ -330,22 +335,45 @@ public sealed class FloatWindow : Window
 
     private static double Clamp01(double v) => Math.Min(1, Math.Max(0, v));
 
-    /// <summary>情绪档目标（平静/告警）：CPU ≥ 阈值 或 告警级台词保持期内 → 告警（intensity→1）；帧率一起切（帧率是情绪）。</summary>
+    /// <summary>情绪目标（二·R ①）：**连续跟随 CPU** —— ≤50 → 0（日常不打扰），50→95 线性爬到 1，95+ 封顶；
+    /// 告警台词保持期内**强制 1**（取 max —— 内存/磁盘告警时 CPU 可能很低，但「有事发生」球该兴奋，坑 3）。
+    /// 帧率已恒 30fps（二·R ③），不再动态调 Interval —— 越忙越提帧是在抢机器的算力。</summary>
     private void UpdateFluidTarget()
     {
-        var alert = _alertHoldUntil > DateTime.Now || (_lastCpu is { } c && c >= AlertCpuThreshold);
-        _targetIntensity = alert ? 1 : 0;
-        _fluidTimer.Interval = TimeSpan.FromMilliseconds(1000.0 / (alert ? AlertFps : CalmFps));
+        _targetIntensity = Math.Max(CpuT(_lastCpu ?? 0), _alertHoldUntil > DateTime.Now ? 1 : 0);
+        var alert = _alertHoldUntil > DateTime.Now;
+        if (alert != _lastAlertState)   // 二·R ⑤：档位此前完全不可观测 —— alert 翻转记一条
+        {
+            _lastAlertState = alert;
+            AppendLog($"[形态] 告警保持期{(alert ? "开始" : "结束")}（cpu={(_lastCpu is { } c ? $"{c:F0}%" : "--")}）");
+        }
     }
 
-    /// <summary>形态驱动（每帧）：intensity 向目标逼近 10% → 各「还看得见」的槽重建 geometry → 主色 HSL 逼近 5%（带死区）。</summary>
+    /// <summary>CPU → 强度曲线（二·R ①，照抄开工单）：≤50 → 0；50→95 线性爬到 1；95+ 封顶。</summary>
+    private static double CpuT(double cpu) => Math.Clamp((cpu - 50.0) / 45.0, 0, 1);
+
+    /// <summary>形态驱动（每帧）：intensity 按**时间基**平滑逼近（二·R ②）→ 各「还看得见」的槽重建 geometry → 主色 HSL 逼近 5%（带死区）。</summary>
     private void FluidTick()
     {
-        _curIntensity += (_targetIntensity - _curIntensity) * IntensityBlendPerFrame;
         var t = _fluidClock.Elapsed.TotalSeconds;
+        // ⭐ 平滑改时间基（二·R ②）：「每帧 10%」与 dt 脱钩，帧率一变行为就变 —— 用 1−exp(−dt/τ)。
+        //   上升 τ=0.6s（忙起来立刻有感觉）、下降 τ=3s（「电脑忙完还喘一会儿」的余温，不许"啪"一下停）。
+        var dt = Math.Clamp(t - _lastFluidT, 0, 0.1);
+        _lastFluidT = t;
+        var tau = _targetIntensity > _curIntensity ? IntensityTauRise : IntensityTauFall;
+        _curIntensity += (_targetIntensity - _curIntensity) * (1 - Math.Exp(-dt / tau));
+
+        // 二·R ⑤：intensity 跨 0.5 档记一条（可观测 —— 这次"速度没变"就是靠读源码才推断出来的）
+        var cpuText = _lastCpu is { } c ? $"{c:F0}%" : "--";
+        var level = (int)Math.Floor(_curIntensity * 2);
+        if (level != _lastIntensityLevel)
+        {
+            _lastIntensityLevel = level;
+            AppendLog($"[形态] cpu={cpuText} intensity={_curIntensity:F2} gain=×{1 + GyroSpeedGain * _curIntensity:F2}");
+        }
 
         // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减），带死区 t = clamp01((cpu−40)/50)；无数据 = 灰
-        var ct = _lastCpu is { } c ? Clamp01((c - ColorDeadZoneLow) / ColorDeadZoneSpan) : double.NaN;
+        var ct = _lastCpu is { } cv ? Clamp01((cv - ColorDeadZoneLow) / ColorDeadZoneSpan) : double.NaN;
         var tgtH = double.IsNaN(ct) ? _curHue : HueCalm + (HueAlert - HueCalm) * ct;
         var tgtS = double.IsNaN(ct) ? 0 : SatCalm + (SatAlert - SatCalm) * ct;
         var tgtL = double.IsNaN(ct) ? GrayLum : LumCalm + (LumAlert - LumCalm) * ct;
@@ -402,11 +430,12 @@ public sealed class FloatWindow : Window
     {
         public string Id => "gyro";
 
-        // ── intensity 接线（复验观察 1）—— 累积相位，绝不用 t·f(intensity) ──
+        // ── intensity 接线（二·R 定案 ×1→×5 连续倍率）—— 累积相位，绝不用 t·f(intensity) ──
         //   t·f(intensity) 在 intensity 变化时会重参数化整个时间轴（sin 的参数瞬间跳）；
-        //   累积相位 φ += ω·(1+gain·intensity)·dt 随 intensity 平滑变化连续推进，无跳变。
-        //   dt 取 Build 间真实间隔：淡出/隐藏期间不调 Build → 相位暂停，回来时无跳变
-        //   （等于进动歇了一会儿，与"颜色/位置都停着"一致）。
+        //   累积相位 φ += ω·gain·dt 随 intensity 平滑变化连续推进，无跳变。
+        //   ⚠️ dt 必须夹紧上限（二·R ④）：隐藏球时 _fluidTimer 停但 _fluidClock 继续走 ——
+        //   不夹紧则显示回来时一次性补上全部空档（隐藏 30s → 相位跳 292°；10min → 跳 16 圈）；
+        //   夹紧 0.1s → 相位最多前进 0.1s 的量 = 无瞬移（验收⑥）。
         private double _lastT;
         private double _vyPhase;                                // 全局 rotY 累积相位
         private readonly double[] _procPhase = new double[3];   // 每环进动累积相位（sin(ph·c + pp) 的 c 是开工单的 1/0.80/1.30）
@@ -415,9 +444,9 @@ public sealed class FloatWindow : Window
 
         public BallLayer[] Build(double t, double intensity)
         {
-            var dt = Math.Max(0, t - _lastT);   // 首帧 / 同帧二调（交叉淡入期间双槽各调一次）= 0，不推进
+            var dt = Math.Clamp(t - _lastT, 0, 0.1);   // ⭐ 夹紧上限（二·R ④）—— 首帧/同帧二调/长期暂停都最多补 0.1s
             _lastT = t;
-            var gain = 1 + GyroSpeedGain * intensity;   // 情绪增益：告警 ×1.5，平静 ×1.0
+            var gain = 1 + GyroSpeedGain * intensity;   // 情绪增益（二·R）：×1.00 ~ ×5.00 连续
             _vyPhase += GyroVySpeed * gain * dt;
             var vy = _vyPhase;
             var layers = new List<BallLayer>();

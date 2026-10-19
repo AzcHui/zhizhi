@@ -43,9 +43,8 @@ public sealed class FloatWindow : Window
     private const double GyroRotX = -0.22;                // 全局视角俯仰（固定）
     private const double GyroVySpeed = 0.17;              // 全局 rotY 速度（B 版定案；≈37s 一圈）—— 环的可见运动全靠这个
     private const double GyroFc = 5.2;                    // 透视焦距（相对 R）：s = Fc/(Fc+z)
-    private const double GyroDepthLo = 0.86;              // 深度映射：dz = clamp01((s − 0.86) / 0.34)
-    private const double GyroDepthSpan = 0.34;
     private const int GyroDepthBands = 6;                 // 深度分 6 档合并（坑 3：别逐段 stroke——三环×96 段 ≈290 段）
+    // （开工单的深度映射 s∈[0.86,1.14] 已按复验观察 2 改为「各环本帧实际 s 范围归一化」—— 小半径环动态范围不再缩水）
     private const int GyroPointsPerRing = 96;             // 每环 96 点
     private const double GyroPrecessX = 0.13, GyroPrecessY = 0.17, GyroPrecessZ = 0.10;   // 进动幅度（照抄）
     // ⭐ 三环 pf 互质（0.31/0.24/0.19）→ 三环相对姿态永不重新对齐；同 pf 会同步点头 = 又变回"一个东西"
@@ -414,11 +413,24 @@ public sealed class FloatWindow : Window
 
                 // 环上取点（⛔ a 不加时间）→ 投影 → 按深度分档
                 var pts = new Point[GyroPointsPerRing + 1];   // +1 = 回到起点（闭合段也参与分档连线）
-                var bands = new List<int>[GyroDepthBands];
+                var ss = new double[GyroPointsPerRing + 1];
                 for (var i = 0; i <= GyroPointsPerRing; i++)
                 {
                     var a = 2 * Math.PI * i / GyroPointsPerRing;
-                    pts[i] = Project(ring.Radius * Math.Cos(a), ring.Radius * Math.Sin(a), 0, tx, ty, tz, vy, out var dz);
+                    pts[i] = Project(ring.Radius * Math.Cos(a), ring.Radius * Math.Sin(a), 0, tx, ty, tz, vy, out var s);
+                    ss[i] = s;
+                }
+
+                // ⭐ 复验观察 2 修复（监工 2026-10-19 14:30）：深度改按**各环本帧实际 s 范围**归一化 ——
+                //   原全局固定 s∈[0.86,1.14] 下，小半径环的 s 范围天然窄（环③ dz 只有 [0.17,0.70]），
+                //   alpha 动态范围掉到 2.5 倍（环① 是 6.3 倍）→ 最里面的环看着偏虚。
+                //   归一化后三环都吃满 [0,1]：姿态连续变化 → s 范围连续变化 → 深度映射连续，无跳变。
+                var sMin = ss.Min();
+                var sSpan = Math.Max(1e-6, ss.Max() - sMin);
+                var bands = new List<int>[GyroDepthBands];
+                for (var i = 0; i <= GyroPointsPerRing; i++)
+                {
+                    var dz = Clamp01((ss[i] - sMin) / sSpan);
                     var band = Math.Min(GyroDepthBands - 1, (int)(dz * GyroDepthBands));
                     (bands[band] ??= new List<int>()).Add(i);
                 }
@@ -436,25 +448,26 @@ public sealed class FloatWindow : Window
 
                 // 环上亮点（每环 1 个；②③ spin 反向 —— 点在环上转是看得见的，与"环自转"两码事）
                 var ha = ring.DotHead + ring.DotSpin * t;
-                var dp = Project(ring.Radius * Math.Cos(ha), ring.Radius * Math.Sin(ha), 0, tx, ty, tz, vy, out var dDz);
+                var dp = Project(ring.Radius * Math.Cos(ha), ring.Radius * Math.Sin(ha), 0, tx, ty, tz, vy, out var dotS);
+                var dotDz = Clamp01((dotS - sMin) / sSpan);   // 亮点深度跟本环归一化口径
                 layers.Add(new BallLayer(
                     BuildDotGeometry(dp),                             // 零长度线段＋圆头笔帽 = 点（坑 2，不用改类型）
-                    ring.Width * (0.45 + 0.65 * dDz),
-                    1.0));                                            // "亮点"字面义 = 全亮（参数表没给点样式）
+                    ring.Width * (0.45 + 0.65 * dotDz),
+                    1.0));                                            // "亮点"字面义 = 全亮（参数表没给点样式；复验观察 3 维持不分深度）
             }
             return layers.ToArray();
         }
 
-        /// <summary>环上一点 → 屏幕坐标：环倾角（X→Y→Z）→ 全局视角（rotX 固定 ＋ rotY(t)）→ 透视。</summary>
-        private static Point Project(double x, double y, double z, double tx, double ty, double tz, double vy, out double dz)
+        /// <summary>环上一点 → 屏幕坐标：环倾角（X→Y→Z）→ 全局视角（rotX 固定 ＋ rotY(t)）→ 透视。
+        /// 输出透视系数 s（深度归一化由调用方按各环本帧实际范围做 —— 复验观察 2）。</summary>
+        private static Point Project(double x, double y, double z, double tx, double ty, double tz, double vy, out double s)
         {
             RotX(ref x, ref y, ref z, tx);
             RotY(ref x, ref y, ref z, ty);
             RotZ(ref x, ref y, ref z, tz);
             RotX(ref x, ref y, ref z, GyroRotX);
             RotY(ref x, ref y, ref z, vy);
-            var s = GyroFc / (GyroFc + z);
-            dz = Clamp01((s - GyroDepthLo) / GyroDepthSpan);
+            s = GyroFc / (GyroFc + z);
             return new Point(BallSize / 2.0 + x * GyroRadius * s, BallSize / 2.0 + y * GyroRadius * s);
         }
 

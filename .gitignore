@@ -26,7 +26,7 @@ data/
 shell/Zhizhi.Shell/bin/
 shell/Zhizhi.Shell/obj/
 shell/Zhizhi.Shell/publish/
-shell/zhi-shell.render.png
+shell/zhi-shell.render*.png
 shell/zhi-shell.log
 
 .env

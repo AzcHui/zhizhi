@@ -45,6 +45,8 @@ public sealed class FloatWindow : Window
     private const double GyroFc = 5.2;                    // 透视焦距（相对 R）：s = Fc/(Fc+z)
     private const int GyroDepthBands = 6;                 // 深度分 6 档合并（坑 3：别逐段 stroke——三环×96 段 ≈290 段）
     // （开工单的深度映射 s∈[0.86,1.14] 已按复验观察 2 改为「各环本帧实际 s 范围归一化」—— 小半径环动态范围不再缩水）
+    private const double GyroSpeedGain = 0.50;            // ⭐ intensity 接线（复验观察 1）：情绪增益 —— 告警（intensity→1）时
+                                                          //   一切角速度（全局旋转/进动/亮点）×1.5；平静 = ×1.0（B 版基准不变）
     private const int GyroPointsPerRing = 96;             // 每环 96 点
     private const double GyroPrecessX = 0.13, GyroPrecessY = 0.17, GyroPrecessZ = 0.10;   // 进动幅度（照抄）
     // ⭐ 三环 pf 互质（0.31/0.24/0.19）→ 三环相对姿态永不重新对齐；同 pf 会同步点头 = 又变回"一个东西"
@@ -400,20 +402,38 @@ public sealed class FloatWindow : Window
     {
         public string Id => "gyro";
 
+        // ── intensity 接线（复验观察 1）—— 累积相位，绝不用 t·f(intensity) ──
+        //   t·f(intensity) 在 intensity 变化时会重参数化整个时间轴（sin 的参数瞬间跳）；
+        //   累积相位 φ += ω·(1+gain·intensity)·dt 随 intensity 平滑变化连续推进，无跳变。
+        //   dt 取 Build 间真实间隔：淡出/隐藏期间不调 Build → 相位暂停，回来时无跳变
+        //   （等于进动歇了一会儿，与"颜色/位置都停着"一致）。
+        private double _lastT;
+        private double _vyPhase;                                // 全局 rotY 累积相位
+        private readonly double[] _procPhase = new double[3];   // 每环进动累积相位（sin(ph·c + pp) 的 c 是开工单的 1/0.80/1.30）
+        private readonly double[] _dotPhase = new double[3];    // 每环亮点累积相位
+        private readonly double[] _sBuf = new double[GyroPointsPerRing + 1];   // 深度归一化缓冲（字段复用——监工 14:50 观察：每帧 new ≈140KB/s GC 压力）
+
         public BallLayer[] Build(double t, double intensity)
         {
-            var vy = t * GyroVySpeed;   // 全局 rotY（三环共用同一 vy —— 差异只由倾角产生）
+            var dt = Math.Max(0, t - _lastT);   // 首帧 / 同帧二调（交叉淡入期间双槽各调一次）= 0，不推进
+            _lastT = t;
+            var gain = 1 + GyroSpeedGain * intensity;   // 情绪增益：告警 ×1.5，平静 ×1.0
+            _vyPhase += GyroVySpeed * gain * dt;
+            var vy = _vyPhase;
             var layers = new List<BallLayer>();
-            foreach (var ring in GyroRings)
+            for (var k = 0; k < GyroRings.Length; k++)
             {
-                // 进动：三个独立的慢漂移（顺序固定 X → Y → Z，不能换）
-                var tx = ring.Tx0 + GyroPrecessX * Math.Sin(t * ring.Pf + ring.Pp);
-                var ty = ring.Ty0 + GyroPrecessY * Math.Sin(t * ring.Pf * 0.80 + ring.Pp * 1.7);
-                var tz = ring.Tz0 + GyroPrecessZ * Math.Sin(t * ring.Pf * 1.30 + ring.Pp * 0.6);
+                var ring = GyroRings[k];
+                // 进动：三个独立的慢漂移（顺序固定 X → Y → Z，不能换）；相位累积 → intensity 平滑加速
+                _procPhase[k] += ring.Pf * gain * dt;
+                var ph = _procPhase[k];
+                var tx = ring.Tx0 + GyroPrecessX * Math.Sin(ph + ring.Pp);
+                var ty = ring.Ty0 + GyroPrecessY * Math.Sin(ph * 0.80 + ring.Pp * 1.7);
+                var tz = ring.Tz0 + GyroPrecessZ * Math.Sin(ph * 1.30 + ring.Pp * 0.6);
 
                 // 环上取点（⛔ a 不加时间）→ 投影 → 按深度分档
                 var pts = new Point[GyroPointsPerRing + 1];   // +1 = 回到起点（闭合段也参与分档连线）
-                var ss = new double[GyroPointsPerRing + 1];
+                var ss = _sBuf;                               // 复用缓冲（零分配）
                 for (var i = 0; i <= GyroPointsPerRing; i++)
                 {
                     var a = 2 * Math.PI * i / GyroPointsPerRing;
@@ -447,7 +467,8 @@ public sealed class FloatWindow : Window
                 }
 
                 // 环上亮点（每环 1 个；②③ spin 反向 —— 点在环上转是看得见的，与"环自转"两码事）
-                var ha = ring.DotHead + ring.DotSpin * t;
+                _dotPhase[k] += ring.DotSpin * gain * dt;   // 亮点速度同样吃情绪增益（②③反向不变）
+                var ha = ring.DotHead + _dotPhase[k];
                 var dp = Project(ring.Radius * Math.Cos(ha), ring.Radius * Math.Sin(ha), 0, tx, ty, tz, vy, out var dotS);
                 var dotDz = Clamp01((dotS - sMin) / sSpan);   // 亮点深度跟本环归一化口径
                 layers.Add(new BallLayer(

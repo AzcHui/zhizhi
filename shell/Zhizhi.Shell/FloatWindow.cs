@@ -52,7 +52,9 @@ public sealed class FloatWindow : Window
     private const double GyroSpeedGain = 4.0;             // 倍率上限：gain = 1 + 4·intensity → ×1.00 ~ ×5.00
     private const int FrameFps = 30;                      // 帧率固定（废 15/60 双档 —— 单核占用稳定 ≈8%，不随负载抖）
     private const double IntensityTauRise = 0.6;          // intensity 平滑：上升 τ（快 —— 忙起来立刻有感觉）
-    private const double IntensityTauFall = 3.0;          //   下降 τ（慢 —— 「电脑忙完还喘一会儿」的余温感；CPU 探针本身是 5s 均值）
+    private const double IntensityTauFall = 3.0;          //   下降 τ（慢 —— 「电脑忙完还喘一会儿」的余温感）。⭐ 兼任**抗抖动的唯一防线**：
+                                                          //   内核 CPU 采样是 300ms 一采（监工 16:00 重大更正：非 5s 均值），窗口噪声极大
+                                                          //   （现场实测相邻采样 83→65→84→32→85 一跳 50pp）—— 全靠 τ 低通吃掉，τ 调小 = 放大抽搐
     private const int GyroPointsPerRing = 96;             // 每环 96 点
     private const double GyroPrecessX = 0.13, GyroPrecessY = 0.17, GyroPrecessZ = 0.10;   // 进动幅度（照抄）
     // ⭐ 三环 pf 互质（0.31/0.24/0.19）→ 三环相对姿态永不重新对齐；同 pf 会同步点头 = 又变回"一个东西"
@@ -110,8 +112,8 @@ public sealed class FloatWindow : Window
     // ── 形态注册表 ＋ 双槽交叉淡入（开工单④⑤）──
     private readonly IBallForm[] _forms = { new GyroForm(), new DebugRingForm() };
     private readonly System.Windows.Controls.Canvas?[] _slotHosts = new System.Windows.Controls.Canvas?[2];  // 每槽一个容器 —— 交叉淡入淡容器，槽内线的粗细浓淡是各 Path 自己的基值
-    private readonly System.Windows.Shapes.Path?[][] _slotStrokes = new System.Windows.Shapes.Path?[2][];
-    private readonly System.Windows.Shapes.Path?[][] _slotHalos = new System.Windows.Shapes.Path?[2][];
+    private readonly System.Windows.Shapes.Path[]?[] _slotStrokes = new System.Windows.Shapes.Path[2][];  // 外层槽可整体置 null（停更）；内层元素建槽后全非 null
+    private readonly System.Windows.Shapes.Path[]?[] _slotHalos = new System.Windows.Shapes.Path[2][];
     private readonly IBallForm?[] _slotForm = new IBallForm?[2];   // 各槽当前挂的形态（null = 空槽不更新）
     private int _frontSlot;        // 正在展示的槽位
     private bool _fading;          // 交叉淡入进行中（切换防重入）
@@ -350,7 +352,8 @@ public sealed class FloatWindow : Window
         }
 
         // 监工复验观察 A（彻底做法）：跨档日志只记"当前值"的瞬间穿越，真实轨迹（0↔0.78 摆动）看不到 ——
-        //   再记一条"目标值"（本方法每次 CPU 采样都调 = 每秒；节流 5 秒一条防刷屏），轨迹就完整了。
+        //   再记一条"目标值"（本方法每次 CPU 采样都调 —— 内核 **300ms 一采**（监工 16:00 重大更正：非 5s/1s）；
+        //   节流 5 秒一条防刷屏），轨迹就完整了。
         if ((DateTime.Now - _lastTargetLog).TotalSeconds >= 5)
         {
             _lastTargetLog = DateTime.Now;
@@ -405,10 +408,12 @@ public sealed class FloatWindow : Window
                 PopulateSlot(slot, layers);
                 continue;
             }
+            var strokes = _slotStrokes[slot]!;   // 守卫后非 null —— 局部变量消 CS8602
+            var halos = _slotHalos[slot]!;
             for (var i = 0; i < layers.Length; i++)
             {
-                _slotStrokes[slot][i].Data = layers[i].Geo;
-                _slotHalos[slot][i].Data = layers[i].Geo;
+                strokes[i].Data = layers[i].Geo;
+                halos[i].Data = layers[i].Geo;
             }
         }
     }
@@ -632,8 +637,8 @@ public sealed class FloatWindow : Window
     {
         var host = _slotHosts[slot]!;
         host.Children.Clear();
-        _slotStrokes[slot] = new System.Windows.Shapes.Path[layers.Length];
-        _slotHalos[slot] = new System.Windows.Shapes.Path[layers.Length];
+        var strokes = new System.Windows.Shapes.Path[layers.Length];   // 局部建满再挂 —— 消 CS8602
+        var halos = new System.Windows.Shapes.Path[layers.Length];
         for (var i = 0; i < layers.Length; i++)
         {
             var layer = layers[i];
@@ -653,11 +658,13 @@ public sealed class FloatWindow : Window
                 StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
                 Opacity = layer.Alpha,
             };
-            _slotHalos[slot][i] = halo;
-            _slotStrokes[slot][i] = stroke;
+            halos[i] = halo;
+            strokes[i] = stroke;
             host.Children.Add(halo);
             host.Children.Add(stroke);
         }
+        _slotStrokes[slot] = strokes;
+        _slotHalos[slot] = halos;
     }
 
     /// <summary>切形态（交叉淡入，开工单⑤）：新形态载入背槽 → 300ms 淡入淡出 → 交换槽位、旧槽停更。

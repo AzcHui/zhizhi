@@ -74,6 +74,12 @@ export interface ZhizhiEvent {
   readonly kind?: EventKind;
   /** 触发它的指标快照（用于归因与展示；chitchat 没有指标证据，为空数组） */
   readonly metrics: readonly Metric[];
+  /**
+   * 🆕 M8-a：来源 probe 的 id（如 `probe-cpu`）—— 由产事件的 rule 填。
+   * gates 的持续判定据此查「该事件的采样周期」（per-probe 调度后各 probe 间隔不同，
+   * 统一 intervalMs 的口径已不存在）。闲聊类事件没有来源，可不填。
+   */
+  readonly sourceProbe?: string;
   /** 首次触发时刻（epoch ms） */
   readonly ts: number;
   /**
@@ -192,6 +198,12 @@ export interface Rule {
    * 配置只在启动时下发一次；实现里的抛错同样会被隔离。
    */
   configure?(config: Readonly<Record<string, unknown>>): void;
+  /**
+   * 🆕 M8-a：本规则关心的**指标 key 列表**（如 `['cpu.usage', 'mem.usage']`）。
+   * 可选 —— 启动报告据此计算「关掉某 probe 后哪些告警失效」（验收①：不静默失效）。
+   * 不填 = 内核无法推断依赖，probe 被关时只按指标前缀约定（probe-x → `x.`）提示。
+   */
+  readonly watches?: readonly string[];
 }
 
 /** persona（台词包）：事件 + 情境 → 台词 */

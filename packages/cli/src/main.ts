@@ -27,7 +27,6 @@ import {
   Dispatcher,
   Memory,
   Registry,
-  Scheduler,
   Store,
   composeLine,
   createGates,
@@ -37,6 +36,14 @@ import {
 } from '@zhizhi/core';
 import type { ContextInput, Metric, MetricBatch, ZhizhiEvent } from '@zhizhi/core';
 import { definePersonaFromJson } from '@zhizhi/plugin-sdk';
+import {
+  calibrateProbes,
+  parseProbePlan,
+  reportCollectionPlan,
+  resolveEffectiveIntervals,
+  startProbeLoop,
+} from './collect.ts';
+import type { EffectiveEntry, ProbePlan } from './collect.ts';
 
 import { loadPlugins } from './loader.ts';
 import { PLUGINS } from './plugins.ts';
@@ -136,12 +143,19 @@ function loadSettings(): Record<string, unknown> {
     log.warn(`设置文件不合规：${path} —— 顶层必须是 JSON 对象。整份忽略，全用默认。`);
     return {};
   }
+  // 🆕 M8-a：probes 是嵌套对象（{ "<probeId>": "off|slow|normal|fast" }）—— 整段放行，
+  //   档位合法性由 collect.ts 的 parseProbePlan 逐键校验（那边有 probe 清单可对照）
+  const OBJECT_KEYS: readonly string[] = ['probes'];
   // 字符串枚举键（M6-b：话量档）—— 只收白名单里的值，别的当没写（不猜）
   const STRING_ENUM_KEYS: Record<string, readonly string[]> = {
     chitchatVolume: ['low', 'normal', 'high'],
   };
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (OBJECT_KEYS.includes(key)) {
+      out[key] = value;   // 形状对不对交给专门解析器；这里只管别把它当垃圾丢掉
+      continue;
+    }
     const allowed = STRING_ENUM_KEYS[key];
     if (allowed !== undefined) {
       if (typeof value === 'string' && allowed.includes(value)) {
@@ -234,9 +248,16 @@ const dispatcher = new Dispatcher(log.child('dispatcher'));
 const registry = new Registry();
 
 // 四道闸门（内核宪法）：持续判定与冷却期的状态全记在 store 里，插件读不到也绕不过。
-// ⚠️ 必须把 intervalMs 交给它 —— 持续判定靠「两次见到相隔多久」推断「中间恢复没有」，
-//    不知道采样节奏就分辨不出「还在超标」和「早就恢复了」（会误报）。
-const gates = createGates({ store, intervalMs, sustainMs, cooldownMs });
+// ⚠️ 持续判定靠「两次见到相隔多久」推断「中间恢复没有」—— 不知道采样节奏就会误报。
+// 🆕 M8-a：per-probe 调度后「统一采样间隔」不存在了 —— intervalOf 按事件来源 probe 查
+//    它的实际生效间隔（gates 内部 ×2 容忍 1 个采样缺口）；查不到回落 --interval。
+const gates = createGates({
+  store,
+  intervalMs,
+  sustainMs,
+  cooldownMs,
+  intervalOf: (probeId) => probeEffective.get(probeId ?? '')?.effectiveMs ?? intervalMs,
+});
 
 // ────────────────────── 加载插件：清单驱动 + 如实记账 ──────────────────────
 // 加载动作在这里（而不是 core）执行 —— 原因见 loader.ts 顶部注释（Node 的解析基准是物理位置）
@@ -280,8 +301,15 @@ for (const channel of registry.channels()) dispatcher.register(channel);
 // 台词包从**账本**里取（见下方 composeLine 调用处）—— 与 probe / rule / channel 走同一条加载路径。
 // ⚠️ M5 硬约束：这里**不许** import 任何写死的内置台词包，否则「可整体替换」就是假的。
 //   一个台词包都没有时，composeLine 会自动降级成事件的客观描述（不崩、不哑）。
-let tickBatches: MetricBatch[] = [];
 const passedEvents: ZhizhiEvent[] = [];
+
+// ── M8-a：采集计划状态（gates 的 intervalOf 闭包要引用，先声明后填充）──
+let probePlan: ProbePlan = new Map();
+let probeEffective: ReadonlyMap<string, EffectiveEntry> = new Map();
+/** 最近一次各 probe 的采样快照（心跳报告行的 probes 字段 —— 外壳解析格式不变） */
+const latestProbes = new Map<string, readonly Metric[]>();
+/** 最近一次各 probe 的采样耗时（报告行 elapsedMs = 其中最大值） */
+const lastSampleElapsed = new Map<string, number>();
 
 /** 把一个 batch 交给全部规则去「发现」；单条规则抛错被隔离，其余继续 */
 function dispatchToRules(batch: MetricBatch): void {
@@ -301,8 +329,8 @@ function dispatchToRules(batch: MetricBatch): void {
 }
 
 bus.on<MetricBatch>('metric', (batch) => {
-  // ① 汇总起来，给本 tick 的 stdout 报告用
-  tickBatches.push(batch);
+  // ① 记进最近快照 —— 心跳报告行用（外壳解析格式不变：probes[probeId] = metrics[]）
+  latestProbes.set(batch.probeId, batch.metrics);
 
   // ② 交给规则去「发现」
   dispatchToRules(batch);
@@ -447,83 +475,30 @@ if (typeof (process.stdin as { unref?: unknown }).unref === 'function') {
 // 把初始上下文（含 --idle-ms 的固定值）也发一遍 —— 别让规则等到第一行 stdin 才见到它
 deliverContext(context);
 
-// ─────────────────────────────── 采样编排 ───────────────────────────────
-// 编排逻辑仍留在 cli：它是「内核进程的入口」，M4 的 app 连的是这个进程而不是重跑一份。
-
-async function sampleAll(): Promise<Record<string, readonly Metric[]>> {
-  tickBatches = [];
-
-  for (const probe of registry.probes()) {
-    try {
-      const metrics = await probe.sample();
-      // 广播出去 —— 谁想用谁自己订阅（铁律①：插件之间只能走总线）
-      bus.emit<MetricBatch>('metric', { probeId: probe.id, metrics });
-    } catch (err) {
-      // 一个插件采样炸了，不许影响其他插件，更不许带崩内核
-      log.error(
-        `插件 ${probe.id} 采样失败（已隔离，其余插件继续）`,
-        err instanceof Error ? err.message : err,
-      );
-    }
-  }
-
-  return Object.fromEntries(tickBatches.map((b) => [b.probeId, b.metrics]));
-}
-
-// ─────────────────────────────── 主循环 ───────────────────────────────
+// ──────────────────── 采样编排（M8-a · 决策 #24）：per-probe 独立调度 ────────────────────
+// 采集逻辑住在 collect.ts；这里只做装配：计划 → 校准 → 生效间隔 → 报告 → 起循环。
+// 编排仍留在 cli：它是「内核进程的入口」，M4 的 app 连的是这个进程而不是重跑一份。
 
 let shuttingDown = false;
+const probeLoops: { stop(): void }[] = [];
+let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
 
 function shutdown(code: number): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  scheduler.stop();
+  for (const loop of probeLoops) loop.stop();
+  if (heartbeatTimer !== undefined) clearTimeout(heartbeatTimer);
   log.info('只只下班了。');
   // 只设 exitCode 不强制 exit —— 让 stdout 先把最后一行数据冲干净
   process.exitCode = code;
 }
-
-const scheduler = new Scheduler(
-  intervalMs,
-  async (tick, now): Promise<void> => {
-    const started = performance.now();
-    const probes = await sampleAll();
-
-    // 决策 #24-⑥ 的**最小解耦**：一个 probe 都没有（没装 / 全挂）也要给规则一次心跳 ——
-    // 闲聊是**时间驱动**的，不需要任何指标；「只想让它陪聊、不想监控」正是关 probe 最自然的
-    // 动机，闲聊不该陪葬。空 batch 对 rule-threshold 无害（没有指标就无命中）。
-    // （完整的「事件评估与采集解耦」——按 probe 独立调度等 —— 仍归 M8-a。）
-    if (tickBatches.length === 0) {
-      dispatchToRules({ probeId: '(no-probe)', metrics: [] });
-    }
-
-    const elapsedMs = Number((performance.now() - started).toFixed(1));
-
-    // M7：每天不互动 -2 —— 跨天后的第一个 tick 结账（没互动的日子这里就是唯一的触碰点）
-    memory.decayIfNewDay();
-
-    const report = {
-      tick,
-      ts: new Date(now).toISOString(),
-      elapsedMs,
-      probes,
-      trust: memory.trust, // M7：外壳据此在状态区显示亲密度档位
-    };
-
-    // ⭐ stdout 只有数据，没有别的 —— M0 的验收标准，M1 继续守
-    process.stdout.write(`${JSON.stringify(report)}\n`);
-
-    if (tick >= maxTicks) shutdown(0);
-  },
-  log.child('scheduler'),
-);
 
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 
 // ─────────────────────────────── 上线报告 ───────────────────────────────
 
-log.info(`只只已上线 —— 每 ${intervalMs} ms 采一次`);
+log.info(`只只已上线 —— 报告节奏 ${intervalMs} ms 一行（stdout）；采集节奏由 settings.probes 档位决定`);
 log.info(
   `插件在岗 ${registry.activeCount} / ${PLUGINS.length}：${registry.activeIds().join(', ') || '（无）'}`,
 );
@@ -578,14 +553,70 @@ log.info(
 log.info(
   `闸门参数：sustain=${sustainMs}ms（持续判定）· cooldown=${cooldownMs}ms（冷却期）· baseline=占位（M8-a 填：需指标样本历史）`,
 );
-if (intervalMs >= sustainMs) {
-  // 持续判定靠「两次见到它相隔多久」推断中间有没有恢复；
-  // 采样比窗口还慢的话，两个样本之间的距离就足以判定「持续够久」，持续判定名存实亡。
-  log.warn(
-    `采样间隔（${intervalMs}ms）没有明显小于持续判定窗口（${sustainMs}ms）——` +
-      `持续判定会失去意义。请把 --interval 调小，或把 --sustain-ms 调大。`,
-  );
-}
 if (Number.isFinite(maxTicks)) log.info(`验收模式：跑满 ${maxTicks} 轮就退出。`);
 
-scheduler.start();
+// ── M8-a：采集计划 → 校准 → 生效间隔 → 报告（验收①②③全在这条链上）──
+probePlan = parseProbePlan(settings, registry.probes().map((p) => p.id), log);
+const calibration = await calibrateProbes(registry.probes(), dataDir, log.child('calibrate'));
+probeEffective = resolveEffectiveIntervals(probePlan, calibration, log.child('plan'));
+reportCollectionPlan(probePlan, probeEffective, calibration, registry.rules(), log.child('plan'));
+
+// 采样间隔明显大于持续判定窗口 = 「持续」名存实亡（per-probe 版：拿最大生效间隔查）
+const maxEffectiveMs = Math.max(0, ...[...probeEffective.values()].map((e) => e.effectiveMs));
+if (maxEffectiveMs >= sustainMs) {
+  log.warn(
+    `最慢的采样间隔（${maxEffectiveMs}ms）没有明显小于持续判定窗口（${sustainMs}ms）——` +
+      `持续判定会失去意义。请把该 probe 的档位调快，或把 --sustain-ms 调大。`,
+  );
+}
+
+// ── 起循环：每 probe 一条自调度链 + 一条独立规则心跳 ──
+
+for (const probe of registry.probes()) {
+  const effective = probeEffective.get(probe.id)?.effectiveMs ?? 0;
+  if (effective <= 0) continue;   // off：不调度（失效告警已在报告里列明 —— 验收①不静默）
+  probeLoops.push(
+    startProbeLoop(
+      probe,
+      effective,
+      (batch, elapsedMs) => {
+        lastSampleElapsed.set(batch.probeId, elapsedMs);
+        // 广播出去 —— 谁想用谁自己订阅（铁律①：插件之间只能走总线）
+        bus.emit<MetricBatch>('metric', batch);
+      },
+      log.child(`probe:${probe.id}`),
+    ),
+  );
+}
+
+// 规则心跳（验收④ 🔴：闲聊是时间驱动的，绝不能挂在 probe 采样上 ——
+// 全部 probe off 时它照样跳，闲聊照说。「只想让它陪聊、不想监控」正是关 probe 最自然的动机）。
+// 空 batch 对 rule-threshold 无害（没有指标就无命中）；对 rule-chitchat 是它的时间脉冲。
+// ⚠️ 不走 bus —— 'metric' 的语义是「采到了数据」，心跳不是数据；直接交给规则评估。
+let heartbeatTick = 0;
+const runHeartbeat = (): void => {
+  if (shuttingDown) return;
+  heartbeatTick += 1;
+
+  // M7：每天不互动 -2 —— 跨天结账（没互动的日子这里是唯一的触碰点）
+  memory.decayIfNewDay();
+
+  dispatchToRules({ probeId: '(heartbeat)', metrics: [] });
+
+  const report = {
+    tick: heartbeatTick,
+    ts: new Date().toISOString(),
+    // 各 probe 最近一次采样的最大耗时（验收③：开销可见；心跳自身近乎零开销不掺进去）
+    elapsedMs: Number(Math.max(0, ...lastSampleElapsed.values()).toFixed(1)),
+    // 最近快照 —— 外壳解析格式与统一 tick 时代完全一致（probes[probeId] = metrics[]）
+    probes: Object.fromEntries(latestProbes),
+    trust: memory.trust, // M7：外壳据此在状态区显示亲密度档位
+  };
+
+  // ⭐ stdout 只有数据，没有别的 —— M0 的验收标准，M1 继续守
+  process.stdout.write(`${JSON.stringify(report)}\n`);
+
+  if (heartbeatTick >= maxTicks) shutdown(0);
+  if (!shuttingDown) heartbeatTimer = setTimeout(runHeartbeat, intervalMs);
+};
+runHeartbeat();

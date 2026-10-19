@@ -48,6 +48,9 @@ function makeEvent(rule: Threshold, metric: Metric, probeId: string): ZhizhiEven
     type: rule.type,
     severity: rule.severity,
     metrics: [metric],
+    // 🆕 M8-a：来源 probe 结构化字段 —— gates 持续判定按它查该 probe 的实际采样周期
+    //   （per-probe 调度后统一 intervalMs 口径不存在了；summary 里的「来源 X」继续保留给人看）
+    sourceProbe: probeId,
     ts,
     // summary 是**客观描述**，不是台词 —— 人格化的说法留给 persona（M5）
     summary: `${rule.label}：${metric.key} ${reading}（阈值 ${rule.op}${rule.value}）｜来源 ${probeId}`,
@@ -56,6 +59,8 @@ function makeEvent(rule: Threshold, metric: Metric, probeId: string): ZhizhiEven
 
 export default defineRule({
   id: 'rule-threshold',
+  // 🆕 M8-a：关心的指标 key —— cli 启动报告据此算「关掉某 probe 后哪些告警失效」（验收①）
+  watches: [...new Set(THRESHOLDS.map((t) => t.metric))],
 
   evaluate(batch: MetricBatch): readonly ZhizhiEvent[] {
     const best = new Map<string, { rule: Threshold; metric: Metric }>();

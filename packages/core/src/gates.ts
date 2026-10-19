@@ -60,8 +60,14 @@ export interface GateOptions {
    * 判据：两次见到同一事件，若相隔超过 `intervalMs × 2`（只容忍 1 个采样缺口），
    * 就认定中间恢复过 → 视为新一轮、重新计时。
    * 拿 `sustainMs` 当这个阈值是错的 —— 那会把「恢复期」也算进「持续」，导致误报。
+   *
+   * 🆕 M8-a：per-probe 调度后「统一采样间隔」不存在了 —— 给 `intervalOf`（按事件来源
+   * probe 查它的实际间隔）。两个都给时 `intervalOf` 优先；只给 `intervalMs` = 全局统一
+   * （旧口径，兼容简单嵌入方）。
    */
   readonly intervalMs: number;
+  /** 🆕 M8-a：按事件来源 probe 查实际采样间隔（ms）。查不到时回落 `intervalMs`。 */
+  readonly intervalOf?: (probeId: string | undefined) => number;
   /** 持续判定窗口（ms），默认 2 分钟 */
   readonly sustainMs?: number;
   /** 冷却期（ms），默认 15 分钟 */
@@ -86,13 +92,19 @@ function humanMs(ms: number): string {
 }
 
 export function createGates(options: GateOptions): readonly Gate[] {
-  const { store, intervalMs } = options;
+  const { store, intervalMs, intervalOf } = options;
   const sustainMs = options.sustainMs ?? DEFAULT_SUSTAIN_MS;
   const cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
 
   // 「还在同一次超标」的容忍上限：相隔超过它 → 中间至少缺了一个采样点 → 视为已恢复。
   // ×2 恰好容忍「漏掉 1 个采样点」，再多就不算连续了。
-  const newRoundGapMs = intervalMs * 2;
+  // 🆕 M8-a：per-probe 调度后各 probe 间隔不同 —— 优先按事件来源 probe 查它的周期。
+  const gapFor = (event: ZhizhiEvent): number => {
+    const interval = intervalOf !== undefined && event.sourceProbe !== undefined
+      ? intervalOf(event.sourceProbe)
+      : intervalMs;
+    return interval * 2;
+  };
 
   return [
     // ── ① 证据校验 ──
@@ -117,7 +129,7 @@ export function createGates(options: GateOptions): readonly Gate[] {
         // ⚠️ 这里用「相隔多久」间接推断「它恢复过」，所以阈值必须绑在**采样间隔**上：
         //    绑在 sustainMs 上（旧做法）会把恢复期也算进「持续」，造成误报 —— 已修。
         //    cli 启动时会校验 intervalMs 与 sustainMs 的关系并告警。
-        const isNewRound = prev === undefined || ctx.now - prev.lastSeenAt > newRoundGapMs;
+        const isNewRound = prev === undefined || ctx.now - prev.lastSeenAt > gapFor(event);
 
         const state: SustainState = isNewRound
           ? { firstAt: ctx.now, lastSeenAt: ctx.now }

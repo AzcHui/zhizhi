@@ -15,6 +15,8 @@ export interface RuleDefinition {
   readonly onContext?: (ctx: ContextInput) => void;
   /** 可选：接收内核下发的启动配置 —— 见 core 里 `Rule` 契约的说明 */
   readonly configure?: (config: Readonly<Record<string, unknown>>) => void;
+  /** 🆕 M8-a：本规则关心的指标 key 列表（启动报告算「关 probe → 哪些告警失效」用） */
+  readonly watches?: readonly string[];
 }
 
 export function defineRule(definition: RuleDefinition): Rule {
@@ -30,5 +32,6 @@ export function defineRule(definition: RuleDefinition): Rule {
     // 两个可选能力：实现了才挂上去（没实现 = 内核转交时直接跳过，不用 try/undefined 探测）
     ...(typeof definition.onContext === 'function' ? { onContext: definition.onContext } : {}),
     ...(typeof definition.configure === 'function' ? { configure: definition.configure } : {}),
+    ...(definition.watches !== undefined ? { watches: definition.watches } : {}),
   };
 }

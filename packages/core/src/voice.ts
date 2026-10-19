@@ -58,6 +58,11 @@ export function composeLine(
   // 在这儿绑死 —— 传给台词包的就是单纯的「这句（模板）说过没有」。
   const isStale = memory === undefined ? undefined : (key: string): boolean => memory.isStale(event.type, key);
 
+  // ⭐ 段序（2026-10-19 监工修正，原序「新鲜专属 → `*` 兜底 → 重复专属」是反的）：
+  //   新鲜专属 → 重复专属 → `"*"` 兜底 → summary。
+  //   设计意图是「说话可以旧，但不能哑」—— 有旧的专属话却去说更哑的 `*` 兜底，恰好相反；
+  //   对台词多的告警无所谓，对只有 5 句的 greeting 就掉成机器味（`（启动）我起来了。`）。
+  //   调序后 `"*"` 回归本意：**该类型压根没有专属台词**时才生效 —— 决策 #23「第一段绝不混 `*`」不变。
   for (const persona of personas) {
     try {
       const line = persona.speak(event, { isStale });
@@ -69,23 +74,23 @@ export function composeLine(
     }
   }
 
-  // 第二段：专属台词全没有 → 各层的 `"*"` 兜底键（仍只挑没说过的）
-  for (const persona of personas) {
-    try {
-      const line = persona.speak(event, { useFallback: true, isStale });
-      if (line !== undefined) return withCount(line, event.type, memory);
-    } catch (err) {
-      log.error(`台词包 ${persona.id} 挑兜底台词时抛错（已跳过，改用兜底描述）`, err);
-    }
-  }
-
-  // 第三段：全都说过 → 允许重复（说话可以旧，但不能哑）
+  // 第二段：专属全说过 → **允许重复**（旧，但不能哑）
   for (const persona of personas) {
     try {
       const line = persona.speak(event, { allowRepeat: true, isStale });
       if (line !== undefined) return withCount(line, event.type, memory);
     } catch (err) {
       log.error(`台词包 ${persona.id} 复挑台词时抛错（已跳过，改用兜底描述）`, err);
+    }
+  }
+
+  // 第三段：该类型**压根没有**专属台词（pool 都不存在）→ 各层的 `"*"` 兜底键
+  for (const persona of personas) {
+    try {
+      const line = persona.speak(event, { useFallback: true, isStale });
+      if (line !== undefined) return withCount(line, event.type, memory);
+    } catch (err) {
+      log.error(`台词包 ${persona.id} 挑兜底台词时抛错（已跳过，改用兜底描述）`, err);
     }
   }
 

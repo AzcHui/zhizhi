@@ -625,11 +625,19 @@ public sealed class FloatWindow : Window
         else { Canvas.SetTop(_panel, double.NaN); Canvas.SetBottom(_panel, 14); }
     }
 
+    /// <summary>回右下角（托盘「回到右下角」/ 启动默认位）。
+    /// ⭐ b2-b1 复验（2026-10-19）：必须写**球的屏幕目标位置**再经 ClampForBall 反推窗口 ——
+    ///   旧版直接写窗口坐标（Top = wa.Bottom − Height − 24），隐含假设「球贴窗底」锚；
+    ///   若当前是翻转锚（球贴窗顶），球会停在差 158 DIP（两锚偏移差）的地方 —— 位移是真的、
+    ///   贴边是假的。与拖动路径共用同一套换算，X/Y 两轴一并修正。</summary>
     private void MoveToCorner()
     {
         var wa = SystemParameters.WorkArea;
-        Left = wa.Right - Width - 24;
-        Top = wa.Bottom - Height - 24;
+        var targetBallLeft = wa.Right - 24 - BallSize;    // 球右缘距屏右 24
+        var targetBallTop = wa.Bottom - 24 - BallSize;    // 球下缘距屏底 24
+        var win = ClampForBall(wa, targetBallLeft, targetBallTop);   // 按**当前锚**反推窗口
+        Left = win.Left;
+        Top = win.Top;
     }
 
     // ───────────────────────── 反向通道喂食 ─────────────────────────
@@ -686,6 +694,20 @@ public sealed class FloatWindow : Window
 
     private void InitTray()
     {
+        // 观察2（监工 2026-10-19）：托盘是「球拖丢后唯一找回后路」，创建成败必须落盘可查
+        try
+        {
+            InitTrayCore();
+            AppendLog("托盘已创建（五项菜单 + 双击显隐）");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[WRN] 托盘创建失败：{ex.Message}");
+        }
+    }
+
+    private void InitTrayCore()
+    {
         _trayShowItem = new System.Windows.Forms.ToolStripMenuItem("隐藏球");
         _trayShowItem.Click += (_, _) => ToggleBallVisible();
 
@@ -695,6 +717,7 @@ public sealed class FloatWindow : Window
         var homeItem = new System.Windows.Forms.ToolStripMenuItem("回到右下角");
         homeItem.Click += (_, _) =>
         {
+            if (_ballHidden) ToggleBallVisible();   // 观察4：球隐藏时点它 = 顺带显示，别让用户以为失灵
             MoveToCorner();
             UpdateOverlayPlacement();
             SaveSettings();   // 位置变了就落盘（口径与拖动结束一致）
@@ -754,13 +777,27 @@ public sealed class FloatWindow : Window
         return System.Drawing.Icon.FromHandle(bmp.GetHicon());   // 句柄随进程回收 —— 应用生命周期托盘常驻，不另释放
     }
 
-    /// <summary>显示/隐藏球（托盘菜单 + 双击共用）。内核照常跑 —— 隐藏只是把球收起来。</summary>
+    /// <summary>显示/隐藏球（托盘菜单 + 双击共用）。
+    /// ⭐ 观察3（监工 2026-10-19）：隐藏只藏窗 —— 内核照常跑。旧版 _idleTimer 照喂 →
+    ///   内核照常闲聊 → 气泡改在隐藏窗里，**recordSpoken 照样记账 = 台词被偷吃**。
+    ///   修法 = 隐藏时**停喂 context**：内核「没外壳喂 = 闲聊自动静默」（硬约束③语义），
+    ///   台词不再被消耗；戳与告警不受影响（它们不走闲聊分流）。显示时立即恢复喂食。</summary>
     private void ToggleBallVisible()
     {
         _ballHidden = !_ballHidden;
-        if (_ballHidden) Hide(); else Show();
+        if (_ballHidden)
+        {
+            Hide();
+            _idleTimer.Stop();
+        }
+        else
+        {
+            Show();
+            _idleTimer.Start();
+            FeedIdle();   // 立即恢复喂食 —— 静音真值 / idleMs 同步刷新
+        }
         if (_trayShowItem is { } item) item.Text = _ballHidden ? "显示球" : "隐藏球";
-        AppendLog(_ballHidden ? "托盘：球已隐藏" : "托盘：球已显示");
+        AppendLog(_ballHidden ? "托盘：球已隐藏（闲聊暂停）" : "托盘：球已显示（闲聊恢复）");
     }
 
     // ───────────────────────── b2-a ①位置记忆（%APPDATA%\zhizhi\shell.json）─────────

@@ -23,7 +23,8 @@ export interface PersonaDefinition {
   readonly id: string;
   /**
    * 挑一句话；返回 undefined = 「这次选择不说」。
-   * `options` 的三段式约定（专属新鲜 → `"*"` 兜底新鲜 → 才许重复）
+   * `options` 的三段式约定（专属新鲜 → 重复专属 → `"*"` 兜底；2026-10-19 段序修正：
+   *  「说话可以旧但不能哑」—— 有旧专属话不该去说更哑的 `*` 兜底）
    * 见 core 里 `Persona` 契约的说明；不关心的实现忽略它即可。
    *
    * M7 起 `options.isStale(key)` 由内核注入（主机带记忆时）——
@@ -183,7 +184,7 @@ export function definePersonaFromJson(raw: unknown, source: string): Persona {
         readonly isStale?: (key: string) => boolean;
       },
     ): Line | undefined {
-      // 三段式（见 core/Persona 契约）：专属新鲜 → `"*"` 兜底新鲜 → 才许重复。
+      // 三段式（见 core/Persona 契约，2026-10-19 段序修正）：专属新鲜 → 重复专属 → `"*"` 兜底。
       // ⚠️ 第一段绝不能把 `"*"` 混进来 —— 否则中层的兜底键会把下层的专属台词挡死。
       const allowRepeat = options?.allowRepeat === true;
       const useFallback = options?.useFallback === true;

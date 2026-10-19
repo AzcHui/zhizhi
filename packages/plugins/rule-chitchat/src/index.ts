@@ -223,6 +223,8 @@ function makeGreeting(ts: number): ZhizhiEvent {
     kind: 'chitchat',
     metrics: [],
     ts,
-    summary: '（启动）我起来了。',
+    // 止血（监工 2026-10-19）：兜底文案也要有人味 —— 带括号前缀是机器日志味，
+    // greeting 只有 5 句，台词耗尽走兜底时用户会愣一下。
+    summary: '我起来了。',
   };
 }

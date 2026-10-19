@@ -96,11 +96,12 @@ public sealed class FloatWindow : Window
 
     // ── b2-b2 形态库运行时状态 ──
     private readonly System.Diagnostics.Stopwatch _fluidClock = System.Diagnostics.Stopwatch.StartNew();
-    private DispatcherTimer _fluidTimer = null!;      // 形态驱动（Interval = 当前档帧率 —— 帧率是情绪的一部分）
+    private DispatcherTimer _fluidTimer = null!;      // 形态驱动（Interval 恒 30fps —— 二·R ③：帧率不随负载变，情绪只剩速度与颜色）
     private System.Windows.Media.SolidColorBrush _mainBrush = null!;  // 主色（持有**未 Freeze** 实例，每帧只改 Color）
     private double _curIntensity, _targetIntensity;               // 情绪强度 0~1（连续跟随 CPU ＋ 告警保持，二·R ①）
     private double _lastFluidT;                       // 上一帧 FluidTick 时刻（时间基平滑的 dt 基准）
-    private int _lastIntensityLevel = -1;             // 已记日志的 0.5 档序号（跨档才记，不刷屏）
+    private int _lastIntensityLevel = -1;             // 已记日志的档位序号（跨档才记，不刷屏）
+    private DateTime _lastTargetLog = DateTime.MinValue;  // target 轨迹日志的节流（5 秒一条）
     private bool _lastAlertState;                     // 告警保持期上次状态（翻转才记日志）
     private double _curHue = HueCalm, _curSat = SatCalm, _curLum = LumCalm;   // 当前色（HSL，向目标逼近 5%/帧）
     private double? _lastCpu;                          // 最近采样 CPU —— 驱动颜色连续插值 + 档位
@@ -347,6 +348,14 @@ public sealed class FloatWindow : Window
             _lastAlertState = alert;
             AppendLog($"[形态] 告警保持期{(alert ? "开始" : "结束")}（cpu={(_lastCpu is { } c ? $"{c:F0}%" : "--")}）");
         }
+
+        // 监工复验观察 A（彻底做法）：跨档日志只记"当前值"的瞬间穿越，真实轨迹（0↔0.78 摆动）看不到 ——
+        //   再记一条"目标值"（本方法每次 CPU 采样都调 = 每秒；节流 5 秒一条防刷屏），轨迹就完整了。
+        if ((DateTime.Now - _lastTargetLog).TotalSeconds >= 5)
+        {
+            _lastTargetLog = DateTime.Now;
+            AppendLog($"[形态] cpu={(_lastCpu is { } c ? $"{c:F0}%" : "--")} target={_targetIntensity:F2}（当前 {_curIntensity:F2}）");
+        }
     }
 
     /// <summary>CPU → 强度曲线（二·R ①，照抄开工单）：≤50 → 0；50→95 线性爬到 1；95+ 封顶。</summary>
@@ -363,13 +372,15 @@ public sealed class FloatWindow : Window
         var tau = _targetIntensity > _curIntensity ? IntensityTauRise : IntensityTauFall;
         _curIntensity += (_targetIntensity - _curIntensity) * (1 - Math.Exp(-dt / tau));
 
-        // 二·R ⑤：intensity 跨 0.5 档记一条（可观测 —— 这次"速度没变"就是靠读源码才推断出来的）
-        var cpuText = _lastCpu is { } c ? $"{c:F0}%" : "--";
-        var level = (int)Math.Floor(_curIntensity * 2);
+        // 二·R ⑤：intensity 跨档记一条（可观测 —— 这次"速度没变"就是靠读源码才推断出来的）。
+        //   ⭐ 监工复验观察 A 修正：原先 Math.Floor(i×2) 两档 —— intensity 指数渐近**永远 < 1.0**，
+        //   Floor(1.0×2)=2 那档永远到不了 → 满档（×5）永远记不到，日志看起来"卡在 0.50"。
+        //   改 Round(i×4) 五档（0/1/2/3/4），≥0.875 即可记到满档。
+        var level = (int)Math.Round(_curIntensity * 4);
         if (level != _lastIntensityLevel)
         {
             _lastIntensityLevel = level;
-            AppendLog($"[形态] cpu={cpuText} intensity={_curIntensity:F2} gain=×{1 + GyroSpeedGain * _curIntensity:F2}");
+            AppendLog($"[形态] cpu={(_lastCpu is { } c ? $"{c:F0}%" : "--")} intensity={_curIntensity:F2} gain=×{1 + GyroSpeedGain * _curIntensity:F2}");
         }
 
         // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减），带死区 t = clamp01((cpu−40)/50)；无数据 = 灰

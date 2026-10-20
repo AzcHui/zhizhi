@@ -162,6 +162,7 @@ public sealed class FloatWindow : Window
     private int _lastMoodTier = -1;           // 上次 trust 档（跨档日志用；-1 = 未记）
     private bool _idleFadeOn;                 // 蔫 进入/退出（日志只记边界）
     private DateTime _pulseAt = DateTime.MinValue;   // 脉冲起点（MinValue = 无脉冲）
+    private string? _lastFgClass;                    // M11-b1：上次前台分类（⑨ 变化日志用；类别可记账，标题不行）
     private double _pulseAmount;              // 本次脉冲的 alpha 峰值
     private double _pulseTauMs;               // 本次脉冲回落 τ
     private double _pulseNorm;                // 脉冲归一值（0~1，半径缩放用）
@@ -1525,7 +1526,15 @@ public sealed class FloatWindow : Window
             // b2-a ②：muteUntil 随 idleMs 一起喂。**每秒都喂真值**（0 = 未静音）——
             // 内核按「每喂必真值」处理，点「恢复」后旧的未来时刻不能留在内核里。
             var mute = IsMuted ? _muteUntil!.Value : 0;
-            _kernel.Feed($"{{\"idleMs\":{ms:F0},\"muteUntil\":{mute}}}");
+            // M11-b1（二·AB）：前台分类随行 —— 传的是**枚举结果**（红线：标题原文永远不出外壳，
+            // 连获取标题的 import 都没有）。类别名可存字段记账（⑨ 变化日志），标题不行。
+            var fg = Win32.ForegroundClass();
+            if (fg != _lastFgClass)
+            {
+                if (_lastFgClass != null) AppendLog($"[前台] {_lastFgClass} → {fg}");
+                _lastFgClass = fg;
+            }
+            _kernel.Feed($"{{\"idleMs\":{ms:F0},\"muteUntil\":{mute},\"foreground\":\"{fg}\"}}");
         }
         // 拿不到 = 「不知道你闲不闲」—— 不喂、不猜（宁可不传也不传错）
     }

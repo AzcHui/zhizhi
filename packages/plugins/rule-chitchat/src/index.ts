@@ -105,6 +105,16 @@ let idleMs: number | undefined = undefined;
 /** 上一帧 idle（判「回来了」的跨越用）—— **只在 onContext 里更新**（易错点 1：
  *  evaluate 每 300ms、onContext 每 1000ms，在 evaluate 里更新会同一秒内重复判「回来了」） */
 let prevIdleMs: number | undefined = undefined;
+/** 前台窗口分类（五值枚举；undefined = 没喂）—— 显式写类型，`typeof` 查询在此处有收窄怪癖 */
+type FgClass = 'meeting' | 'fullscreen' | 'code' | 'browser' | 'unknown' | undefined;
+
+/**
+ * 🆕 M11-b1（二·AB）：前台窗口分类（外壳 C# 侧分完类只传枚举 —— **标题原文永远不出外壳**，
+ * 结构上保证内核拿不到）。undefined = 旧外壳没喂 → busy 恒 false，判定与 M11-a2 逐字等价。
+ */
+let foreground: FgClass = undefined;
+/** 上一帧前台分类（合成 prevBlocked 用）—— **只在 onContext 里更新**（易错点 6，同 prevIdleMs 的坑） */
+let prevForeground: FgClass = undefined;
 /** 内核注入的亲密度（M7 记忆）；没注入（无记忆的主机）按「熟悉」对待 */
 let trust = 40;
 /** 用户点了「说说」—— 下一次 evaluate 立即开口（用户指令优先于一切节奏条件） */
@@ -179,6 +189,13 @@ export default defineRule({
     if (typeof ctx['trust'] === 'number' && Number.isFinite(ctx['trust']) && ctx['trust'] >= 0) {
       trust = ctx['trust'];
     }
+    // M11-b1（二·AB）易错点 6：prevForeground 同款纪律 —— 旧值先存，再收新值
+    //（cli 已做白名单校验，这里只认 5 个枚举值；没喂 = undefined = busy 恒 false）
+    const fg = ctx['foreground'];
+    if (fg === 'meeting' || fg === 'fullscreen' || fg === 'code' || fg === 'browser' || fg === 'unknown') {
+      prevForeground = foreground;
+      foreground = fg;
+    }
     if (ctx['requestSay'] === true) sayRequested = true;
   },
 
@@ -230,23 +247,34 @@ export default defineRule({
     if (idleMs === undefined) return [];
 
     // M11-a2 核心：闹钟 ＋ 等你回来（判定整个翻转 —— 旧代码是 `idle 小 → 闭嘴`，正好说反）
+    // M11-b1（二·AB）：**blocked = busy || away**，与「你离开了」共用同一套机制，不新增分支 ——
+    //   busy  = foreground ∈ {meeting, fullscreen}（开会/全屏 = 你暂时不在场；
+    //           ⚠️ unknown **不构成 busy** —— 宁可多说一句，不要永远沉默，易错点 5）
+    //   away  = idleMs >= 空闲门槛（现有逻辑，语义「你离开多久我开始攒」不变）
+    // 不喂 foreground 时 busy 恒 false → 判定与 M11-a2 **逐字等价**（旧外壳零回归）
     const thresh = idleThresholdMs();
+    const busy = foreground === 'meeting' || foreground === 'fullscreen';
+    const blocked = busy || idleMs >= thresh;
 
-    // ⑤ 挂起中：到过点、你在离开 → 只等你**回来**（跨越判定，易错点 4 ——
-    //    不能用「现在 idle 小」判，否则一直在场也判成刚回来，pendingSince 永远清不掉）
+    // ⑤ 挂起中：到过点、你不在（开会或离开）→ 只等**回来**（跨越判定，易错点 4 ——
+    //    不能用「现在在场」判，否则一直在场也判成刚回来，pendingSince 永远清不掉）
     if (pendingSince !== undefined) {
-      const crossed = prevIdleMs !== undefined && prevIdleMs >= thresh && idleMs < thresh;
+      const prevBusy = prevForeground === 'meeting' || prevForeground === 'fullscreen';
+      const prevAway = prevIdleMs !== undefined && prevIdleMs >= thresh;
+      const prevBlocked = prevBusy || prevAway;
+      const crossed = prevBlocked && !blocked;
       if (!crossed) return [];   // 还没回来，继续攒（1 句封顶，攒多久都只这一句）
-      return sayNow(now);        // 跨越 = 你回来了 → 立刻说攒着的那句
+      return sayNow(now);        // 跨越 = 你回来了（散会/切回/动鼠标）→ 立刻说攒着的那句
     }
 
     // ③ 还没到它自己定的点儿 → 什么都不做
     if (dueAt !== undefined && now < dueAt) return [];
 
-    // ④ 到点了：你在离开（idle 达门槛）→ 攒着等你回来；你在场 → 现在就说
-    if (idleMs >= thresh) {
+    // ④ 到点了：你不在（busy 或离开）→ 攒着等你回来；你在场 → 现在就说
+    if (blocked) {
+      const why = busy ? `前台=${foreground}` : `idle=${Math.round(idleMs / 1000)}s ≥ 门槛`;
       pendingSince = now;        // 只在第一次到点时记（不覆盖 —— 只攒 1 句，易错点 2）
-      logFn?.(`闲聊到点但你在离开（idle=${Math.round(idleMs / 1000)}s ≥ 门槛）→ 攒着，等你回来再说`);
+      logFn?.(`闲聊到点但你在忙（${why}）→ 攒着，等你回来再说`);
       return [];
     }
     return sayNow(now);          // 你在场 + 到点 → 现在就说（这正是「无论你在干嘛，想说话就说话」）

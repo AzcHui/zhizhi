@@ -25,6 +25,8 @@ public static class Program
             return RunRenderTest();
         if (args.Contains("--mood-test", StringComparer.OrdinalIgnoreCase))
             return RunMoodTest();
+        if (args.Contains("--fg-test", StringComparer.OrdinalIgnoreCase))
+            return RunFgTest();
 
         // ── b2-b1 ① 单实例互斥：双击两次 = 两个只只、两个内核（双重告警、双重闲聊）──
         // ⭐ 只拦**正常 UI 模式**：--self-test / --render-test 是验收工具，上面已分流，不受互斥影响。
@@ -266,6 +268,46 @@ public static class Program
 
         Console.WriteLine(failures == 0 ? "=== 情绪三态截图：通过（三张 mood-*.png 并排肉眼比亮度）===" : $"=== 情绪三态截图：{failures} 项失败 ===");
         return failures == 0 ? 0 : 1;
+    }
+
+    // ───────────────────── 前台分类自测（二·AB 验收①⑧：合成输入 → 期望类别，不碰真窗口）─────────────────────
+    private static int RunFgTest()
+    {
+        Console.WriteLine("=== 只只 · 前台分类自测（--fg-test，合成用例）===");
+        // (进程名, 全屏?, 期望类别, 说明) —— ≥12 组，覆盖六条判据与全部易错点
+        (string? Name, bool Full, string Want, string Note)[] cases =
+        {
+            ("wemeeting",        false, "meeting",    "会议白名单①（小写）"),
+            ("WeMeetApp",        false, "meeting",    "会议白名单②（大小写不敏感）"),
+            ("ms-teams",         false, "meeting",    "会议白名单③"),
+            ("Zoom",             false, "meeting",    "会议白名单④"),
+            ("DingTalk",         false, "meeting",    "会议白名单⑤"),
+            ("Feishu",           false, "meeting",    "会议白名单⑥"),
+            ("Code",             false, "code",       "IDE 白名单①（VS Code）"),
+            ("devenv",           false, "code",       "IDE 白名单②（Visual Studio）"),
+            ("WindowsTerminal",  false, "code",       "IDE 白名单③（终端）"),
+            ("chrome",           false, "browser",    "浏览器白名单①"),
+            ("msedge",           false, "browser",    "浏览器白名单②"),
+            ("explorer",         false, "unknown",    "桌面/任务栏 → unknown"),
+            ("WorkBuddy",        false, "unknown",    "非白名单进程 → unknown"),
+            (null,               false, "unknown",    "取不到进程名（系统进程/已退出）→ unknown 不抛"),
+            ("somegame",         true,  "fullscreen", "未知进程全屏 → fullscreen（游戏/全屏视频统一判据）"),
+            ("Code",             true,  "code",       "⭐ 易错点2/⑧：IDE 全屏仍是 code（进程名命中就不看全屏）"),
+            ("chrome",           true,  "browser",    "浏览器全屏看视频 → browser（不是 fullscreen，同样先看进程名）"),
+        };
+        var fails = 0;
+        foreach (var c in cases)
+        {
+            var got = Win32.Classify(c.Name, c.Full);
+            var ok = got == c.Want;
+            if (!ok) fails++;
+            Console.WriteLine($"  {(ok ? "OK " : "FAIL")}  {(c.Name ?? "(null)"),-18} full={c.Full,-5} → {got,-11} 期望 {c.Want,-11} {c.Note}");
+        }
+        // 验收②补充：真前台实测（打印类别名，**绝不打印标题** —— 没有标题可打）
+        var live = Win32.ForegroundClass();
+        Console.WriteLine($"  ── 真前台：当前窗口分类 = {live}（meeting/fullscreen 会压闲聊；code/browser/unknown 不影响）──");
+        Console.WriteLine(fails == 0 ? "=== 前台分类自测：通过 ===" : $"=== 前台分类自测：{fails} 项失败 ===");
+        return fails == 0 ? 0 : 1;
     }
 
     // ───────────────────── 渲染冒烟（真开窗；「逻辑全绿 ≠ 画出来正常」）─────────────────────

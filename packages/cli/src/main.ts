@@ -451,10 +451,18 @@ process.stdin.on('data', (chunk: string) => {
         const mute = obj === null || typeof obj !== 'object' ? undefined : obj['muteUntil'];
         const muteOk = typeof mute === 'number' && Number.isFinite(mute) && mute >= 0;
         const idleOk = typeof idle === 'number' && Number.isFinite(idle) && idle >= 0;
+        // 🆕 M11-b1（二·AB）：前台窗口**分类结果**（外壳 C# 侧分完类只传枚举 —— 隐私红线：
+        //   标题原文永远不出外壳）。**白名单校验**：不在 5 个值里 → 丢弃，不猜、不兜底（「宁可不传也不传错」）。
+        const fgRaw = obj === null || typeof obj !== 'object' ? undefined : obj['foreground'];
+        const FG_CLASSES = ['meeting', 'fullscreen', 'code', 'browser', 'unknown'] as const;
+        const fg = typeof fgRaw === 'string' && (FG_CLASSES as readonly string[]).includes(fgRaw)
+          ? (fgRaw as (typeof FG_CLASSES)[number])
+          : undefined;
         if (idleOk) {
           context = {
             idleMs: idle as number,
             ...(muteOk ? { muteUntil: mute as number } : {}),
+            ...(fg !== undefined ? { foreground: fg } : {}),
           };
           deliverContext(context);
         }

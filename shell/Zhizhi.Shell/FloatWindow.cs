@@ -82,6 +82,8 @@ public sealed class FloatWindow : Window
     private const double BubbleGapMs = 400;                // 条间留白（淡出 180 ＋ 静止 220）
     private const double BubbleFadeMs = 180;               // 淡入/淡出时长
     private const int BubbleMaxLines = 8;                  // 行数上限；超出 ScrollViewer 自动跟随
+    private const double BubbleTypingBudgetMs = 6000;      // 二·Y 复验观察1：打字总时长封顶 6s（超长一拍多吐几字，正常消息不受影响）
+    private const double BubbleHoldMaxMs = 12000;          // 停留封顶 12s —— 两条一起保证 per ≤ 18.4s < 30s，「容量 8 永久成立」的数学前提不被长文本打破
 
     private const double DragThreshold = 4;   // 位移 < 4px 松手 = 戳，≥ 4px = 拖（与系统 MinimumHorizontalDragDistance 同量级）
     // 球在窗口 Canvas 里的边距（单一事实源 —— Canvas 定位与 clamp 都用它们）
@@ -112,6 +114,7 @@ public sealed class FloatWindow : Window
     private BubbleItem? _bubbleCurrent;                        // 正在播的（critical 打断时按规则回队/丢弃）
     private string _bubbleFullText = "";                       // 当前条的完整文本
     private int _bubbleCharIndex;                              // 已打出的字符数
+    private int _bubbleCharsPerTick = 1;                       // 每拍推进的中文字数（≤109 字=1；超长按预算 6s 摊）
     private BubblePhase _bubblePhase = BubblePhase.Idle;
     private DateTime _bubblePhaseUntil;                        // Holding/Gap 的截止时刻
     private double _bubbleLastTextHeight = -1;                 // 自动跟随：ActualHeight 变了才 ScrollToEnd
@@ -850,11 +853,14 @@ public sealed class FloatWindow : Window
         if (_bubblePhase == BubblePhase.Idle) TryPlayNext();
     }
 
-    /// <summary>单条预估播放时长（二·Y 复验 P1）：打字（55ms/字上界）＋ 停留 ＋ 条间留白 —— 与监工核算表同口径。</summary>
+    /// <summary>单条预估播放时长（二·Y 复验 P1）：打字（55ms/字上界，封顶 6s）＋ 停留（封顶 12s）＋ 条间留白
+    /// —— 与监工核算表同口径，且与打字/停留的两道封顶保持一致 → per ≤ 18.4s < 30s 恒成立。</summary>
     private static double EstimatePlayMs(BubbleItem m)
     {
         var len = Math.Max(1, m.Text.Length);
-        return BubbleTypingMs * len + Math.Max(2500, 2000 + 90.0 * len) + BubbleGapMs;
+        var typing = Math.Min(BubbleTypingBudgetMs, BubbleTypingMs * len);
+        var hold = Math.Min(BubbleHoldMaxMs, Math.Max(2500, 2000 + 90.0 * len));
+        return typing + hold + BubbleGapMs;
     }
 
     /// <summary>按分级规则插入队列（warn/critical 排全部 info 之前、同级 FIFO；info 队尾），
@@ -899,6 +905,8 @@ public sealed class FloatWindow : Window
         _bubbleCurrent = item;
         _bubbleFullText = item.Text;
         _bubbleCharIndex = 0;
+        // 二·Y 复验观察1：打字总时长封顶 6s —— 超过 109 字（6000/55）的长文本每拍多吐几字
+        _bubbleCharsPerTick = Math.Max(1, (int)Math.Ceiling(_bubbleFullText.Length / (BubbleTypingBudgetMs / BubbleTypingMs)));
         _bubbleLastTextHeight = -1;
         UpdateOverlayPlacement();   // b2-a 复验观察2：气泡同样自适应（球贴上缘 → 翻转后挂球下方）
         _bubbleText.Text = instant ? _bubbleFullText : "";
@@ -954,13 +962,14 @@ public sealed class FloatWindow : Window
             _bubbleLastTextHeight = _bubbleText.ActualHeight;
             _bubbleScroll.ScrollToEnd();
         }
-        var holdMs = Math.Max(2500, 2000 + 90.0 * _bubbleFullText.Length);
+        var holdMs = Math.Min(BubbleHoldMaxMs, Math.Max(2500, 2000 + 90.0 * _bubbleFullText.Length));   // 停留封顶 12s（观察1）
         _bubblePhase = BubblePhase.Holding;
         _bubblePhaseUntil = DateTime.Now.AddMilliseconds(holdMs);
         AppendLog($"[气泡] 打字完，停留 {holdMs / 1000.0:F1}s");
     }
 
-    /// <summary>取下一段要显示的文本：英文/数字连续段整段吐（`Microsoft Windows` 不许出现 `Microsof`），中文逐字。</summary>
+    /// <summary>取下一段要显示的文本：英文/数字连续段整段吐（`Microsoft Windows` 不许出现 `Microsof`），
+    /// 中文按每拍字数推进 —— 正常消息（≤109 字）每拍 1 字；超长按 6s 预算摊（观察1：打字总时长封顶）。</summary>
     private string NextSegment()
     {
         if (_bubbleCharIndex >= _bubbleFullText.Length) return "";
@@ -972,7 +981,10 @@ public sealed class FloatWindow : Window
             _bubbleCharIndex = j;
             return seg;
         }
-        return _bubbleFullText[_bubbleCharIndex++].ToString();
+        var take = Math.Min(_bubbleCharsPerTick, _bubbleFullText.Length - _bubbleCharIndex);
+        var text = _bubbleFullText.Substring(_bubbleCharIndex, take);
+        _bubbleCharIndex += take;
+        return text;
     }
 
     private static bool IsWordChar(char c) =>

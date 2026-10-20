@@ -20,9 +20,15 @@
  * 单源失败（reg 被安全软件拦等）：WRN 一次（去重）＋ **该源本轮跳过且基线保留旧值** ——
  * 绝不把「读不到」当成「空了」（否则恢复那一刻满屏误报）。 Startup 目录用 readdir，
  * 沙箱里也能采 —— 两码事分开。
+ *
+ * 二·W（M8-b 第二版 A）：自启项签名深挖 —— 新增/改写告警后，异步核验目标 exe 的
+ * 数字签名（PowerShell Get-AuthenticodeSignature，EncodedCommand + base64 输出，
+ * 绕开引号与码页的一切坑），结果在下一个采样拍以 `security.autostart.sigcheck`
+ * 指标带出，由 rule-autostart 翻译成跟进事件（正经货 info ／ 没签名 warn ／ 异常 warn）。
+ * 核验是**加餐不是依赖**：PS 不可用/超时 → WRN 一次，主告警链路原样。
  */
 
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defineProbe } from '@zhizhi/plugin-sdk';
@@ -69,6 +75,122 @@ let logFn: ((msg: string) => void) | undefined;
 const warnedSources = new Set<string>();
 /** 校准试采挂起标志 —— collect.ts 直调 sample() 测耗时时置位（二·V 碰撞修复） */
 let calibrating = false;
+
+// ══════════ 签名核验（二·W：异步、单飞、去重 —— 加餐不是依赖）══════════
+
+/** 队列上限：同时排队+在飞的核验数。超过就丢弃并 WRN（一次）—— 防异常风暴把 PS 连环拉起 */
+const SIG_QUEUE_MAX = 20;
+/** 正在排队/在飞的核验（去重键 = srcKey|name|value） */
+const sigInFlight = new Set<string>();
+/** 已完成、等下一个采样拍带出的核验结果 */
+const sigResults: Metric[] = [];
+/** PowerShell 不可用只 WRN 一次（核验是加餐，坏了不该刷屏） */
+let sigWarned = false;
+/** 单飞链：保证任意时刻最多 1 个 PowerShell 进程 */
+let sigChain: Promise<void> = Promise.resolve();
+
+/** 从命令值里取目标（首 token，支持引号包裹）—— 与可疑特征②同一套提取逻辑 */
+function extractTarget(value: string): string | undefined {
+  const v = value.replace(/^[A-Z_]+\|/, '');
+  const first = v.match(/^"([^"]+)"/) ?? v.match(/^(\S+)/);
+  const t = first?.[1]?.trim();
+  return t === '' ? undefined : t;
+}
+
+/**
+ * PowerShell 核验脚本：经 -EncodedCommand（UTF-16LE base64）下发 —— 免引号地狱；
+ * 目标路径走环境变量 ZZ_SIG_TARGET（路径含中文/空格/单引号都安全）；
+ * 输出 base64(UTF-8) 三段：状态 |DELIM| 签名者 CN |DELIM| 实际核验的路径 —— 字节保真（latin1 教训姊妹招）。
+ * 目标不存在时先 Get-Command 兜底解析（"cmd" → C:\Windows\System32\cmd.exe），
+ * 用户的 `cmd /c echo test` 测试命令不许被误判成「无签名」。
+ */
+const PS_SCRIPT_FINAL = [
+  "$ErrorActionPreference='SilentlyContinue'",
+  '$p = $env:ZZ_SIG_TARGET',
+  'if (-not $p) { Write-Output ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("ERR|DELIM||"))); exit }',
+  'if (-not (Test-Path -LiteralPath $p)) {',
+  '  $c = Get-Command $p -ErrorAction SilentlyContinue',
+  '  if ($c -and $c.Source) { $p = $c.Source }',
+  '}',
+  'if (-not (Test-Path -LiteralPath $p)) { Write-Output ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("MISSING|DELIM||$p"))); exit }',
+  '$s = Get-AuthenticodeSignature -LiteralPath $p',
+  '$cn = ""',
+  'if ($s -and $s.SignerCertificate) { $m = [regex]::Match($s.SignerCertificate.Subject, "CN=([^,]+)"); $cn = $m.Groups[1].Value }',
+  '$status = "UNKNOWN"; if ($s) { $status = $s.Status.ToString() }',
+  'Write-Output ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$status|DELIM|$cn|DELIM|$p")))',
+].join('\r\n');
+
+const PS_COMMAND_B64 = Buffer.from(PS_SCRIPT_FINAL, 'utf16le').toString('base64');
+/** PS 输出分段符（避开一切可能出现在状态/路径/厂商里的字符） */
+const SIG_DELIM = '|DELIM|';
+
+/** 单个核验任务：跑 PS → 解码 → 落结果（error 不落，只 WRN 一次） */
+function runSigcheck(key: string, name: string, target: string): void {
+  execFile(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', PS_COMMAND_B64],
+    {
+      timeout: 15_000,
+      windowsHide: true,
+      encoding: 'utf8',
+      env: { ...process.env, ZZ_SIG_TARGET: target },
+    },
+    (err, stdout) => {
+      sigInFlight.delete(key);
+      try {
+        if (err !== null && err !== undefined && (err as { killed?: boolean }).killed === true) {
+          throw new Error(`超时或被终止：${err.message}`);
+        }
+        const decoded = Buffer.from(String(stdout).trim(), 'base64').toString('utf8');
+        const parts = decoded.split(SIG_DELIM).map((s) => s.trim());
+        const status = parts[0] ?? '';
+        const publisher = parts[1] ?? '';
+        const resolved = parts[2] ?? target;
+        if (status === 'ERR') throw new Error('脚本执行失败（无目标）');
+        let verdict: string;
+        if (status === 'Valid') verdict = 'valid';
+        else if (status === 'NotSigned') verdict = 'unsigned';
+        else if (status === 'MISSING') verdict = 'missing';
+        else verdict = 'broken';
+        logFn?.(`[签名核验] ${name} → ${verdict}${publisher === '' ? '' : `（${publisher}）`}`);
+        sigResults.push({
+          key: 'security.autostart.sigcheck',
+          value: 1,
+          unit: 'count',
+          ts: Date.now(),
+          source: name,
+          meta: { name, verdict, publisher, target, resolved, sourceKey: key.split('|')[0] ?? '' },
+        });
+      } catch (e) {
+        // 核验失败是加餐失败：WRN 一次（去重），主告警链路不受任何影响
+        if (!sigWarned) {
+          sigWarned = true;
+          logFn?.(
+            `签名核验不可用（${e instanceof Error ? e.message : String(e)}）—— ` +
+              '自启项告警照常，只是没有跟进的签名结论。可在终端手跑 powershell Get-AuthenticodeSignature 复核。',
+          );
+        }
+      }
+    },
+  );
+}
+
+/** 排一个核验（去重 + 上限 + 单飞链）—— 只在真实采样的新增/改写检出时调用 */
+function queueSigcheck(srcKey: string, name: string, value: string): void {
+  const target = extractTarget(value);
+  if (target === undefined) return;
+  const key = `${srcKey}|${name}|${value}`;
+  if (sigInFlight.has(key)) return;
+  if (sigInFlight.size >= SIG_QUEUE_MAX) {
+    if (!sigWarned) {
+      sigWarned = true;
+      logFn?.(`签名核验队列已满（${SIG_QUEUE_MAX}）—— 本轮新增项跳过核验（主告警照常）`);
+    }
+    return;
+  }
+  sigInFlight.add(key);
+  sigChain = sigChain.then(() => runSigcheck(key, name, target));
+}
 
 // ══════════ reg 采集 ═══════════
 
@@ -257,6 +379,9 @@ export default defineProbe({
     //   基线对比/吸收/落盘全是副作用，做了的话关机期间的新增会在校准里被静默吞掉
     if (calibrating) return metrics;
 
+    // 二·W：把已完成的签名核验结果带出（真实采样拍；校准拍不经过总线，结果多等一拍）
+    if (sigResults.length > 0) metrics.push(...sigResults.splice(0));
+
     // ── 首采：只建基线，一条不告警（开工单纪律 1）──
     // ⭐ 判据用 baselineLoaded 不是 baseline === undefined：从磁盘加载到的空基线 {} 要
     //   直接进对比（照常告警），不能被当成「没加载过」再重建一遍（二·V ①）
@@ -289,6 +414,7 @@ export default defineProbe({
             //   可能自带 |，split 会把命令截断；类型前缀在解析时已剥掉 REG_ 前缀（"SZ|…"）
             meta: { name, command: value.slice(value.indexOf('|') + 1), sourceKey: srcKey, suspicious: isSuspicious(name, value) ? 1 : 0 },
           });
+          queueSigcheck(srcKey, name, value);   // 二·W：新增 → 排签名核验（异步，结果下拍带出）
         } else if (prev !== value) {
           // 同名不同值 = 被改写 —— before/after 都带上（RunOnce 天生短命，改写无意义，也静默）
           if (isRunonce) continue;
@@ -297,6 +423,7 @@ export default defineProbe({
             source: name,
             meta: { name, before: prev, after: value, sourceKey: srcKey },
           });
+          queueSigcheck(srcKey, name, value);   // 二·W：改写也核验（核的是**新值**指向的目标）
         }
         // 已消失的项（prev 有 now 无）→ 静默：基线更新时自然吸收（开工单⑤：删除不告警）
       }
@@ -308,3 +435,16 @@ export default defineProbe({
     return metrics;
   },
 });
+
+/**
+ * 合成验收钩子（二·W 验收②③④）：loader 只 import default，不影响生产；
+ * 合成探针用它**进程内直接打核心**（验收纪律 1：构造输入直接打核心，不跑真实负载）。
+ */
+export const __sigcheckTest = {
+  queueSigcheck,
+  extractTarget,
+  /** 取走全部已完成的核验结果 */
+  drain: (): readonly Metric[] => sigResults.splice(0),
+  /** 当前排队/在飞数（去重与上限断言用） */
+  pending: (): number => sigInFlight.size,
+};

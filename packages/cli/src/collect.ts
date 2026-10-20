@@ -205,25 +205,35 @@ export async function calibrateProbes(
   }
 
   // ② 现测：只测 result 里还没有的 probe（缓存命中的不重跑 —— 见 ① 的修正说明）
-  for (const probe of probes) {
-    if (result.has(probe.id)) continue;
-    try {
-      const samples: number[] = [];
-      for (let i = 0; i < CALIBRATION_RUNS; i++) samples.push(await measureOnce(probe));
-      const medianMs = median(samples);
-      result.set(probe.id, {
-        medianMs,
-        minIntervalMs: Math.max(Math.round(medianMs * MIN_INTERVAL_FACTOR), MIN_INTERVAL_FLOOR),
-        fromCache: false,
-      });
-    } catch (err) {
-      // 校准失败 ≠ 内核失败：按「不知道耗时」处理 → 底线取绝对下限，告警说明
-      log.warn(
-        `采集校准：${probe.id} 实测抛错（已隔离）—— 底线按 ${MIN_INTERVAL_FLOOR}ms 处理`,
-        err instanceof Error ? err.message : err,
-      );
-      result.set(probe.id, { medianMs: Number.NaN, minIntervalMs: MIN_INTERVAL_FLOOR, fromCache: false });
+  // ⭐ M8-b 碰撞修复（二·V）：校准试采不经总线，但**有状态 probe 的 sample() 带副作用**
+  //   （哨兵基线对比/吸收）—— 不挂起的话，「关机期间新增的自启项」会在校准里被静默
+  //   吸收、产出的指标被丢弃 → 首个正式采样看到「无变化」，跨重启告警永远发不出去。
+  //   有 setCalibrating 的 probe 先挂起副作用（保留真实采集耗时），测完立刻恢复。
+  const measuring = probes.filter((p) => !result.has(p.id) && typeof p.setCalibrating === 'function');
+  for (const probe of measuring) probe.setCalibrating!(true);
+  try {
+    for (const probe of probes) {
+      if (result.has(probe.id)) continue;
+      try {
+        const samples: number[] = [];
+        for (let i = 0; i < CALIBRATION_RUNS; i++) samples.push(await measureOnce(probe));
+        const medianMs = median(samples);
+        result.set(probe.id, {
+          medianMs,
+          minIntervalMs: Math.max(Math.round(medianMs * MIN_INTERVAL_FACTOR), MIN_INTERVAL_FLOOR),
+          fromCache: false,
+        });
+      } catch (err) {
+        // 校准失败 ≠ 内核失败：按「不知道耗时」处理 → 底线取绝对下限，告警说明
+        log.warn(
+          `采集校准：${probe.id} 实测抛错（已隔离）—— 底线按 ${MIN_INTERVAL_FLOOR}ms 处理`,
+          err instanceof Error ? err.message : err,
+        );
+        result.set(probe.id, { medianMs: Number.NaN, minIntervalMs: MIN_INTERVAL_FLOOR, fromCache: false });
+      }
     }
+  } finally {
+    for (const probe of measuring) probe.setCalibrating!(false);
   }
 
   // ③ 写缓存（写失败不拦 —— 大不了下次重测）

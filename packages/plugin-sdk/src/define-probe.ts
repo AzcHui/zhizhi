@@ -16,6 +16,11 @@ export interface ProbeDefinition {
    * 需要持久化状态的 probe（如哨兵的基线文件）从这里拿路径。只在启动时调一次。
    */
   readonly configure?: (config: Readonly<Record<string, unknown>>) => void;
+  /**
+   * 🆕 M8-b 补丁（二·V）：可选，校准试采前后由 cli 调用 —— 有状态 probe 据此挂起
+   * sample() 的副作用（基线对比/吸收/落盘），只保留真实采集耗时。
+   */
+  readonly setCalibrating?: (on: boolean) => void;
 }
 
 export function defineProbe(definition: ProbeDefinition): Probe {
@@ -30,5 +35,6 @@ export function defineProbe(definition: ProbeDefinition): Probe {
     sample: definition.sample,
     // 实现了才挂（与 defineRule 的可选能力同款纪律）
     ...(typeof definition.configure === 'function' ? { configure: definition.configure } : {}),
+    ...(typeof definition.setCalibrating === 'function' ? { setCalibrating: definition.setCalibrating } : {}),
   };
 }

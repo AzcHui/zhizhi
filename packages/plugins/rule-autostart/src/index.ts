@@ -25,7 +25,10 @@ function describe(m: Metric): string {
   const tail = shortKey === '' ? '' : ` ＠${shortKey}`;
   // 改写事件（有 before/after）走对照形态 —— 「被改写了」必须让人看见从什么变成了什么
   if (typeof m.meta?.['before'] === 'string' && typeof m.meta?.['after'] === 'string') {
-    return `${name}：${m.meta['before']} → ${m.meta['after']}${tail}`;
+    // ⭐ 剥掉类型前缀（二·V ⑥）：probe 存的是 "SZ|cmd…"，气泡显示 `zz-test：SZ|a → SZ|b`
+    //   没人看得懂 —— 类型是基线比对的内部格式，给人看的只有命令
+    const human = (s: string) => s.replace(/^[A-Z_]+\|/, '');
+    return `${name}：${human(m.meta['before'])} → ${human(m.meta['after'])}${tail}`;
   }
   const command = String(m.meta?.['command'] ?? '');
   const cmd = command === '' ? '' : `（${command}）`;

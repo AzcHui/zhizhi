@@ -188,6 +188,13 @@ export interface Probe {
    * （如哨兵的基线文件）从这里拿路径。只在启动时下发一次；抛错被隔离。
    */
   configure?(config: Readonly<Record<string, unknown>>): void;
+  /**
+   * 🆕 M8-b 补丁（二·V）：可选，通知 probe「接下来这几次 sample() 是校准试采」。
+   * 校准实测不经总线（collect.ts 直调 sample() 只为测耗时），但有状态 probe 的
+   * sample() 带副作用（如哨兵的基线对比/吸收）—— 不挂起的话，「关机期间新增的
+   * 自启项」会在校准里被静默吸收，告警永远发不出去。无状态 probe 无需实现。
+   */
+  setCalibrating?(on: boolean): void;
 }
 
 /**

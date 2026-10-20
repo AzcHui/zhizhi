@@ -274,10 +274,12 @@ const errors = outcomes.filter((o) => o.status === 'failed');
 
 // 配置下发（M6）：数据目录设置文件 → 实现了 configure() 的规则各认领各的键。
 // 一次启动只发一次；单个规则接配置时抛错被隔离，不影响其余规则。
+// 🆕 M11-a2（二·AA）：顺带下发 log —— rule 自己的话也要能上日志（闲聊「攒着等你回来」
+//   这类状态变化验不了就等于没做）。各 rule 只读自己认领的键，多出来的 log 键无影响。
 for (const rule of registry.rules()) {
   if (typeof rule.configure !== 'function') continue;
   try {
-    rule.configure(settings);
+    rule.configure({ ...settings, log: (msg: string) => log.info(msg) });
   } catch (err) {
     log.error(
       `规则 ${rule.id} 接收配置时抛错（已隔离，用自身默认值继续）`,

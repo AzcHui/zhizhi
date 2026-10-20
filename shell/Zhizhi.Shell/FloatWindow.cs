@@ -91,6 +91,8 @@ public sealed class FloatWindow : Window
     private const double PulseAlphaCritical = 0.50;        // critical 更强（「惊了一下」）
     private const double PulseTauInfoMs = 180;             // info 脉冲回落 τ
     private const double PulseTauCriticalMs = 120;         // critical 回落更快
+    private const double PulseTauPokeMs = 300;             // 戳的脉冲回落 τ（二·AA：比说话慢一点，像「咦？」）
+    private const double PulseAlphaPoke = 0.35;            // 戳的脉冲峰值（二·AA 保留项①：即时反应）
     private const double PulseRadiusScale = 1.04;          // 环径微扩峰值
     private const double IdleFadeStartMin = 30;            // 被冷落：30 分钟起
     private const double IdleFadeEndMin = 60;              // 60 分钟滑到最低（30 分钟内平滑完成）
@@ -398,8 +400,9 @@ public sealed class FloatWindow : Window
     {
         EnqueueBubble(said);        // 二·Y：排队 → 逐字打出 → 按字数停留 → 淡出（不再来一条覆盖一条）
         if (_panelOpen) UpdateStatusLine();
-        // L4（决策 #34）：poked@ 前缀 = 它决定「躲开」—— 外壳只做动作，说话归内核
-        if (said.EventId.StartsWith("poked@", StringComparison.Ordinal)) MoveAside();
+        // L4（决策 #34 ＋ 二·AA「戳烦了才躲」）：poked_again@ 前缀 = 戳到第 2 轮它烦了才躲；
+        // 第 1 轮的 poked@ 只说话不挪（易错点 6：第 1 轮就躲 = 回到古板行为）
+        if (said.EventId.StartsWith("poked_again@", StringComparison.Ordinal)) MoveAside();
         // b2-b2：告警级台词 → 告警档保持一段时间（活跃期结束后平滑回落，FluidTick 逼近）
         if (said.Level is "warn" or "critical")
         {
@@ -1307,8 +1310,13 @@ public sealed class FloatWindow : Window
     private void Poke()
     {
         ShakeBall();                                   // L1：点击必须有反馈（球的视觉反应，不挪窗口）
+        // M11-a2 二·AA 保留项①：戳也触发情绪脉冲（复用 M11-a 触发机制 —— +0.35 / τ=300ms，
+        // 与说话脉冲同层指数回落；戳它要「咦？」一下，这是「活起来」最便宜的一档）
+        _pulseAmount = PulseAlphaPoke;
+        _pulseTauMs = PulseTauPokeMs;
+        _pulseAt = DateTime.Now;
         _kernel.Feed("{\"poked\":1}");                 // 外壳只报事实，裁决归 rule-poke（决策 #34）
-        AppendLog("球被戳了一下 → 已喂 {\"poked\":1}");
+        AppendLog("球被戳了一下 → 已喂 {\"poked\":1}（脉冲已触发）");
     }
 
     private void ShakeBall()
@@ -1322,11 +1330,14 @@ public sealed class FloatWindow : Window
             FillBehavior = FillBehavior.Stop,
         };
         // 相对偏移（监工 P0 的教训在变换域里天然成立：动的是 RenderTransform，永远不覆盖位置）
+        // M11-a2 二·AA：幅度 3~5 随机 —— 每下手感不一样，不再像机械按键
+        var a1 = 3 + Random.Shared.Next(3);   // 3~5
+        var a2 = 3 + Random.Shared.Next(3);
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(0, TimeSpan.Zero));
-        kf.KeyFrames.Add(new LinearDoubleKeyFrame(-4, TimeSpan.FromMilliseconds(30)));
-        kf.KeyFrames.Add(new LinearDoubleKeyFrame(4, TimeSpan.FromMilliseconds(60)));
-        kf.KeyFrames.Add(new LinearDoubleKeyFrame(-3, TimeSpan.FromMilliseconds(90)));
-        kf.KeyFrames.Add(new LinearDoubleKeyFrame(3, TimeSpan.FromMilliseconds(120)));
+        kf.KeyFrames.Add(new LinearDoubleKeyFrame(-a1, TimeSpan.FromMilliseconds(30)));
+        kf.KeyFrames.Add(new LinearDoubleKeyFrame(a1, TimeSpan.FromMilliseconds(60)));
+        kf.KeyFrames.Add(new LinearDoubleKeyFrame(-a2, TimeSpan.FromMilliseconds(90)));
+        kf.KeyFrames.Add(new LinearDoubleKeyFrame(a2, TimeSpan.FromMilliseconds(120)));
         kf.KeyFrames.Add(new LinearDoubleKeyFrame(0, TimeSpan.FromMilliseconds(150)));
         // 双保险：Stop 之外再显式摘除时钟（幂等）—— 确保 guard 一定会松开
         kf.Completed += (_, _) => _ballShake.BeginAnimation(TranslateTransform.XProperty, null);

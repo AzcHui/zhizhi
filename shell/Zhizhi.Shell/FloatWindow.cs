@@ -102,10 +102,14 @@ public sealed class FloatWindow : Window
     private readonly Border _panel;
 
     // ── 二·Y 气泡队列状态（单一定时器状态机：Idle → Typing → Holding → Gap → Idle）──
-    private sealed record BubbleItem(string Text, string Severity, string EventId, DateTime EnqueuedAt);
+    // Deadline 语义（二·Y 复验 P1，方案 A）：TTL 是「宽度」不是绝对时长 ——
+    // 入队时 Deadline = now + 30s + 前方所有条目的预估播放时长，出队时比它。
+    // 「你前面还有 N 条要播，播完再给你 30 秒宽限」—— 容量 8 才真正成立（绝对 30s 下
+    // 40 字的消息实际只能播 4 条，60 字 3 条，「容量 8」是假的）。
+    private sealed record BubbleItem(string Text, string Severity, string EventId, DateTime EnqueuedAt, DateTime Deadline);
     private enum BubblePhase { Idle, Typing, Holding, Gap }
     private readonly List<BubbleItem> _bubbleQueue = new();   // 待播队列（容量 BubbleQueueCapacity）
-    private BubbleItem? _bubbleCurrent;                        // 正在播的（critical 打断时回队首完整重播）
+    private BubbleItem? _bubbleCurrent;                        // 正在播的（critical 打断时按规则回队/丢弃）
     private string _bubbleFullText = "";                       // 当前条的完整文本
     private int _bubbleCharIndex;                              // 已打出的字符数
     private BubblePhase _bubblePhase = BubblePhase.Idle;
@@ -811,7 +815,7 @@ public sealed class FloatWindow : Window
             AppendLog($"[气泡] 静音中丢弃 info：{said.Text}");
             return;
         }
-        var item = new BubbleItem(said.Text, severity, said.EventId, DateTime.Now);
+        var item = new BubbleItem(said.Text, severity, said.EventId, DateTime.Now, DateTime.Now);
 
         if (_bubbleQueue.Count >= BubbleQueueCapacity)
         {
@@ -822,45 +826,68 @@ public sealed class FloatWindow : Window
             AppendLog($"[气泡] 丢弃（溢出）{dropped.Severity}：{dropped.Text}");
         }
 
-        if (severity is "warn" or "critical")
-        {
-            var idx = _bubbleQueue.FindIndex(m => m.Severity == "info");
-            if (idx >= 0) _bubbleQueue.Insert(idx, item); else _bubbleQueue.Add(item);
-        }
-        else
-        {
-            _bubbleQueue.Add(item);
-        }
-        AppendLog($"[气泡] 入队（{severity}）队={_bubbleQueue.Count}：{item.Text}");
+        InsertBySeverity(item);
+        AppendLog($"[气泡] 入队（{severity}）队={_bubbleQueue.Count} 宽限 {(item.Deadline - DateTime.Now).TotalSeconds:F0}s：{item.Text}");
 
         // critical 打断正在播的（Typing/Holding）—— 安全告警晚 10 秒就没意义。
-        // ⭐ 被打断者回队首**但排在这条 critical 之后**（先报警报，再重播被打断的话）：
-        //    插入位置 = 与 warn/critical 同规则（排全部 info 之前）
+        // 被打断者：info/warn 回队（排在这条 critical 之后完整重播）；critical 不回队 ——
+        // 二·Y 复验 P3：两条告警撞车，残句＋重播 = 同一句说两遍开头，且旧告警重播时可能已过时
         if (severity == "critical" && _bubbleCurrent is { } cur && _bubblePhase is BubblePhase.Typing or BubblePhase.Holding)
         {
-            var curIdx = _bubbleQueue.FindIndex(m => m.Severity == "info");
-            if (curIdx >= 0) _bubbleQueue.Insert(curIdx, cur); else _bubbleQueue.Add(cur);
-            AppendLog($"[气泡] 被打断回队（critical 之后完整重播）：{cur.Text}");
             _bubbleCurrent = null;
             _bubblePhase = BubblePhase.Idle;
+            if (cur.Severity == "critical")
+            {
+                AppendLog($"[气泡] critical 打断 critical：丢弃残句（避免同一句说两遍开头）：{cur.Text}");
+            }
+            else
+            {
+                InsertBySeverity(cur);
+                AppendLog($"[气泡] 被打断回队（critical 之后完整重播）：{cur.Text}");
+            }
         }
 
         if (_bubblePhase == BubblePhase.Idle) TryPlayNext();
     }
 
-    /// <summary>出队播下一条；TTL 超 30s 的沿途丢弃（记账，不补播）。队列空 → 归 Idle 不驻留。</summary>
+    /// <summary>单条预估播放时长（二·Y 复验 P1）：打字（55ms/字上界）＋ 停留 ＋ 条间留白 —— 与监工核算表同口径。</summary>
+    private static double EstimatePlayMs(BubbleItem m)
+    {
+        var len = Math.Max(1, m.Text.Length);
+        return BubbleTypingMs * len + Math.Max(2500, 2000 + 90.0 * len) + BubbleGapMs;
+    }
+
+    /// <summary>按分级规则插入队列（warn/critical 排全部 info 之前、同级 FIFO；info 队尾），
+    /// 并按「宽度 TTL」记 Deadline（now + 30s ＋ 前方所有条目的预估播放时长）；
+    /// 插入使其后方条目的等待变长 → 后方 Deadline 统一后移。</summary>
+    private void InsertBySeverity(BubbleItem item)
+    {
+        var idx = item.Severity is "warn" or "critical"
+            ? _bubbleQueue.FindIndex(m => m.Severity == "info")
+            : -1;                                          // info：队尾
+        var insertAt = idx >= 0 ? idx : _bubbleQueue.Count;
+        var aheadMs = 0.0;
+        for (var i = 0; i < insertAt; i++) aheadMs += EstimatePlayMs(_bubbleQueue[i]);
+        item = item with { Deadline = DateTime.Now.AddMilliseconds(BubbleTtlSeconds * 1000 + aheadMs) };
+        if (idx >= 0) _bubbleQueue.Insert(idx, item); else _bubbleQueue.Add(item);
+        for (var i = insertAt + 1; i < _bubbleQueue.Count; i++)
+            _bubbleQueue[i] = _bubbleQueue[i] with { Deadline = _bubbleQueue[i].Deadline.AddMilliseconds(EstimatePlayMs(item)) };
+    }
+
+    /// <summary>出队播下一条；宽限（Deadline）超时的沿途丢弃（记账，不补播）。队列空 → 归 Idle 不驻留。</summary>
     private void TryPlayNext()
     {
         while (_bubbleQueue.Count > 0)
         {
             var head = _bubbleQueue[0];
             _bubbleQueue.RemoveAt(0);
-            if ((DateTime.Now - head.EnqueuedAt).TotalSeconds <= BubbleTtlSeconds)
+            if (DateTime.Now <= head.Deadline)
             {
-                StartBubble(head);
+                // 二·Y 复验 P2：critical 整句出现（不打字）—— 安全告警一个字一个字蹦是负价值
+                StartBubble(head, head.Severity == "critical");
                 return;
             }
-            AppendLog($"[气泡] 丢弃（TTL 超 {BubbleTtlSeconds:F0}s）：{head.Text}");
+            AppendLog($"[气泡] 丢弃（宽限超时）：{head.Text}");
         }
         _bubblePhase = BubblePhase.Idle;
         _bubbleCurrent = null;

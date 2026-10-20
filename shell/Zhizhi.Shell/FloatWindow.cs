@@ -75,6 +75,14 @@ public sealed class FloatWindow : Window
 
     private const double FormFadeMs = 300;                 // 交叉淡入时长（开工单⑤：硬切会像"闪屏"）
 
+    // ── 二·Y 气泡呈现层参数（开工单定案，别自己调）──
+    private const int BubbleQueueCapacity = 8;             // 队列容量；溢出丢「最旧 info」，没有 info 才丢最旧
+    private const double BubbleTtlSeconds = 30;            // TTL（从入队时刻算）：超时丢弃＋记账，不补播
+    private const double BubbleTypingMs = 55;              // 打字节奏（用户定 55）；英文/数字整词吐出
+    private const double BubbleGapMs = 400;                // 条间留白（淡出 180 ＋ 静止 220）
+    private const double BubbleFadeMs = 180;               // 淡入/淡出时长
+    private const int BubbleMaxLines = 8;                  // 行数上限；超出 ScrollViewer 自动跟随
+
     private const double DragThreshold = 4;   // 位移 < 4px 松手 = 戳，≥ 4px = 拖（与系统 MinimumHorizontalDragDistance 同量级）
     // 球在窗口 Canvas 里的边距（单一事实源 —— Canvas 定位与 clamp 都用它们）
     private const double BallRightMargin = 18;    // 球右缘距窗右（X 右锚）
@@ -84,13 +92,25 @@ public sealed class FloatWindow : Window
 
     private readonly KernelSidecar _kernel;
     private readonly DispatcherTimer _idleTimer;      // 每秒喂 idleMs
-    private readonly DispatcherTimer _bubbleTimer;    // 气泡自动消失
+    private readonly DispatcherTimer _bubbleTimer;    // 二·Y：气泡状态机唯一时钟（原 4.5s 固定消失定时器已退役）
     private readonly System.Windows.Controls.Canvas _ballHost;  // 球的容器（抖动变换挂它身上；内部=视觉层+命中层）
     private readonly System.Windows.Shapes.Rectangle _hitArea;  // ⭐ 命中层：矩形 84×84（圆的四角天然不命中——监工打点实测）
     private readonly TranslateTransform _ballShake;   // L1 抖动 = 球的视觉反应
     private readonly Border _bubble;
     private readonly TextBlock _bubbleText;
+    private ScrollViewer _bubbleScroll = null!;       // 二·Y ⑤：气泡内套滚动（8 行上限 + 自动跟随）
     private readonly Border _panel;
+
+    // ── 二·Y 气泡队列状态（单一定时器状态机：Idle → Typing → Holding → Gap → Idle）──
+    private sealed record BubbleItem(string Text, string Severity, string EventId, DateTime EnqueuedAt);
+    private enum BubblePhase { Idle, Typing, Holding, Gap }
+    private readonly List<BubbleItem> _bubbleQueue = new();   // 待播队列（容量 BubbleQueueCapacity）
+    private BubbleItem? _bubbleCurrent;                        // 正在播的（critical 打断时回队首完整重播）
+    private string _bubbleFullText = "";                       // 当前条的完整文本
+    private int _bubbleCharIndex;                              // 已打出的字符数
+    private BubblePhase _bubblePhase = BubblePhase.Idle;
+    private DateTime _bubblePhaseUntil;                        // Holding/Gap 的截止时刻
+    private double _bubbleLastTextHeight = -1;                 // 自动跟随：ActualHeight 变了才 ScrollToEnd
     private TextBlock _statusText = null!;   // 在 MakePanel()（构造函数内）里创建 —— 非只读
     private TextBlock _cpuText = null!;
     private TextBlock _memText = null!;
@@ -222,14 +242,26 @@ public sealed class FloatWindow : Window
             FontSize = 12.5,
             Foreground = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)),
         };
-        _bubble.Child = _bubbleText;
+        _bubble.Child = _bubbleScroll = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = _bubbleText,
+        };
+        // 二·Y ④：8 行上限按公式换算（行高 = FontSize×1.36），不写死像素 —— 以后改字号不错位
+        _bubble.MaxHeight = _bubbleText.FontSize * 1.36 * BubbleMaxLines + _bubble.Padding.Top + _bubble.Padding.Bottom;
         // ⭐ P0-3（监工 2026-10-17）：气泡贴球**正上方**（不与面板同位），且 Z 序压在面板之上 ——
         //   「它刚说了句话」本就该盖过面板；此前气泡与面板几乎同位（Bottom 92 vs 90）且
         //   面板后加入在上层 → 鼠标在球上（点球前提）必然开着面板 → 气泡被完整盖住，一次都看不见。
         Canvas.SetRight(_bubble, 14);
         Canvas.SetBottom(_bubble, BallSize + 20);   // 球(bottom 14 + 64)顶在 78 → 气泡底 84，留 6px 间隙
         Panel.SetZIndex(_bubble, 10);               // 面板 Z 序默认 0 —— 气泡恒在其上
-        _bubble.MouseEnter += (_, _) => { _panelCloseTimer.Stop(); ExpandPanel(); };   // 气泡上也算悬停（话没读完不收）
+        _bubble.MouseEnter += (_, _) =>
+        {
+            _panelCloseTimer.Stop();
+            FlushTyping();                          // 二·Y「不拦路」：悬停立即吐完全文
+            ExpandPanel();
+        };   // 气泡上也算悬停（话没读完不收）
         _bubble.MouseLeave += (_, _) => StartPanelCloseGrace();
 
         _panel = MakePanel();
@@ -250,8 +282,8 @@ public sealed class FloatWindow : Window
         // ── 状态 ──
         _idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _idleTimer.Tick += (_, _) => FeedIdle();
-        _bubbleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4.5) };
-        _bubbleTimer.Tick += (_, _) => HideBubble();
+        _bubbleTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(BubbleTypingMs) };
+        _bubbleTimer.Tick += (_, _) => BubbleTick();   // 二·Y：状态机唯一时钟（55ms 一拍，Holding/Gap 查截止时刻）
         _fluidTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000.0 / FrameFps) };   // 二·R ③：帧率恒 30 —— 不再随负载调
         _fluidTimer.Tick += (_, _) => FluidTick();
 
@@ -322,7 +354,7 @@ public sealed class FloatWindow : Window
 
     private void OnSaid(SaidLine said)
     {
-        ShowBubble(said.Text);
+        EnqueueBubble(said);        // 二·Y：排队 → 逐字打出 → 按字数停留 → 淡出（不再来一条覆盖一条）
         if (_panelOpen) UpdateStatusLine();
         // L4（决策 #34）：poked@ 前缀 = 它决定「躲开」—— 外壳只做动作，说话归内核
         if (said.EventId.StartsWith("poked@", StringComparison.Ordinal)) MoveAside();
@@ -766,34 +798,195 @@ public sealed class FloatWindow : Window
         _statusText.Text = word.Length == 0 ? baseText : $"{baseText} · {word}";
     }
 
-    // ───────────────────────── 气泡（L2）─────────────────────────
+    // ───────────────────────── 气泡（L2）· 二·Y：队列 ＋ 打字机 ＋ 8 行上限 ─────────────────────────
 
-    private void ShowBubble(string text)
+    /// <summary>入队：warn/critical 插队首（在全部 info 之前，同级保持 FIFO）；info 排队尾。
+    /// 容量满丢「最旧 info」（没有 info 才丢最旧）；critical 打断正在播的（被打断者回队首完整重播）。</summary>
+    private void EnqueueBubble(SaidLine said)
     {
+        var severity = string.IsNullOrEmpty(said.Level) ? "info" : said.Level;
+        // 静音中：info 直接丢（解除后不补播 —— 与沉默机制同源）；warn/critical 照常（告警不受静音压制）
+        if (IsMuted && severity == "info")
+        {
+            AppendLog($"[气泡] 静音中丢弃 info：{said.Text}");
+            return;
+        }
+        var item = new BubbleItem(said.Text, severity, said.EventId, DateTime.Now);
+
+        if (_bubbleQueue.Count >= BubbleQueueCapacity)
+        {
+            var idxInfo = _bubbleQueue.FindIndex(m => m.Severity == "info");
+            var dropIdx = idxInfo >= 0 ? idxInfo : 0;
+            var dropped = _bubbleQueue[dropIdx];
+            _bubbleQueue.RemoveAt(dropIdx);
+            AppendLog($"[气泡] 丢弃（溢出）{dropped.Severity}：{dropped.Text}");
+        }
+
+        if (severity is "warn" or "critical")
+        {
+            var idx = _bubbleQueue.FindIndex(m => m.Severity == "info");
+            if (idx >= 0) _bubbleQueue.Insert(idx, item); else _bubbleQueue.Add(item);
+        }
+        else
+        {
+            _bubbleQueue.Add(item);
+        }
+        AppendLog($"[气泡] 入队（{severity}）队={_bubbleQueue.Count}：{item.Text}");
+
+        // critical 打断正在播的（Typing/Holding）—— 安全告警晚 10 秒就没意义。
+        // ⭐ 被打断者回队首**但排在这条 critical 之后**（先报警报，再重播被打断的话）：
+        //    插入位置 = 与 warn/critical 同规则（排全部 info 之前）
+        if (severity == "critical" && _bubbleCurrent is { } cur && _bubblePhase is BubblePhase.Typing or BubblePhase.Holding)
+        {
+            var curIdx = _bubbleQueue.FindIndex(m => m.Severity == "info");
+            if (curIdx >= 0) _bubbleQueue.Insert(curIdx, cur); else _bubbleQueue.Add(cur);
+            AppendLog($"[气泡] 被打断回队（critical 之后完整重播）：{cur.Text}");
+            _bubbleCurrent = null;
+            _bubblePhase = BubblePhase.Idle;
+        }
+
+        if (_bubblePhase == BubblePhase.Idle) TryPlayNext();
+    }
+
+    /// <summary>出队播下一条；TTL 超 30s 的沿途丢弃（记账，不补播）。队列空 → 归 Idle 不驻留。</summary>
+    private void TryPlayNext()
+    {
+        while (_bubbleQueue.Count > 0)
+        {
+            var head = _bubbleQueue[0];
+            _bubbleQueue.RemoveAt(0);
+            if ((DateTime.Now - head.EnqueuedAt).TotalSeconds <= BubbleTtlSeconds)
+            {
+                StartBubble(head);
+                return;
+            }
+            AppendLog($"[气泡] 丢弃（TTL 超 {BubbleTtlSeconds:F0}s）：{head.Text}");
+        }
+        _bubblePhase = BubblePhase.Idle;
+        _bubbleCurrent = null;
+        _bubbleTimer.Stop();
+    }
+
+    private void StartBubble(BubbleItem item, bool instant = false)
+    {
+        _bubbleCurrent = item;
+        _bubbleFullText = item.Text;
+        _bubbleCharIndex = 0;
+        _bubbleLastTextHeight = -1;
         UpdateOverlayPlacement();   // b2-a 复验观察2：气泡同样自适应（球贴上缘 → 翻转后挂球下方）
-        _bubbleText.Text = text;
+        _bubbleText.Text = instant ? _bubbleFullText : "";
+        _bubbleScroll.ScrollToHome();
         _bubble.Visibility = Visibility.Visible;
         _bubble.Opacity = 0;
-        _bubble.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180)));
+        _bubble.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(BubbleFadeMs)));
+        _bubblePhase = BubblePhase.Typing;
         _bubbleTimer.Stop();
-        _bubbleTimer.Start();       // 4.5s 后自动消失 —— 绝不永久驻留
-        AppendLog($"气泡显示：{text}");
+        _bubbleTimer.Start();
+        AppendLog($"[气泡] 出队 队={_bubbleQueue.Count}（{item.Severity}）：{item.Text}");
+        if (instant) CompleteTyping();   // 「不拦路」路径：跳过打字直接进停留
     }
 
-    private void HideBubble()
+    /// <summary>状态机唯一时钟（55ms 一拍）：Typing 逐段追加；Holding/Gap 查截止时刻。</summary>
+    private void BubbleTick()
     {
-        _bubbleTimer.Stop();
-        var anim = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(220));
-        anim.Completed += (_, _) => _bubble.Visibility = Visibility.Collapsed;
-        _bubble.BeginAnimation(OpacityProperty, anim);
-        AppendLog("气泡已隐");
+        switch (_bubblePhase)
+        {
+            case BubblePhase.Typing:
+                _bubbleText.Text += NextSegment();
+                if (_bubbleCharIndex >= _bubbleFullText.Length) { CompleteTyping(); break; }
+                // 自动跟随：行数（高度）变了才滚 —— 不逐字滚（逐字滚会每字重排）
+                if (Math.Abs(_bubbleText.ActualHeight - _bubbleLastTextHeight) > 0.5)
+                {
+                    _bubbleLastTextHeight = _bubbleText.ActualHeight;
+                    _bubbleScroll.ScrollToEnd();
+                }
+                break;
+
+            case BubblePhase.Holding:
+                if (DateTime.Now < _bubblePhaseUntil) return;
+                _bubblePhase = BubblePhase.Gap;
+                _bubblePhaseUntil = DateTime.Now.AddMilliseconds(BubbleGapMs);
+                FadeOutBubble();
+                break;
+
+            case BubblePhase.Gap:
+                if (DateTime.Now < _bubblePhaseUntil) return;
+                _bubblePhase = BubblePhase.Idle;
+                TryPlayNext();
+                break;
+        }
     }
 
-    /// <summary>渲染冒烟专用：展开面板（复现「鼠标在球上」现场）＋ 显示气泡 —— 验证气泡不被盖住。</summary>
+    /// <summary>打字收尾 → 进入停留：停留时长 = max(2.5s, 2.0s + 0.09s/字)，从最后一个字显示完起算。</summary>
+    private void CompleteTyping()
+    {
+        _bubbleText.Text = _bubbleFullText;
+        _bubbleCharIndex = _bubbleFullText.Length;
+        if (Math.Abs(_bubbleText.ActualHeight - _bubbleLastTextHeight) > 0.5)
+        {
+            _bubbleLastTextHeight = _bubbleText.ActualHeight;
+            _bubbleScroll.ScrollToEnd();
+        }
+        var holdMs = Math.Max(2500, 2000 + 90.0 * _bubbleFullText.Length);
+        _bubblePhase = BubblePhase.Holding;
+        _bubblePhaseUntil = DateTime.Now.AddMilliseconds(holdMs);
+        AppendLog($"[气泡] 打字完，停留 {holdMs / 1000.0:F1}s");
+    }
+
+    /// <summary>取下一段要显示的文本：英文/数字连续段整段吐（`Microsoft Windows` 不许出现 `Microsof`），中文逐字。</summary>
+    private string NextSegment()
+    {
+        if (_bubbleCharIndex >= _bubbleFullText.Length) return "";
+        if (IsWordChar(_bubbleFullText[_bubbleCharIndex]))
+        {
+            var j = _bubbleCharIndex;
+            while (j < _bubbleFullText.Length && IsWordChar(_bubbleFullText[j])) j++;
+            var seg = _bubbleFullText[_bubbleCharIndex..j];
+            _bubbleCharIndex = j;
+            return seg;
+        }
+        return _bubbleFullText[_bubbleCharIndex++].ToString();
+    }
+
+    private static bool IsWordChar(char c) =>
+        char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '\\' or '-';
+
+    /// <summary>二·Y「不拦路」单一入口：拖动 / 面板展开 / 气泡悬停三处都调 —— 打字中的立即吐完全文（动画不许挡操作）。</summary>
+    private void FlushTyping()
+    {
+        if (_bubblePhase == BubblePhase.Typing) CompleteTyping();
+    }
+
+    /// <summary>二·Y 静音联动：立即淡出 ＋ 清空队列（解除后不补播 —— 静音期间只记账）。</summary>
+    private void SuppressBubbleForMute()
+    {
+        var n = _bubbleQueue.Count;
+        _bubbleQueue.Clear();
+        _bubbleCurrent = null;
+        _bubbleTimer.Stop();
+        _bubblePhase = BubblePhase.Idle;
+        if (_bubble.Visibility == Visibility.Visible) FadeOutBubble();
+        if (n > 0) AppendLog($"[气泡] 静音：清空队列 {n} 条，解除后不补播");
+    }
+
+    private void FadeOutBubble()
+    {
+        var anim = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(220));
+        anim.Completed += (_, _) =>
+        {
+            // 守卫：淡出动画完成时若已切入下一条（Typing），不能把新气泡藏掉
+            if (_bubblePhase is BubblePhase.Gap or BubblePhase.Idle) _bubble.Visibility = Visibility.Collapsed;
+        };
+        _bubble.BeginAnimation(OpacityProperty, anim);
+    }
+
+    /// <summary>渲染冒烟专用：展开面板（复现「鼠标在球上」现场）＋ 显示气泡 —— 验证气泡不被盖住。
+    /// 二·Y：走队列后用 Flush 立即吐完全文 —— 截图要确定性（不测打字机）。</summary>
     public void ShowTestBubble(string text)
     {
         ExpandPanel();
-        ShowBubble(text);
+        EnqueueBubble(new SaidLine("render-test@", "info", text));
+        FlushTyping();
     }
 
     /// <summary>渲染冒烟专用：气泡/面板的可见性与透明度实况（诊断「为什么截图里没有」）。</summary>
@@ -850,6 +1043,7 @@ public sealed class FloatWindow : Window
 
     private void ExpandPanel()
     {
+        FlushTyping();              // 二·Y「不拦路」：面板展开立即吐完打字中的气泡
         UpdateOverlayPlacement();   // b2-a 复验观察2：先按当前球位自适应方向（幂等）—— 面板绝不整块出屏
         if (_panelOpen) return;
         _panelOpen = true;
@@ -896,6 +1090,7 @@ public sealed class FloatWindow : Window
     private void OnBallDragStart(object sender, MouseButtonEventArgs e)
     {
         if (_movingAside) return;      // Left/Top 正被「挪一挪」动画持有 —— 不抢（防打架）
+        FlushTyping();                 // 二·Y「不拦路」：拖动立即吐完打字中的气泡
         _dragStartScreen = ScreenDip(e);
         _dragStartBall = new Point(BallScreenLeft, BallScreenTop);   // 记球不记窗 —— 窗口锚可翻转，球才是稳定参照
         _dragging = true;
@@ -1180,6 +1375,7 @@ public sealed class FloatWindow : Window
         {
             _muteUntil = EpochNow() + MuteDurationMs;
             AppendLog("静音 1 小时（chitchat 停；戳与告警不受影响）");
+            SuppressBubbleForMute();   // 二·Y：立即淡出 ＋ 清空队列（解除后不补播）
         }
         UpdateMuteUi();
     }

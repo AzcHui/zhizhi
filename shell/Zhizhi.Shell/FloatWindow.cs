@@ -96,7 +96,9 @@ public sealed class FloatWindow : Window
     private const double IdleFadeEndMin = 60;              // 60 分钟滑到最低（30 分钟内平滑完成）
     private const double IdleFadeMin = 0.85;               // 蔫的最低乘数
     private const double MoodAlphaFloor = 0.55;            // 总 alpha 下限（坑4：蔫不能暗得像坏了）
-    private const double MoodAlphaCeil = 1.15;             // 总 alpha 上限（脉冲不许白成一片）
+    // 二·Z 复验 P1：固定上限 1.15 与亲近档 1.20 自相矛盾（亲近档脉冲恒 0、熟悉档只剩 4.5%）——
+    // 天花板改「随档位走」：基础值 + 脉冲余量，四档全不被切（复算：critical 峰值 1.25~1.70 < 各档 ceil）
+    private const double PulseCeilHeadroom = 0.55;         // 档位基础值之上的脉冲余量（ceil = 档位基础 + 0.55）
 
     private const double DragThreshold = 4;   // 位移 < 4px 松手 = 戳，≥ 4px = 拖（与系统 MinimumHorizontalDragDistance 同量级）
     // 球在窗口 Canvas 里的边距（单一事实源 —— Canvas 定位与 clamp 都用它们）
@@ -152,6 +154,8 @@ public sealed class FloatWindow : Window
 
     // ── M11-a 情绪状态（二·Z）：trust 档位 ＋ 说话脉冲 ＋ 被冷落 —— 只碰 alpha/线宽/半径，绝不碰 gain ──
     private double _moodAlpha = 1.0;          // 平滑后的亮度乘数（trust × idleFade），脉冲不进平滑层
+    private double _trustAlpha = 1.0;         // 当前档位基础 alpha（FluidTick 算脉冲天花板 ceil = _trustAlpha + 0.55 用）
+    private double _lastMoodA = 1.0;          // 上一帧渲染生效的 moodA（P2：跨档日志打生效值，不打档位表值）
     private double _moodWidth = 1.0;          // 平滑后的线宽乘数（只跟 trust）
     private int _lastMoodTier = -1;           // 上次 trust 档（跨档日志用；-1 = 未记）
     private bool _idleFadeOn;                 // 蔫 进入/退出（日志只记边界）
@@ -484,7 +488,10 @@ public sealed class FloatWindow : Window
             var halos = _slotHalos[slot]!;
             // M11-a：情绪乘数逐层应用（坑2：绝不统一覆盖 Opacity —— 三层 alpha 本来就不同，
             // 分层的虚实感必须原样保留；乘数只碰亮度/线宽，深浅对比不动）
-            var moodA = Math.Clamp(_moodAlpha * (1 + _pulseNorm * _pulseAmount), MoodAlphaFloor, MoodAlphaCeil);
+            // 二·Z 复验 P1：脉冲改**加法**（在基础亮度上加一档），天花板随档位走（基础+0.55）——
+            // 旧「乘法×clamp1.15」把亲近档静态就切到 1.15、脉冲增幅恒 0；改后四档脉冲 +0.35 绝对增量全可读
+            var moodA = Math.Clamp(_moodAlpha + _pulseNorm * _pulseAmount, MoodAlphaFloor, _trustAlpha + PulseCeilHeadroom);
+            _lastMoodA = moodA;
             var moodW = _moodWidth;
             for (var i = 0; i < layers.Length; i++)
             {
@@ -880,12 +887,14 @@ public sealed class FloatWindow : Window
         _lastMoodT = t;
 
         var (tA, tW, tier, word) = TrustMood(_moodTrustOverride ?? _trust);
+        _trustAlpha = tA;
         if (tier != _lastMoodTier)
         {
             var first = _lastMoodTier < 0;
             _lastMoodTier = tier;
             if (!first)   // 首拍不打日志（还没法跟谁「跨」）
-                AppendLog($"[心情] trust={(_moodTrustOverride ?? _trust) ?? 0}({word}) alpha=×{tA:F2} → 情绪乘数 {_moodAlpha:F2}");
+                // P2：两个都打 —— 档位表值（平滑目标）与实际渲染生效值（含 clamp），日志不许替代码说谎
+                AppendLog($"[心情] trust={(_moodTrustOverride ?? _trust) ?? 0}({word}) 档位×{tA:F2} → 生效×{_lastMoodA:F2}");
         }
 
         // ③ 被冷落（蔫）：30 分钟起，30 分钟内平滑滑到 ×0.85（总 alpha 还有 0.55 下限兜底）

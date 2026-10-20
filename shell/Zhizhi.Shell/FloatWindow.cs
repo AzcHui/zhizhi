@@ -85,6 +85,19 @@ public sealed class FloatWindow : Window
     private const double BubbleTypingBudgetMs = 6000;      // 二·Y 复验观察1：打字总时长封顶 6s（超长一拍多吐几字，正常消息不受影响）
     private const double BubbleHoldMaxMs = 12000;          // 停留封顶 12s —— 两条一起保证 per ≤ 18.4s < 30s，「容量 8 永久成立」的数学前提不被长文本打破
 
+    // ── M11-a 情绪参数（二·Z 定案，别自己调）──
+    private const double MoodTauMs = 600;                  // 情绪乘数平滑 τ（复用 1-exp(-dt/τ)，禁止阶跃）
+    private const double PulseAlphaInfo = 0.35;            // 说话脉冲提亮（info/warn）
+    private const double PulseAlphaCritical = 0.50;        // critical 更强（「惊了一下」）
+    private const double PulseTauInfoMs = 180;             // info 脉冲回落 τ
+    private const double PulseTauCriticalMs = 120;         // critical 回落更快
+    private const double PulseRadiusScale = 1.04;          // 环径微扩峰值
+    private const double IdleFadeStartMin = 30;            // 被冷落：30 分钟起
+    private const double IdleFadeEndMin = 60;              // 60 分钟滑到最低（30 分钟内平滑完成）
+    private const double IdleFadeMin = 0.85;               // 蔫的最低乘数
+    private const double MoodAlphaFloor = 0.55;            // 总 alpha 下限（坑4：蔫不能暗得像坏了）
+    private const double MoodAlphaCeil = 1.15;             // 总 alpha 上限（脉冲不许白成一片）
+
     private const double DragThreshold = 4;   // 位移 < 4px 松手 = 戳，≥ 4px = 拖（与系统 MinimumHorizontalDragDistance 同量级）
     // 球在窗口 Canvas 里的边距（单一事实源 —— Canvas 定位与 clamp 都用它们）
     private const double BallRightMargin = 18;    // 球右缘距窗右（X 右锚）
@@ -98,6 +111,7 @@ public sealed class FloatWindow : Window
     private readonly System.Windows.Controls.Canvas _ballHost;  // 球的容器（抖动变换挂它身上；内部=视觉层+命中层）
     private readonly System.Windows.Shapes.Rectangle _hitArea;  // ⭐ 命中层：矩形 84×84（圆的四角天然不命中——监工打点实测）
     private readonly TranslateTransform _ballShake;   // L1 抖动 = 球的视觉反应
+    private System.Windows.Media.ScaleTransform _ballPulseScale = null!;   // M11-a：说话脉冲的环径微扩
     private readonly Border _bubble;
     private readonly TextBlock _bubbleText;
     private ScrollViewer _bubbleScroll = null!;       // 二·Y ⑤：气泡内套滚动（8 行上限 + 自动跟随）
@@ -136,6 +150,17 @@ public sealed class FloatWindow : Window
     private double? _lastCpu;                          // 最近采样 CPU —— 驱动颜色连续插值 + 档位
     private DateTime _alertHoldUntil = DateTime.MinValue;              // 告警级台词后的保持期
 
+    // ── M11-a 情绪状态（二·Z）：trust 档位 ＋ 说话脉冲 ＋ 被冷落 —— 只碰 alpha/线宽/半径，绝不碰 gain ──
+    private double _moodAlpha = 1.0;          // 平滑后的亮度乘数（trust × idleFade），脉冲不进平滑层
+    private double _moodWidth = 1.0;          // 平滑后的线宽乘数（只跟 trust）
+    private int _lastMoodTier = -1;           // 上次 trust 档（跨档日志用；-1 = 未记）
+    private bool _idleFadeOn;                 // 蔫 进入/退出（日志只记边界）
+    private DateTime _pulseAt = DateTime.MinValue;   // 脉冲起点（MinValue = 无脉冲）
+    private double _pulseAmount;              // 本次脉冲的 alpha 峰值
+    private double _pulseTauMs;               // 本次脉冲回落 τ
+    private double _pulseNorm;                // 脉冲归一值（0~1，半径缩放用）
+    private double _lastMoodT = -1;           // 情绪平滑的 dt 基准（复用 _fluidClock 时间轴）
+
     // ── 形态注册表 ＋ 双槽交叉淡入（开工单④⑤）──
     private readonly IBallForm[] _forms = { new GyroForm(), new DebugRingForm() };
     private readonly System.Windows.Controls.Canvas?[] _slotHosts = new System.Windows.Controls.Canvas?[2];  // 每槽一个容器 —— 交叉淡入淡容器，槽内线的粗细浓淡是各 Path 自己的基值
@@ -146,7 +171,7 @@ public sealed class FloatWindow : Window
     private bool _fading;          // 交叉淡入进行中（切换防重入）
 
     private int _samples;             // 已看 N 轮
-    private int? _trust;              // M7：内核报上来的亲密度
+    private int? _trust;              // M7：内核报上来的亲密度（null = 首拍未报 → M11-a 按陌生兜底）
     private bool _panelOpen;
     private bool _movingAside;        // L4 躲开动画进行中（防重入；watchdog 兜底防卡死）
     private bool _dragging;           // 拖动进行中（球上按下并捕获鼠标后）
@@ -186,12 +211,18 @@ public sealed class FloatWindow : Window
         var canvas = new Canvas();
 
         _ballShake = new TranslateTransform();
+        _ballPulseScale = new System.Windows.Media.ScaleTransform();
         _mainBrush = new System.Windows.Media.SolidColorBrush(HslToColor(HueCalm, SatCalm, LumCalm));
         _ballHost = new System.Windows.Controls.Canvas
         {
             Width = BallSize,
             Height = BallSize,
-            RenderTransform = _ballShake,   // 戳的抖动 = 整个球容器一起抖
+            // 戳的抖动（平移）＋ M11-a 说话脉冲的环径微扩（缩放，中心 = 球心）—— 组合变换互不打架
+            RenderTransform = new System.Windows.Media.TransformGroup
+            {
+                Children = { _ballShake, _ballPulseScale }
+            },
+            RenderTransformOrigin = new Point(0.5, 0.5),
         };
         // 双槽（开工单⑤）：每槽一个容器（交叉淡入淡容器 Opacity），槽内 = 每根线一层（光晕+描边）。
         // 槽 0 = 前台（常态线团），槽 1 = 备用（交叉淡入时接新形态）。
@@ -425,6 +456,8 @@ public sealed class FloatWindow : Window
             AppendLog($"[形态] cpu={(_lastCpu is { } c ? $"{c:F0}%" : "--")} intensity={_curIntensity:F2} gain=×{1 + GyroSpeedGain * _curIntensity:F2}");
         }
 
+        UpdateMood(t);   // M11-a：trust 档位 ＋ 被冷落 平滑逼近 ＋ 说话脉冲回落（在逐层应用前算好）
+
         // 颜色：连续跟随 CPU（HSL 空间插值，色相 180→16 递减），带死区 t = clamp01((cpu−40)/50)；无数据 = 灰
         var ct = _lastCpu is { } cv ? Clamp01((cv - ColorDeadZoneLow) / ColorDeadZoneSpan) : double.NaN;
         var tgtH = double.IsNaN(ct) ? _curHue : HueCalm + (HueAlert - HueCalm) * ct;
@@ -449,11 +482,24 @@ public sealed class FloatWindow : Window
             }
             var strokes = _slotStrokes[slot]!;   // 守卫后非 null —— 局部变量消 CS8602
             var halos = _slotHalos[slot]!;
+            // M11-a：情绪乘数逐层应用（坑2：绝不统一覆盖 Opacity —— 三层 alpha 本来就不同，
+            // 分层的虚实感必须原样保留；乘数只碰亮度/线宽，深浅对比不动）
+            var moodA = Math.Clamp(_moodAlpha * (1 + _pulseNorm * _pulseAmount), MoodAlphaFloor, MoodAlphaCeil);
+            var moodW = _moodWidth;
             for (var i = 0; i < layers.Length; i++)
             {
                 strokes[i].Data = layers[i].Geo;
                 halos[i].Data = layers[i].Geo;
+                var a = Clamp01(layers[i].Alpha * moodA);
+                strokes[i].Opacity = a;
+                halos[i].Opacity = HaloOpacity * a;
+                strokes[i].StrokeThickness = layers[i].Width * moodW;
+                halos[i].StrokeThickness = layers[i].Width * moodW * HaloWidthFactor;
             }
+            // 说话脉冲的环径微扩（峰值 ×1.04，随脉冲指数回落到 1）
+            var scale = 1 + (PulseRadiusScale - 1) * _pulseNorm;
+            _ballPulseScale.ScaleX = scale;
+            _ballPulseScale.ScaleY = scale;
         }
     }
 
@@ -805,6 +851,69 @@ public sealed class FloatWindow : Window
         _statusText.Text = word.Length == 0 ? baseText : $"{baseText} · {word}";
     }
 
+    // ───────────────────────── M11-a 情绪（二·Z）─────────────────────────
+
+    private int? _moodTrustOverride;   // M11-a 验收②专用：--mood-test 注入 trust（真实 trust 照常解析存账，采样不会冲掉注入值）
+
+    /// <summary>验收②专用：注入指定 trust 档位截三态图（沉默/陌生/亲近）。</summary>
+    internal void MoodTestOverride(int? trust) => _moodTrustOverride = trust;
+
+    /// <summary>验收②专用：当前平滑后的情绪亮度乘数（日志/断言用）。</summary>
+    internal double MoodAlphaForTest => _moodAlpha;
+
+    /// <summary>trust 档位 → 情绪系数（二·Z 表照抄）：沉默&lt;10 ／ 陌生&lt;40 ／ 熟悉&lt;80 ／ 亲近≥80。
+    /// null（首拍未报）→ 按**陌生**兜底（坑3：不能一上来就亲近地活泼，也不能一上来就蔫 —— 陌生系数恰是 ×1.00）。</summary>
+    private static (double Alpha, double Width, int Tier, string Word) TrustMood(int? trust)
+    {
+        var t = trust ?? 20;
+        if (t < 10) return (0.75, 0.92, 0, "沉默");
+        if (t < 40) return (1.00, 1.00, 1, "陌生");
+        if (t < 80) return (1.10, 1.05, 2, "熟悉");
+        return (1.20, 1.10, 3, "亲近");
+    }
+
+    /// <summary>情绪乘数每帧更新（M11-a 实现要点 5：全部指数平滑，禁止阶跃）：
+    /// 平滑层 = trust 系数 × 被冷落系数；脉冲层 = 出队触发的指数回落（要「瞬间一亮」，不参与平滑）。</summary>
+    private void UpdateMood(double t)
+    {
+        var dt = _lastMoodT < 0 ? 0 : Math.Clamp(t - _lastMoodT, 0, 0.1);   // 复用二·R ④ 的 dt 夹紧（隐藏球回来不跳变，验收⑥）
+        _lastMoodT = t;
+
+        var (tA, tW, tier, word) = TrustMood(_moodTrustOverride ?? _trust);
+        if (tier != _lastMoodTier)
+        {
+            var first = _lastMoodTier < 0;
+            _lastMoodTier = tier;
+            if (!first)   // 首拍不打日志（还没法跟谁「跨」）
+                AppendLog($"[心情] trust={(_moodTrustOverride ?? _trust) ?? 0}({word}) alpha=×{tA:F2} → 情绪乘数 {_moodAlpha:F2}");
+        }
+
+        // ③ 被冷落（蔫）：30 分钟起，30 分钟内平滑滑到 ×0.85（总 alpha 还有 0.55 下限兜底）
+        var idleFade = 1.0;
+        var idleMin = (Win32.GetIdleMs() ?? 0) / 60000.0;
+        var fade = Math.Clamp((idleMin - IdleFadeStartMin) / (IdleFadeEndMin - IdleFadeStartMin), 0, 1);
+        idleFade = 1.0 - (1.0 - IdleFadeMin) * fade;
+        if ((fade > 0) != _idleFadeOn)
+        {
+            _idleFadeOn = fade > 0;
+            AppendLog($"[心情] 被冷落：idle={idleMin:F0}m → 亮度开始滑向 ×{IdleFadeMin}");
+        }
+
+        // ② 说话脉冲：出队触发，指数回落（info τ=180 / critical τ=120）
+        _pulseNorm = 0.0;
+        if (_pulseAt != DateTime.MinValue)
+        {
+            var elapsed = (DateTime.Now - _pulseAt).TotalMilliseconds;
+            var norm = Math.Exp(-elapsed / _pulseTauMs);
+            if (norm < 0.01) { _pulseAt = DateTime.MinValue; }   // 归零停算（600ms 内基本回落完）
+            else _pulseNorm = norm;
+        }
+
+        var k = 1 - Math.Exp(-dt * 1000 / MoodTauMs);
+        _moodAlpha += (tA * idleFade - _moodAlpha) * k;
+        _moodWidth += (tW - _moodWidth) * k;
+    }
+
     // ───────────────────────── 气泡（L2）· 二·Y：队列 ＋ 打字机 ＋ 8 行上限 ─────────────────────────
 
     /// <summary>入队：warn/critical 插队首（在全部 info 之前，同级保持 FIFO）；info 排队尾。
@@ -908,6 +1017,11 @@ public sealed class FloatWindow : Window
         // 二·Y 复验观察1：打字总时长封顶 6s —— 超过 109 字（6000/55）的长文本每拍多吐几字
         _bubbleCharsPerTick = Math.Max(1, (int)Math.Ceiling(_bubbleFullText.Length / (BubbleTypingBudgetMs / BubbleTypingMs)));
         _bubbleLastTextHeight = -1;
+        // M11-a ②：说话脉冲 —— 出队（开始播放）即触发；critical 更强更短 =「惊了一下」（二·Z 要点 4）
+        _pulseAmount = item.Severity == "critical" ? PulseAlphaCritical : PulseAlphaInfo;
+        _pulseTauMs = item.Severity == "critical" ? PulseTauCriticalMs : PulseTauInfoMs;
+        _pulseAt = DateTime.Now;
+        AppendLog($"[心情] 说话脉冲（{item.Severity}）");
         UpdateOverlayPlacement();   // b2-a 复验观察2：气泡同样自适应（球贴上缘 → 翻转后挂球下方）
         _bubbleText.Text = instant ? _bubbleFullText : "";
         _bubbleScroll.ScrollToHome();

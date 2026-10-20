@@ -32,3 +32,4 @@ shell/zhi-shell.log
 .env
 .env.*
 !.env.example
+zhi-shell.mood-*.png

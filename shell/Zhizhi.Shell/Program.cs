@@ -23,6 +23,8 @@ public static class Program
             return RunSelfTest();
         if (args.Contains("--render-test", StringComparer.OrdinalIgnoreCase))
             return RunRenderTest();
+        if (args.Contains("--mood-test", StringComparer.OrdinalIgnoreCase))
+            return RunMoodTest();
 
         // ── b2-b1 ① 单实例互斥：双击两次 = 两个只只、两个内核（双重告警、双重闲聊）──
         // ⭐ 只拦**正常 UI 模式**：--self-test / --render-test 是验收工具，上面已分流，不受互斥影响。
@@ -182,6 +184,87 @@ public static class Program
         Check("无孤儿 node", true, $"（系统当前 node 进程 {orphans} 个，供人工比对）");
 
         Console.WriteLine(failures == 0 ? "=== 自检结束：全部通过 ===" : $"=== 自检结束：{failures} 项失败 ===");
+        return failures == 0 ? 0 : 1;
+    }
+
+    // ───────────────────── 情绪三态截图（M11-a 验收②：沉默/陌生/亲近 三张并排，肉眼分亮度）─────────────────────
+    private static int RunMoodTest()
+    {
+        AttachConsole(unchecked((uint)-1));
+        try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+
+        Console.WriteLine("=== 只只 · WPF 情绪三态截图（M11-a 验收②）===");
+        var repo = KernelSidecar.FindRepoRoot();
+        if (repo is null) { Console.WriteLine("  FAIL  没找到仓库根"); return 1; }
+        ShellLog.FilePath = LogPath;
+        ShellLog.Write("情绪三态截图开始");
+
+        var kernel = new KernelSidecar();
+        var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
+        var window = new FloatWindow(kernel);
+        var failures = 0;
+        var samples = 0;
+        kernel.SampleArrived += _ => System.Threading.Interlocked.Increment(ref samples);
+
+        var cases = new (int Trust, string Name)[] { (5, "silent"), (20, "stranger"), (90, "close") };
+        var caseIdx = -1;          // -1 = 等首采样
+        var waitTicks = 0;
+        const int settleTicks = 60;   // 每态等 3s：τ=600ms 平滑收敛（>5τ）＋ 说话脉冲回落 ＋ greeting 播完
+
+        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        timer.Tick += (_, _) =>
+        {
+            waitTicks++;
+            if (waitTicks > 600) { Console.WriteLine("  FAIL  等采样超时（30s）"); failures++; timer.Stop(); window.Close(); return; }
+
+            if (caseIdx < 0)
+            {
+                if (System.Threading.Volatile.Read(ref samples) < 1) return;
+                caseIdx = 0;
+                waitTicks = 0;
+                window.MoodTestOverride(cases[caseIdx].Trust);
+                Console.WriteLine($"  [{cases[0].Name}] 注入 trust={cases[0].Trust}");
+                return;
+            }
+            if (waitTicks < settleTicks) return;
+
+            try
+            {
+                var (trust, name) = cases[caseIdx];
+                Console.WriteLine($"  [{name}] trust={trust} moodAlpha={window.MoodAlphaForTest:F3}");
+                var w = (int)window.ActualWidth;
+                var h = (int)window.ActualHeight;
+                var rtb = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
+                rtb.Render(window);
+                var enc = new PngBitmapEncoder();
+                enc.Frames.Add(BitmapFrame.Create(rtb));
+                var shot = Path.Combine(repo, "shell", $"zhi-shell.mood-{name}.png");
+                using var fs = File.Create(shot);
+                enc.Save(fs);
+                Console.WriteLine($"  截图已存：{shot}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  FAIL  截图失败：{ex.Message}");
+                failures++;
+            }
+            caseIdx++;
+            if (caseIdx >= cases.Length) { timer.Stop(); window.Close(); return; }
+            window.MoodTestOverride(cases[caseIdx].Trust);
+            Console.WriteLine($"  [{cases[caseIdx].Name}] 注入 trust={cases[caseIdx].Trust}");
+            waitTicks = 0;
+        };
+
+        window.Loaded += (_, _) => timer.Start();
+
+        try { kernel.Start(repo, intervalMs: 300); }
+        catch (Exception ex) { Console.WriteLine($"  FAIL  sidecar 启动：{ex.Message}"); return 1; }
+
+        try { app.Run(window); }
+        catch (Exception ex) { Console.WriteLine($"  FAIL  消息循环：{ex.Message}"); return 1; }
+        finally { kernel.Stop(); }
+
+        Console.WriteLine(failures == 0 ? "=== 情绪三态截图：通过（三张 mood-*.png 并排肉眼比亮度）===" : $"=== 情绪三态截图：{failures} 项失败 ===");
         return failures == 0 ? 0 : 1;
     }
 

@@ -293,7 +293,8 @@ public static class Program
             (null,               false, "unknown",    "取不到进程名（系统进程/已退出）→ unknown 不抛"),
             ("somegame",         true,  "fullscreen", "未知进程全屏 → fullscreen（游戏/全屏视频统一判据）"),
             ("Code",             true,  "code",       "⭐ 易错点2/⑧：IDE 全屏仍是 code（进程名命中就不看全屏）"),
-            ("chrome",           true,  "browser",    "浏览器全屏看视频 → browser（不是 fullscreen，同样先看进程名）"),
+            ("chrome",           true,  "fullscreen", "⭐ P3：浏览器真全屏 → fullscreen（在看内容，该闭嘴）"),
+            ("chrome",           false, "browser",    "浏览器非全屏 → browser（查资料，说话）"),
         };
         var fails = 0;
         foreach (var c in cases)
@@ -306,6 +307,16 @@ public static class Program
         // 验收②补充：真前台实测（打印类别名，**绝不打印标题** —— 没有标题可打）
         var live = Win32.ForegroundClass();
         Console.WriteLine($"  ── 真前台：当前窗口分类 = {live}（meeting/fullscreen 会压闲聊；code/browser/unknown 不影响）──");
+
+        // 二·AC P1 性能验收：60 次取样，单次平均 < 1ms（删掉 pid 缓存后的代价必须可忽略）
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (var i = 0; i < 60; i++) _ = Win32.ForegroundClass();
+        sw.Stop();
+        var avgMs = sw.Elapsed.TotalMilliseconds / 60.0;
+        var perfOk = avgMs < 1.0;
+        if (!perfOk) fails++;
+        Console.WriteLine($"  {(perfOk ? "OK " : "FAIL")}  ForegroundClass() 60 次取样：平均 {avgMs:F3} ms/次（判据 < 1ms）");
+
         Console.WriteLine(fails == 0 ? "=== 前台分类自测：通过 ===" : $"=== 前台分类自测：{fails} 项失败 ===");
         return fails == 0 ? 0 : 1;
     }
@@ -348,6 +359,8 @@ public static class Program
                 if (Volatile.Read(ref samples) < 1) return;
                 Console.WriteLine($"  UI 模式采样：{Volatile.Read(ref samples)} 条");
                 // P0-3 回归：面板开着（复现「鼠标在球上」现场）＋ 气泡显示 —— 截图验遮挡
+                // 二·AC P2：注入固定「前台 code」—— 面板上的前台读数要在这张截图里看得见
+                window.FgTestOverride("code");
                 window.ShowTestBubble("【渲染冒烟】这条气泡应该在截图里可见 —— 不被面板盖住");
                 bubbleShown = true;
                 phase = 1;

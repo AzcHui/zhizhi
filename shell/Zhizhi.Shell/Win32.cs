@@ -109,13 +109,23 @@ internal static class Win32
     /// <summary>浏览器进程名白名单</summary>
     private static readonly string[] BrowserNames = { "chrome", "msedge", "firefox", "brave", "opera" };
 
-    /// <summary>pid → 进程名缓存（GetProcessById 每次都开句柄 —— pid 不变就不值得重复开）</summary>
-    private static readonly Dictionary<int, string> ProcNameCache = new();
+    /// <summary>
+    /// ⚠️ 故意不缓存进程名（见二·AC P1）：Windows 的 **pid 会复用** ——
+    /// 开会 → ms-teams.exe 拿到 pid 8000 → 缓存 {8000:"ms-teams"} → 闭会进程退出
+    /// → 某天 chrome 复用 pid 8000 → 缓存仍返回 "ms-teams" → 判成 meeting →
+    /// **busy 恒 true → 闲聊永远攒着不说**。
+    /// 这种错不抛异常、不写日志，表现就是「它忽然不爱说话了」——排查时根本想不到是 pid 缓存。
+    /// 每秒 1 次 `GetProcessById`（几十 µs）远小于一次静默误判的代价。
+    /// 若将来真觉得慢：key 换成 `pid + 进程启动时间`，**别只留 pid**。
+    /// </summary>
 
     /// <summary>
     /// 分类纯函数 —— 合成自测（--fg-test）直接打这里，不碰真窗口。
-    /// ⚠️ 顺序是红线（易错点 2）：meeting → code → browser → **全屏** → unknown ——
-    /// 进程名命中 code 就不再看全屏，否则 VS Code 按 F11 全屏写代码会被判 fullscreen → 整段不说话。
+    /// ⚠️ 顺序是红线（易错点 2 ＋ 二·AC P3）：**meeting → code → 全屏 → browser → unknown**。
+    ///   · 进程名命中 `meeting`/`code` 就不再看全屏 —— 否则 VS Code 按 F11 全屏写代码会被判
+    ///     fullscreen → 整段不说话（易错点 2）。
+    ///   · `fullscreen` 排在 `browser` **之前**（P3）—— 浏览器真全屏（F11 看视频／网页版会议／
+    ///     在线演示）几乎必然意味着「你在看内容」，这时它来一句比误判成闭嘴难受得多。
     /// </summary>
     public static string Classify(string? processName, bool fullscreen)
     {
@@ -124,10 +134,10 @@ internal static class Win32
         {
             if (MeetingNames.Contains(name)) return "meeting";
             if (CodeNames.Contains(name)) return "code";
-            if (BrowserNames.Contains(name)) return "browser";
         }
         // 易错点 3：Maximized ≠ 全屏 —— 调用方必须用「窗口矩形 == rcMonitor」判，不是查最大化状态
         if (fullscreen) return "fullscreen";
+        if (name != null && BrowserNames.Contains(name)) return "browser";
         // 易错点 5：取不到进程名 / 桌面 / 任务栏 → unknown，且 unknown **不构成 busy**（宁可多说一句）
         return "unknown";
     }
@@ -146,6 +156,7 @@ internal static class Win32
     /// <summary>
     /// 当前前台的分类结果（枚举字符串，**唯一允许跨界的东西**）。
     /// 取不到任何判据 → unknown（易错点 4：系统进程 / 已退出 / 权限不足不许抛）。
+    /// ⚠️ 进程名**不缓存**（二·AC P1：pid 会复用，缓存会静默误判）。
     /// </summary>
     public static string ForegroundClass()
     {
@@ -155,13 +166,8 @@ internal static class Win32
         string? procName = null;
         if (pid > 0)
         {
-            if (!ProcNameCache.TryGetValue((int)pid, out procName))
-            {
-                try { procName = System.Diagnostics.Process.GetProcessById((int)pid)?.ProcessName; }
-                catch { procName = null; }   // 易错点 4：系统进程 / 已退出 / 权限不足 → unknown，不抛
-                ProcNameCache[(int)pid] = procName ?? "";
-            }
-            if (procName == "") procName = null;
+            try { procName = System.Diagnostics.Process.GetProcessById((int)pid)?.ProcessName; }
+            catch { procName = null; }   // 易错点 4：系统进程 / 已退出 / 权限不足 → unknown，不抛
         }
         return Classify(procName, IsFullscreen(hwnd));
     }

@@ -139,6 +139,8 @@ public sealed class FloatWindow : Window
     private TextBlock _statusText = null!;   // 在 MakePanel()（构造函数内）里创建 —— 非只读
     private TextBlock _cpuText = null!;
     private TextBlock _memText = null!;
+    private string _fgClass = "—";   // 二·AC P2：当前前台分类（M11-b1）—— 面板上唯一「看得见」的前台读数
+    private bool _fgLocked;          // 验收模式注入后锁定读数（防 1Hz FeedIdle 用真实值覆盖）
     private readonly Random _rng = new();
 
     // ── b2-b2 形态库运行时状态 ──
@@ -845,7 +847,9 @@ public sealed class FloatWindow : Window
     {
         (false, _) => "内核停了",
         (_, "—") => "看着呢",
-        _ => $"看着呢 —— CPU {_cpuText.Text}",
+        // 二·AC P2：带上「前台 xxx」—— b1/b2 的效果都是「少说/多说一句」，没有可感知输出，
+        //   这一行是**唯一「它现在以为我在干什么」的读数**（没有它，「今天很安静」与「它坏了」无法区分）
+        _ => $"看着呢 —— CPU {_cpuText.Text} · 前台 {_fgClass}",
     };
 
     private void UpdateStatusLine()
@@ -1155,6 +1159,15 @@ public sealed class FloatWindow : Window
         FlushTyping();
     }
 
+    /// <summary>验收专用（二·AC P2）：注入面板上的「前台 xxx」读数 —— 截图是这版唯一看得见的证据。
+    /// ⚠️ 注入后**锁定**：否则 1Hz 的 FeedIdle 会用真实前台把它覆盖掉（截图里就成 unknown 了）。</summary>
+    public void FgTestOverride(string cls)
+    {
+        _fgClass = cls;
+        _fgLocked = true;
+        if (_panelOpen) UpdateStatusLine();
+    }
+
     /// <summary>渲染冒烟专用：气泡/面板的可见性与透明度实况（诊断「为什么截图里没有」）。</summary>
     public string DumpVisualState() =>
         $"bubble(V={_bubble.Visibility} O={_bubble.Opacity:F2} W={_bubble.ActualWidth:F0} H={_bubble.ActualHeight:F0}) " +
@@ -1170,6 +1183,8 @@ public sealed class FloatWindow : Window
             FontSize = 11.5,
             Foreground = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)),
             Text = "正在把内核叫起来…",
+            // 二·AC P2：状态行加了「前台 xxx」会变长 —— 允许换行，别把面板撑破（窗口只有 330 DIP）
+            TextWrapping = TextWrapping.Wrap,
         };
         _cpuText = new TextBlock { FontSize = 13, FontWeight = FontWeights.SemiBold };
         _memText = new TextBlock { FontSize = 13, FontWeight = FontWeights.SemiBold };
@@ -1529,10 +1544,19 @@ public sealed class FloatWindow : Window
             // M11-b1（二·AB）：前台分类随行 —— 传的是**枚举结果**（红线：标题原文永远不出外壳，
             // 连获取标题的 import 都没有）。类别名可存字段记账（⑨ 变化日志），标题不行。
             var fg = Win32.ForegroundClass();
-            if (fg != _lastFgClass)
+            if (!_fgLocked)
             {
-                if (_lastFgClass != null) AppendLog($"[前台] {_lastFgClass} → {fg}");
-                _lastFgClass = fg;
+                if (fg != _lastFgClass)
+                {
+                    if (_lastFgClass != null) AppendLog($"[前台] {_lastFgClass} → {fg}");
+                    _lastFgClass = fg;
+                }
+                // 二·AC P2：顺手把读数挂上面板（**不要为此多调一次 ForegroundClass()** —— 复用这一份结果）
+                if (_fgClass != fg)
+                {
+                    _fgClass = fg;
+                    if (_panelOpen) UpdateStatusLine();   // 面板开着就立刻刷新（关着时等展开再算）
+                }
             }
             _kernel.Feed($"{{\"idleMs\":{ms:F0},\"muteUntil\":{mute},\"foreground\":\"{fg}\"}}");
         }

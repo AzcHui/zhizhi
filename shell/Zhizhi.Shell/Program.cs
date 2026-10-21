@@ -361,9 +361,11 @@ public static class Program
                 // P0-3 回归：面板开着（复现「鼠标在球上」现场）＋ 气泡显示 —— 截图验遮挡
                 // 二·AC P2：注入固定「前台 code」—— 面板上的前台读数要在这张截图里看得见
                 window.FgTestOverride("code");
-                // 二·AC 复验补记③：几何断言必须在**最宽状态行**下跑（监工实测该行 228.3 DIP，
-                //   限宽前会把面板撑到 249.6 → 左侧被窗裁掉 25.6 DIP）
-                window.StatusTestOverride("静音中 · 剩 60 分 · 前台 browser · 熟悉");
+                // 二·AC 复验补记③ ＋ 监工 A1：几何断言必须在**真实最坏**状态行下跑 ——
+                //   真实最坏 = 「看着呢 —— CPU 100.0% · 前台 meeting · 亲近」（三位数 CPU ＋ 最宽枚举 ＋ 信任词）。
+                //   ⚠️ 注入后**锁定**（StatusTestOverride 内置）：不锁的话 300ms 一条的 OnSample
+                //      → UpdateStatusLine 会把它覆盖回普通行，断言就测了个假的（A1 假绿根因）。
+                window.StatusTestOverride("看着呢 —— CPU 100.0% · 前台 meeting · 亲近");
                 window.ShowTestBubble("【渲染冒烟】这条气泡应该在截图里可见 —— 不被面板盖住");
                 bubbleShown = true;
                 phase = 1;
@@ -392,8 +394,8 @@ public static class Program
                         failures++;
                     }
 
-                    // 恢复成正常状态行再截图（截图是给人看的证据，别让「静音中」混淆视线）
-                    window.StatusTestOverride("看着呢 —— CPU 8.8% · 前台 code · 熟悉");
+                    // 恢复成真实状态行再截图（截图是给人看的证据，别让注入的最坏行混淆视线）
+                    window.StatusTestUnlock();
                     phase = 3;
                     waitTicks = 0;
                     return;

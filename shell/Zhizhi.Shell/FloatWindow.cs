@@ -109,6 +109,15 @@ public sealed class FloatWindow : Window
     private const double BallBottomMargin = 14;   // 球下缘距窗下（Y 底锚）
     private const double BallTopMargin = 14;      // 球上缘距窗顶（Y 顶锚，翻转后）
 
+    /// <summary>
+    /// 面板**最小可用宽**（二·AC 复验补记①）：206 = 窗宽 330 − 左锚占位 124（球左边距 18 + 球 76 + 间隙 30）。
+    /// 右锚占位 106（球 76 + 间隙 30）→ 可用 224。**206 是两种锚里更紧的那个** ——
+    /// 面板宽只要 ≤ 206，在任一锚下都完整；超了就不可能在任一锚下完整。
+    /// ⚠️ 单一事实源：`MakePanel()` 的 MaxWidth 与几何断言都用它（别再各写一个 206）。
+    /// ⚠️ 改窗宽/球尺寸/间隙 → 这个数必须跟着重算。
+    /// </summary>
+    private const double PanelMaxWidth = 206;
+
     private readonly KernelSidecar _kernel;
     private readonly DispatcherTimer _idleTimer;      // 每秒喂 idleMs
     private readonly DispatcherTimer _bubbleTimer;    // 二·Y：气泡状态机唯一时钟（原 4.5s 固定消失定时器已退役）
@@ -141,6 +150,7 @@ public sealed class FloatWindow : Window
     private TextBlock _memText = null!;
     private string _fgClass = "—";   // 二·AC P2：当前前台分类（M11-b1）—— 面板上唯一「看得见」的前台读数
     private bool _fgLocked;          // 验收模式注入后锁定读数（防 1Hz FeedIdle 用真实值覆盖）
+    private bool _statusLocked;      // 验收模式注入后锁定状态行（防 OnSample 300ms 覆盖 → A1 假绿）
     private readonly Random _rng = new();
 
     // ── b2-b2 形态库运行时状态 ──
@@ -854,6 +864,10 @@ public sealed class FloatWindow : Window
 
     private void UpdateStatusLine()
     {
+        // 二·AC 监工 A1：验收注入的状态行必须**一次锁干净** ——
+        //   注入文本会被 OnSample（300ms 一条）→ UpdateStatusLine 覆盖，
+        //   OnSaid / UpdateMuteUi 也会写 —— 逐处判断会漏，锁在唯一入口最省。
+        if (_statusLocked) return;
         var word = TrustWord(_trust);
         var baseText = BaseStateText;
         // b2-a 复验观察1：静音只在**常态**下占位 —— 「内核停了」是 M4-c 核心契约，
@@ -1168,11 +1182,23 @@ public sealed class FloatWindow : Window
         if (_panelOpen) UpdateStatusLine();
     }
 
-    /// <summary>验收专用（二·AC 复验补记③）：注入**最宽**的状态行 —— 几何断言必须在最坏文本下跑，
-    /// 否则「短文本不越界」会让人误以为限宽生效了。文字：真实最坏组合（静音＋最宽枚举＋信任词）。</summary>
+    /// <summary>验收专用（二·AC 复验补记③ ＋ 监工 A1）：注入**真实最坏**的状态行并**锁定** ——
+    /// 几何断言必须在最坏文本下跑，否则短文本不越界会让人误以为限宽生效。
+    /// ⚠️ 锁定的理由：注入文本会被 OnSample（300ms 一条）→ UpdateStatusLine 覆盖回普通行，
+    ///   那时断言测的就不是最坏文本了（A1 假绿的根因）。锁定后只有本方法能改它。
+    /// 真实最坏行：**「看着呢 —— CPU 100.0% · 前台 meeting · 亲近」**（三位数 CPU ＋ 最宽枚举 ＋ 信任词）。
+    ///   ⚠️ 别用「静音中 · 剩 60 分 …」那句 —— 它比常态行**更窄**，测了个假最坏。</summary>
     public void StatusTestOverride(string text)
     {
         _statusText.Text = text;
+        _statusLocked = true;
+    }
+
+    /// <summary>验收专用：解除状态行锁定并立刻刷回真实内容（截图用 —— 真实行更清晰）。</summary>
+    public void StatusTestUnlock()
+    {
+        _statusLocked = false;
+        if (_panelOpen) UpdateStatusLine();
     }
 
     /// <summary>渲染冒烟专用：气泡/面板的可见性与透明度实况（诊断「为什么截图里没有」）。
@@ -1185,7 +1211,10 @@ public sealed class FloatWindow : Window
     /// <summary>
     /// 二·AC 复验补记③：面板**几何**裁剪断言（截图判不出来 —— 被窗裁掉的内容在截图里根本不存在）。
     /// 返回 null = 完整落在窗内；返回非 null = 越界描述（含越界多少 DIP）。
-    /// 可用宽按**当前锚**算：左锚 = 窗宽 − 124；右锚 = 窗宽 − 106。
+    /// <para>判据分两层（监工 A1：必须**锚无关**，否则数字会随运行时锚漂移、没法当回归基准）：</para>
+    /// <para>① 硬判据（锚无关）：**面板宽 ≤ `PanelMaxWidth`（206）** —— 206 是两种锚的最小可用宽，
+    ///   宽于此就不可能在任一锚下完整；</para>
+    /// <para>② 细项（按**当前锚**算，报出具体出界量，供排查）：左缘/右缘/顶缘是否出窗。</para>
     /// </summary>
     public string? PanelClipViolation()
     {
@@ -1194,6 +1223,10 @@ public sealed class FloatWindow : Window
         var pW = _panel.ActualWidth;
         var pH = _panel.ActualHeight;
         if (pW <= 0 || pH <= 0 || winW <= 0 || winH <= 0) return null;   // 还没布局，交给后续帧
+
+        // ① 硬判据（锚无关）：面板宽超过最小可用宽 = 必被裁（与当前锚、与注入文本无关）
+        if (pW > PanelMaxWidth + 0.5)
+            return $"面板宽 {pW:F1} > 最小可用宽 {PanelMaxWidth:F0}（必被裁）";
 
         var canvasLeft = Canvas.GetLeft(_panel);
         double pLeft, availW;
@@ -1209,12 +1242,18 @@ public sealed class FloatWindow : Window
             availW = winW - canvasRight;
         }
         var pRight = pLeft + pW;
-        var pTop = winH - 14 - pH;                // 底对齐：Canvas.SetBottom(_panel, 14)
+
+        // Y 方向与 X 同构（监工 A2）：Y 锚翻转过（Canvas.SetTop(_panel, 14)）——
+        //   写死「底对齐」会在面板长高时误报「顶缘出界」。有 Top 用 Top，否则用底对齐推。
+        var canvasTop = Canvas.GetTop(_panel);
+        var pTop = !double.IsNaN(canvasTop)
+            ? canvasTop
+            : winH - Canvas.GetBottom(_panel) - pH;
 
         if (pLeft < -0.5) return $"面板左缘出界 {-pLeft:F1} DIP";
         if (pRight > winW + 0.5) return $"面板右缘出界 {pRight - winW:F1} DIP";
         if (pTop < -0.5) return $"面板顶缘出界 {-pTop:F1} DIP";
-        if (pW > availW + 0.5) return $"面板宽 {pW:F1} > 可用宽 {availW:F1}";
+        if (pW > availW + 0.5) return $"面板宽 {pW:F1} > 当前锚可用宽 {availW:F1}";
         return null;
     }
 
@@ -1239,12 +1278,12 @@ public sealed class FloatWindow : Window
         metrics.Children.Add(new TextBlock { Text = "   MEM ", FontSize = 12, Foreground = Brushes.Gray, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 0, 0) });
         metrics.Children.Add(_memText);
 
-        var moveBtn = new Button { Content = "挪一挪", Padding = new Thickness(8, 3, 8, 3), Cursor = Cursors.Hand };
+        var moveBtn = new Button { Content = "挪一挪", Padding = new Thickness(6, 3, 6, 3), Cursor = Cursors.Hand };
         moveBtn.Click += (_, _) => MoveAside();
         // b2-a ②「静一下」（决策 #30 面板三按钮补齐）：点 = 静音 1 小时；静音中变「恢复」，点 = 立刻取消
-        _muteBtn = new Button { Content = "静一下", Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
+        _muteBtn = new Button { Content = "静一下", Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
         _muteBtn.Click += (_, _) => ToggleMute();
-        var exitBtn = new Button { Content = "退出", Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
+        var exitBtn = new Button { Content = "退出", Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
         exitBtn.Click += (_, _) => Close();
 
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 0) };
@@ -1262,14 +1301,14 @@ public sealed class FloatWindow : Window
             Background = new SolidColorBrush(Color.FromRgb(0xFF, 0xFF, 0xFF)) { Opacity = 0.97 },
             CornerRadius = new CornerRadius(10),
             Padding = new Thickness(12, 9, 12, 9),
-            // ⚠️ 二·AC 复验补记①：**限宽 206 DIP**。
+            // ⚠️ 二·AC 复验补记①：**限宽 `PanelMaxWidth`（206 DIP，单一事实源在文件头）**。
             //   数字来历：窗宽 330 − 左锚占位 124（= 球左边距 18 + 球 76 + 间隙 30）= 206；
             //   右锚时占位 106（= 球 76 + 间隙 30）→ 可用 224。**206 是两种锚的最小可用宽**。
             //   为什么必须限宽：面板挂在 Canvas 上，无 Width/MaxWidth → Measure 收到 Infinity →
-            //   `TextWrapping.Wrap` 根本不生效（等于没加），状态行一行到底把面板撑到 249~268 DIP，
+            //   `TextWrapping.Wrap` 根本不生效（等于没加），状态行一行到底把面板撑到 250~275 DIP，
             //   超出窗宽的部分**被窗口裁掉**（截图里只能看到右半句，「看得见」≠「看得全」）。
-            //   ⚠️ 将来改窗口宽 / 球尺寸 / 间隙，这个 206 必须跟着重算（330 − 18 − 76 − 30）。
-            MaxWidth = 206,
+            //   ⚠️ 数字只有一处（`PanelMaxWidth`）—— 限宽与几何断言共用；改窗宽/球尺寸时一起改。
+            MaxWidth = PanelMaxWidth,
             Child = stack,
         };
     }

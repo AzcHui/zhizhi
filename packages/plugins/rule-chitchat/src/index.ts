@@ -295,10 +295,20 @@ function sayNow(now: number): readonly ZhizhiEvent[] {
     return [];
   }
 
-  // 攒话 ≥30 分钟回来 →「你回来了」专用池（开工单第六节分流线）
-  const type = pendingSince !== undefined && now - pendingSince >= BACK_POOL_MINUTES * MINUTE * timeScale()
-    ? 'chitchat_back'
-    : 'chitchat';
+  // 台词池分流（M11-b2 · 二·AD）：按前台类别选池。
+  // 优先级 —— **攒话回来 > 写代码 > 浏览网页 > 兜底**：
+  //   ⚠️ chitchat_back 必须最前：「你回来了」比「你在写代码」重要，
+  //      而且它只在离开 ≥30 分钟时出现，说错就没有第二次机会。
+  //   ⚠️ meeting / fullscreen 走不到这儿（那是 busy，根本不会 sayNow）——
+  //      万一走到，落到 chitchat 兜底，不新增分支。
+  const type =
+    pendingSince !== undefined && now - pendingSince >= BACK_POOL_MINUTES * MINUTE * timeScale()
+      ? 'chitchat_back'
+      : foreground === 'code'
+        ? 'chitchat_code'
+        : foreground === 'browser'
+          ? 'chitchat_browser'
+          : 'chitchat';
 
   autoCount += 1;
   dueAt = now + drawGapMs();
@@ -306,18 +316,28 @@ function sayNow(now: number): readonly ZhizhiEvent[] {
   return [makeChitchat(now, false, type)];
 }
 
-function makeChitchat(ts: number, isUserRequested: boolean, type: 'chitchat' | 'chitchat_back'): ZhizhiEvent {
+/** 台词池类型（M11-b2 加了 code/browser 两类；voice.ts 按 event.type 找池，不用改引擎） */
+type ChitchatType = 'chitchat' | 'chitchat_back' | 'chitchat_code' | 'chitchat_browser';
+
+function makeChitchat(ts: number, isUserRequested: boolean, type: ChitchatType): ZhizhiEvent {
   return {
     // `say@` = 用户点名的（内核的亲密度门槛不压它）；`chitchat@` = 自己找话说的
     id: `${isUserRequested ? 'say' : 'chitchat'}@${ts}`,
-    // type 决定 persona 挑哪个池：chitchat（在场闲话）/ chitchat_back（离开 ≥30 分钟回来，M11-a2）
+    // type 决定 persona 挑哪个池：chitchat（在场闲话）／chitchat_back（离开 ≥30 分钟回来）／
+    //   chitchat_code（你在写代码）／chitchat_browser（你在翻网页）—— M11-b2
     type,
     severity: 'info', // 「多要紧」的正确归类：critical=出事 / warn=不对劲 / info=就是说说
     kind: 'chitchat', // 内核据此绕闸门、走 dispatcher（决策 #22）
     metrics: [], // 闲聊没有指标证据 —— 所以更不能进告警闸门（threshold 会拦空口报）
     ts,
     // summary 是兜底描述：没有台词包时，只只用它说话（降级，不是故障）
-    summary: type === 'chitchat_back' ? '（你回来了）回来了？我一直在。' : '（闲聊）你忙着呢，我陪你待会儿。',
+    summary: type === 'chitchat_back'
+      ? '（你回来了）回来了？我一直在。'
+      : type === 'chitchat_code'
+        ? '（闲聊）你写你的，我看着。'
+        : type === 'chitchat_browser'
+          ? '（闲聊）找什么呢？找到了告诉我。'
+          : '（闲聊）你忙着呢，我陪你待会儿。',
   };
 }
 

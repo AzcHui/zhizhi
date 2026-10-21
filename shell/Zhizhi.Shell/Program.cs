@@ -361,6 +361,9 @@ public static class Program
                 // P0-3 回归：面板开着（复现「鼠标在球上」现场）＋ 气泡显示 —— 截图验遮挡
                 // 二·AC P2：注入固定「前台 code」—— 面板上的前台读数要在这张截图里看得见
                 window.FgTestOverride("code");
+                // 二·AC 复验补记③：几何断言必须在**最宽状态行**下跑（监工实测该行 228.3 DIP，
+                //   限宽前会把面板撑到 249.6 → 左侧被窗裁掉 25.6 DIP）
+                window.StatusTestOverride("静音中 · 剩 60 分 · 前台 browser · 熟悉");
                 window.ShowTestBubble("【渲染冒烟】这条气泡应该在截图里可见 —— 不被面板盖住");
                 bubbleShown = true;
                 phase = 1;
@@ -377,6 +380,40 @@ public static class Program
                     Console.WriteLine($"  可视化状态：{window.DumpVisualState()}");
                     if (!bubbleShown) { Console.WriteLine("  FAIL  气泡未注入"); failures++; }
 
+                    // 二·AC 复验补记③：**几何裁剪断言**（防复发的关键，不是可选项）——
+                    //   截图判不出裁剪：被窗裁掉的内容在截图里根本不存在（只能看到右半句）。
+                    //   所以必须用数字判：面板宽 ≤ 当前锚可用宽、左右顶缘都在窗内。
+                    var clip = window.PanelClipViolation();
+                    if (clip is null)
+                        Console.WriteLine("  OK    面板完整落在窗口内（几何断言，最宽状态行下）");
+                    else
+                    {
+                        Console.WriteLine($"  FAIL  面板被窗裁：{clip}");
+                        failures++;
+                    }
+
+                    // 恢复成正常状态行再截图（截图是给人看的证据，别让「静音中」混淆视线）
+                    window.StatusTestOverride("看着呢 —— CPU 8.8% · 前台 code · 熟悉");
+                    phase = 3;
+                    waitTicks = 0;
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  FAIL  几何断言阶段出错：{ex.Message}");
+                    failures++;
+                    phase = 3;
+                    waitTicks = 0;
+                    return;
+                }
+            }
+
+            // phase 3：恢复普通状态行后等 4 tick（布局稳定）再截图 —— 截图是给人看的证据
+            if (phase == 3)
+            {
+                if (waitTicks < 4) return;
+                try
+                {
                     var w = (int)window.ActualWidth;
                     var h = (int)window.ActualHeight;
                     var rtb = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);

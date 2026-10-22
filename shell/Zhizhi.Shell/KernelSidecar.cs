@@ -74,7 +74,15 @@ public sealed class KernelSidecar : IDisposable
     }
 
     /// <summary>拉起内核。失败抛异常（调用方决定怎么显示 —— 不吞）。</summary>
-    public void Start(string repoRoot, int intervalMs)
+    /// <param name="repoRoot">仓库根（内核 cwd）。</param>
+    /// <param name="intervalMs">采样间隔。</param>
+    /// <param name="dataDir">
+    /// 可选：**覆盖内核的数据目录**（null = 用内核默认的仓库 data/）。
+    /// ⚠️ **只给验收/隔离实例用** —— 生产路径永远传 null，
+    ///   否则用户数据会跑到别处（记忆、台词池、trust 全在那边）。
+    ///   ⚠️ cli 的 option() 只认 `--name=value` 格式（不认 `--name value` 分离写法）。
+    /// </param>
+    public void Start(string repoRoot, int intervalMs, string? dataDir = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -91,6 +99,11 @@ public sealed class KernelSidecar : IDisposable
         psi.ArgumentList.Add("--disable-warning=ExperimentalWarning");
         psi.ArgumentList.Add("packages/cli/src/main.ts");
         psi.ArgumentList.Add($"--interval={intervalMs}");
+        if (!string.IsNullOrWhiteSpace(dataDir))
+        {
+            psi.ArgumentList.Add($"--data-dir={dataDir}");
+            Log?.Invoke($"内核数据目录被覆盖为：{dataDir}（仅验收/隔离实例用）");
+        }
 
         _proc = Process.Start(psi) ?? throw new InvalidOperationException("node 进程启动失败（Process.Start 返回 null）");
         _proc.OutputDataReceived += OnStdout;

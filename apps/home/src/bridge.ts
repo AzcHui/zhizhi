@@ -48,13 +48,39 @@ export interface LogLine {
   text: string;
 }
 
+/**
+ * 首页摘要（9.4 getDigest）—— 「它今天过得怎么样、我们相处得怎么样」。
+ * ⚠️ 全部现成，不新增采集。
+ */
+export interface Digest {
+  /** 今天说了几句（本地时区；**不含 greeting** —— 那是启动告知，不是聊天） */
+  today: number;
+  /** 昨天说了几句（同样不含 greeting） */
+  yesterday: number;
+  /** 一共说过几句（说/被戳类事件总数，含 greeting） */
+  total: number;
+  /** 今天打过几次招呼（greeting 单独记，不混进「今天说了」） */
+  greetedToday: number;
+  /** 说过多少句**不同**的话（按 key 去重，全量扫盘） */
+  uniqueSaid: number;
+  /** 池子一共多少句 */
+  poolTotal: number;
+  /** 有没有 events.jsonl（false = 第一天/文件还没建） */
+  hasFile: boolean;
+  /** 它注意到你什么（今天各类计数） */
+  noticed: { code: number; browser: number; meeting: number; poke: number };
+}
+
 export type HostMessage =
   | { type: 'overview'; data: Overview }
   | { type: 'history'; data: { total: number; items: HistoryItem[] } }
   | { type: 'pools'; data: { sections: PoolSection[] } }
   | { type: 'logs'; data: { items: LogLine[] } }
   | { type: 'logLine'; data: LogLine }
-  | { type: 'previewDone'; data: { ok: boolean } };
+  | { type: 'digest'; data: Digest }
+  | { type: 'previewDone'; data: { ok: boolean } }
+  | { type: 'sayDone'; data: { ok: boolean } }
+  | { type: 'muteDone'; data: { ok: boolean } };
 
 // ── 发送侧 ───────────────────────────────────────────────────────────
 

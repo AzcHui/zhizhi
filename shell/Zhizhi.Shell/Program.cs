@@ -28,7 +28,7 @@ public static class Program
         if (args.Contains("--fg-test", StringComparer.OrdinalIgnoreCase))
             return RunFgTest();
         if (args.Contains("--home-test", StringComparer.OrdinalIgnoreCase))
-            return RunHomeTest();
+            return RunHomeTest(args);
 
         // ── b2-b1 ① 单实例互斥：双击两次 = 两个只只、两个内核（双重告警、双重闲聊）──
         // ⭐ 只拦**正常 UI 模式**：--self-test / --render-test 是验收工具，上面已分流，不受互斥影响。
@@ -214,7 +214,7 @@ public static class Program
     //   ③ overview 回传后前端回显字段数 ≥ 5（说明桥是双向的，不是只发不收）
     //   ④ getHistory 返回条数 > 0（events.jsonl 存在时）—— 证明真的读到了盘
     //   ⑤ 截图里能看到四个页签（人眼复核一次）
-    private static int RunHomeTest()
+    private static int RunHomeTest(string[] args)
     {
         AttachConsole(unchecked((uint)-1));
         try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
@@ -256,9 +256,17 @@ public static class Program
         var floatWindow = new FloatWindow(kernel);
         HomeWindow? home = null;
 
+        // ⚠️ 验收专用：`--home-test --data-dir=<路径>` 让内核用**独立数据目录**。
+        //   用途：判据⑥「空状态」—— 真 events.jsonl 在跑着，不能改名（用户在用），
+        //   所以隔离出一个空目录来验「第一天」长什么样。**生产路径永远不带这个参数。**
+        var dataDirArg = Array.Find(args, a => a.StartsWith("--data-dir=", StringComparison.OrdinalIgnoreCase));
+        var overrideDataDir = dataDirArg is null ? null : dataDirArg.Substring("--data-dir=".Length);
+        // 隔离实例的截图加后缀 —— 别覆盖真截图（那是给人眼复核用的）
+        var shotSuffix = overrideDataDir is null ? "" : "empty-";
+
         try
         {
-            kernel.Start(repo, intervalMs: 1000);
+            kernel.Start(repo, intervalMs: 1000, dataDir: overrideDataDir);
         }
         catch (Exception ex)
         {
@@ -283,7 +291,25 @@ public static class Program
         home.WebMessageProbe = (cmd, json) =>
         {
             if (cmd == "ready") readySeen = true;
-            if (cmd == "echoOverview") ackFields = 1;
+            if (cmd == "echoOverview")
+            {
+                // ⚠️⚠️ 2026-10-22 修 9.2 假数字：**必须从 args 里真读 fields**，
+                //   原来这里写死 `ackFields = 1` —— 判据从「字段数 ≥ 5」退化成「收到过就行」，
+                //   而且日志打出的「字段数=1」是假的（前端明明回了 8，外壳直接丢弃写死 1）。
+                //   教训（同一个坑第二次）：**要打印出来的数字，就得是它原样穿过来的那个数**。
+                ackFields = 0;
+                try
+                {
+                    using var d = System.Text.Json.JsonDocument.Parse(json);
+                    if (d.RootElement.TryGetProperty("fields", out var f)
+                        && f.ValueKind == System.Text.Json.JsonValueKind.Number
+                        && f.TryGetInt32(out var n))
+                    {
+                        ackFields = n;
+                    }
+                }
+                catch { /* 探针自己解析失败不影响主链 */ }
+            }
         };
 
         home.Show();
@@ -306,14 +332,14 @@ public static class Program
             {
                 timer.Stop();
                 Check("② 收到前端 ready", readySeen, readySeen ? "" : "（35s 内没收到 —— dist 没加载成功或 bridge 没通）");
-                Check("③ overview 回显（桥是双向的）", ackFields > 0, ackFields > 0 ? "" : "（前端没回显 overview）");
+                Check("③ overview 回显（桥是双向的）", ackFields >= 5, ackFields >= 5 ? $"（真实字段数 {ackFields}）" : $"（字段数 {ackFields} < 5 —— 前端没回显或 overview 被丢字段）");
                 Finish();
                 return;
             }
 
             if (phase == 0)
             {
-                if (!readySeen || ackFields <= 0) return;
+                if (!readySeen || ackFields < 5) return;
                 Console.WriteLine($"  握手完成：ready={readySeen}，overview 回显字段数={ackFields}");
                 phase = 1;
                 waitTicks = 0;
@@ -326,7 +352,7 @@ public static class Program
                 if (waitTicks < 30) return;
 
                 Check("② 收到前端 ready", readySeen);
-                Check("③ overview 回显（桥是双向的）", ackFields > 0, ackFields > 0 ? "" : "（前端没回显 overview）");
+                Check("③ overview 回显（桥是双向的）", ackFields >= 5, ackFields >= 5 ? $"（真实字段数 {ackFields}）" : $"（字段数 {ackFields} < 5 —— 前端没回显或 overview 被丢字段）");
 
                 // ④ getHistory 条数（真读盘）
                 try
@@ -352,7 +378,7 @@ public static class Program
                 // ⚠️ **绝不能在 UI 线程同步等异步**（GetAwaiter().GetResult()）——
                 //   CapturePreviewAsync 的续体要回到 UI 线程，同步等就是死锁（实测：程序直接卡死无输出）。
                 //   正确做法：发起异步 → 下一拍再查结果。
-                shotPath = Path.Combine(repo, "shell", "zhi-shell.home.png");
+                shotPath = Path.Combine(repo, "shell", shotSuffix + "zhi-shell.home.png");
                 captureTask = home.CaptureToAsync(shotPath);
                 phase = 2;
                 waitTicks = 0;
@@ -371,7 +397,7 @@ public static class Program
                 tabIndex++;
                 if (tabIndex < 4)
                 {
-                    shotPath = Path.Combine(repo, "shell", $"zhi-shell.home{tabIndex}.png");
+                    shotPath = Path.Combine(repo, "shell", $"{shotSuffix}zhi-shell.home{tabIndex}.png");
                     switchTask = home.SwitchTabAsync(tabIndex);
                     phase = 3;
                     waitTicks = 0;
@@ -619,6 +645,20 @@ public static class Program
                     else
                     {
                         Console.WriteLine($"  FAIL  面板被窗裁：{clip}");
+                        failures++;
+                    }
+
+                    // ⚠️ 2026-10-22 修 bug 的**回归判据**：第三按钮的**文案必须与行为一致**。
+                    //   起因：用户报「面板显示退出，点击却是打开窗口」——
+                    //   根因是文案在 MakePanel() 时算（那时 _trayOk 还是 false），
+                    //   而点击行为读的是点击那一刻的 _trayOk（已 true）→ 说的和做的不是一回事。
+                    //   这类缺陷**截图看不出来**（按钮就那么几个字），必须用数字判。
+                    var btnOk = window.HomeOrExitUiConsistent();
+                    if (btnOk.ok)
+                        Console.WriteLine($"  OK    第三按钮文案与行为一致（{btnOk.detail}）");
+                    else
+                    {
+                        Console.WriteLine($"  FAIL  第三按钮文案与行为不一致：{btnOk.detail}");
                         failures++;
                     }
 

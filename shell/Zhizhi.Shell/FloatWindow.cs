@@ -1217,11 +1217,15 @@ public sealed class FloatWindow : Window
     }
 
     /// <summary>渲染冒烟专用：气泡/面板的可见性与透明度实况（诊断「为什么截图里没有」）。
-    /// 二·AC 复验补记④：面板补打 W=/H= —— 裁剪这种「看得见却看不见」的缺陷在日志里完全无迹。</summary>
+    /// 二·AC 复验补记④：面板补打 W=/H= —— 裁剪这种「看得见却看不见」的缺陷在日志里完全无迹。
+    /// ⚠️ 补打第三按钮文案 + 托盘状态（2026-10-22 修 bug）：
+    ///   「显示的是 A、点下去做的是 B」这类缺陷**截图看不出来**（按钮就那么几个字），
+    ///   必须把「文案」和「行为依据的字段」一起打出来对比。</summary>
     public string DumpVisualState() =>
         $"bubble(V={_bubble.Visibility} O={_bubble.Opacity:F2} W={_bubble.ActualWidth:F0} H={_bubble.ActualHeight:F0}) " +
         $"panel(V={_panel.Visibility} O={_panel.Opacity:F2} W={_panel.ActualWidth:F0} H={_panel.ActualHeight:F0}) form={ActiveFormId} " +
-        $"slotO(F={_slotHosts[_frontSlot]!.Opacity:F2} B={_slotHosts[1 - _frontSlot]!.Opacity:F2}) ballO={_ballHost.Opacity:F2}";
+        $"slotO(F={_slotHosts[_frontSlot]!.Opacity:F2} B={_slotHosts[1 - _frontSlot]!.Opacity:F2}) ballO={_ballHost.Opacity:F2} " +
+        $"btn3=\"{_homeOrExitBtn?.Content}\"(trayOk={_trayOk})";
 
     /// <summary>
     /// 二·AC 复验补记③：面板**几何**裁剪断言（截图判不出来 —— 被窗裁掉的内容在截图里根本不存在）。
@@ -1299,20 +1303,26 @@ public sealed class FloatWindow : Window
         _muteBtn = new Button { Content = "静一下", Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
         _muteBtn.Click += (_, _) => ToggleMute();
         // ⭐ M11-c · 3.7：第三按钮是**动态**的 ——
-        //   托盘建成了 → 「进屋」（打开只只的家）；托盘失败 → 仍显示「退出」。
+        //   托盘建成了 → 「看一看」（打开只只的家）；托盘失败 → 仍显示「退出」。
         //   理由（防呆）：InitTray 是 try/catch，失败只记账不崩。一旦托盘没建起来，
         //   用户就**再没有任何退出入口**（只能任务管理器杀）→ 必须留后路。
         //   ⚠️ 家打开时**不禁用**这个按钮 —— 内核停了也要能进家看日志，那正是最需要它的时候。
+        //
+        // ⚠️⚠️ **文案不在这里定**（2026-10-22 修 bug）：MakePanel() 在构造函数早期跑，
+        //   那时 InitTray() 还没执行 → `_trayOk` 恒为 false → 文案被写死成「退出」；
+        //   而点击逻辑读的是**点击那一刻**的 `_trayOk`（已 true）→ **显示「退出」却打开窗口**。
+        //   修法：文案与 tooltip 统一由 UpdateHomeOrExitUi() 写（InitTray 之后调一次），
+        //   **按钮行为与文案读同一个字段**，杜绝「说的和做的不是一回事」。
         _homeOrExitBtn = new Button
         {
-            Content = _trayOk ? "进屋" : "退出",
+            Content = "退出",          // 初值；真正的文案由 UpdateHomeOrExitUi() 决定（这里只是兜底）
             Padding = new Thickness(6, 3, 6, 3),
             Margin = new Thickness(8, 0, 0, 0),
             Cursor = Cursors.Hand,
-            ToolTip = _trayOk ? "打开只只的家" : "退出只只（托盘没建起来，这是唯一的退出入口）",
         };
         _homeOrExitBtn.Click += (_, _) =>
         {
+            // ⚠️ 行为与文案**读同一个字段**（_trayOk）—— 别在这里再算一遍
             if (_trayOk)
             {
                 OpenHome();
@@ -1700,6 +1710,35 @@ public sealed class FloatWindow : Window
     /// <summary>静音是否生效（到点自动失效 —— 「必须有明确结束」）。</summary>
     private bool IsMuted => _muteUntil is { } m && m > EpochNow();
 
+    /// <summary>
+    /// M11-c · 9.4：让只只**现在说一句**（首页快捷按钮用）。
+    ///
+    /// ⚠️ 走内核**已有的** `requestSay` 机制（cli 已解析这个字段）—— **内核零改动**。
+    ///   `requestSay` 是「用户点名」，不受沉默档/静音压制，也不占每日闲聊额度
+    ///   （决策 #26：say@ 是 low-trust 唯一的回暖入口）。
+    /// ⚠️ 必须**连 idleMs 一起喂** —— cli 的 stdin 解析里 `requestSay` 与 `idleMs` 是并列的
+    ///   两个字段，只喂 requestSay 会走「上下文行缺有效的 idleMs/requestSay/poked」告警分支。
+    /// </summary>
+    public void RequestSay()
+    {
+        try
+        {
+            // 连最新上下文一起喂（idleMs 已是 FeedIdle 每秒更新的真值）
+            var idle = _lastIdleMs ?? 0;
+            var mute = IsMuted ? _muteUntil ?? 0 : 0;
+            var fg = _fgClass == "—" ? "unknown" : _fgClass;
+            _kernel.Feed($"{{\"idleMs\":{idle:F0},\"muteUntil\":{mute},\"foreground\":\"{fg}\",\"requestSay\":true}}");
+            AppendLog("首页「随便说一句」→ 已点名（requestSay）");
+        }
+        catch (Exception ex)
+        {
+            ShellLog.Write($"[WRN] 点名失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>M11-c · 9.4：静一下 / 恢复（首页快捷按钮用；复用面板那个 ToggleMute）。</summary>
+    public void ToggleMutePublic() => ToggleMute();
+
     private void ToggleMute()
     {
         if (IsMuted)
@@ -1736,7 +1775,7 @@ public sealed class FloatWindow : Window
         try
         {
             InitTrayCore();
-            _trayOk = true;   // ⭐ M11-c：托盘建成了 → 面板第三按钮显示「进屋」；退出走托盘右键
+            _trayOk = true;   // ⭐ M11-c：托盘建成了 → 面板第三按钮显示「看一看」；退出走托盘右键
             AppendLog("托盘已创建（六项菜单 + 双击显隐）");
         }
         catch (Exception ex)
@@ -1744,6 +1783,49 @@ public sealed class FloatWindow : Window
             _trayOk = false;  // 托盘失败 → 面板第三按钮留「退出」（唯一的退出入口，不能丢）
             AppendLog($"[WRN] 托盘创建失败：{ex.Message}");
         }
+        // ⚠️ 托盘成败落地后**立刻同步按钮文案**（2026-10-22 修 bug）：
+        //   面板是在 InitTray 之前建的，那时 _trayOk=false → 文案写死「退出」，
+        //   而点击逻辑读的是点击时的 _trayOk（true）→ **显示「退出」却打开窗口**。
+        //   文案与行为必须读同一个字段 → 由这一个方法统一写。
+        UpdateHomeOrExitUi();
+    }
+
+    /// <summary>
+    /// 同步面板第三按钮的**文案 + tooltip**（2026-10-22 修 bug 时抽出来的唯一入口）。
+    ///
+    /// ⚠️ 为什么必须抽出来：文案与点击行为**读同一个字段 `_trayOk`**，
+    ///   但两者发生在**不同时刻**（建面板时 vs 点按钮时）——
+    ///   各自算一遍就会「说的和做的不是一回事」（实测踩过：显示「退出」却打开窗口）。
+    ///   单一入口 = 改文案和改行为的口径永远一致。
+    ///
+    /// ⚠️ 「看一看」是 2026-10-22 开工单 9.3 的定案（原「进屋」）：
+    ///   与「挪一挪」「静一下」同节奏（动词+补音），3 字不撑破 PanelMaxWidth=206。
+    /// </summary>
+    private void UpdateHomeOrExitUi()
+    {
+        if (_homeOrExitBtn is null) return;
+        var content = _trayOk ? "看一看" : "退出";
+        if (!Equals(_homeOrExitBtn.Content, content)) _homeOrExitBtn.Content = content;
+        var tip = _trayOk ? "打开只只的家" : "退出只只（托盘没建起来，这是唯一的退出入口）";
+        if (_homeOrExitBtn.ToolTip as string != tip) _homeOrExitBtn.ToolTip = tip;
+    }
+
+    /// <summary>
+    /// 回归判据（2026-10-22 修 bug 时加的）：第三按钮的**文案**与**点击行为**是否一致。
+    ///
+    /// ⚠️ 为什么要有这条：用户报过「面板显示退出，点击却是打开窗口」。
+    ///   根因是文案与行为**在不同时刻各算一遍**（文案在建面板时、行为在点击时）——
+    ///   托盘建起来之后，文案还停在建面板那一刻的值 → 说的和做的不是一回事。
+    ///   这类缺陷**截图看不出来**（按钮就那么几个字，人眼容易放过）→ 必须用数字判。
+    ///
+    /// 判据：文案「看一看」⇔ 托盘建成了（_trayOk）；文案「退出」⇔ 托盘没建成。
+    /// </summary>
+    public (bool ok, string detail) HomeOrExitUiConsistent()
+    {
+        var text = _homeOrExitBtn?.Content as string ?? "(无按钮)";
+        var expected = _trayOk ? "看一看" : "退出";
+        var ok = text == expected;
+        return (ok, $"文案「{text}」/ 期望「{expected}」（trayOk={_trayOk}）");
     }
 
     private void InitTrayCore()

@@ -6,7 +6,7 @@
  */
 
 import { reactive, computed } from 'vue';
-import { send, onMessage, inShell, waitFor, type Overview, type HistoryItem, type PoolSection, type LogLine } from './bridge';
+import { send, onMessage, inShell, waitFor, type Overview, type HistoryItem, type PoolSection, type LogLine, type Digest } from './bridge';
 
 export interface HomeState {
   /** 概览 */
@@ -15,6 +15,8 @@ export interface HomeState {
   history: { total: number; items: HistoryItem[] } | null;
   /** 台词池 */
   pools: PoolSection[] | null;
+  /** 首页摘要（9.4） */
+  digest: Digest | null;
   /** 日志 */
   logs: LogLine[];
   /** 日志实时推流开关 */
@@ -31,6 +33,7 @@ export const state = reactive<HomeState>({
   overview: null,
   history: null,
   pools: null,
+  digest: null,
   logs: [],
   logLive: true,
   connected: false,
@@ -84,6 +87,9 @@ export async function bootstrap(): Promise<void> {
       case 'pools':
         state.pools = msg.data.sections;
         break;
+      case 'digest':
+        state.digest = msg.data;
+        break;
       case 'logs':
         state.logs = msg.data.items.slice();
         break;
@@ -97,20 +103,38 @@ export async function bootstrap(): Promise<void> {
   });
 
   send('ready');
+  // ⭐ 首页摘要（9.4）：ready 之后单独拉一次。
+  //   ⚠️ **只在打开家时算一次，不做定时轮询** —— 这是低频界面，别学面板的 1Hz。
+  //   ⚠️ 外壳的 ready 回包里已含 digest（见 HomeBridge），这里再拉一次是为了
+  //   「刷新」后能重新算（今天跨零点、或用户手动刷新）。
+  send('getDigest');
 }
 
 /** 刷新单个板块（页签切换时按需拉，避免首屏塞太多）。 */
-export async function refresh(which: 'overview' | 'history' | 'pools' | 'logs'): Promise<void> {
-  const cmd = { overview: 'getOverview', history: 'getHistory', pools: 'getPools', logs: 'getLogs' }[which];
+export async function refresh(which: 'overview' | 'history' | 'pools' | 'logs' | 'digest'): Promise<void> {
+  const cmd = { overview: 'getOverview', history: 'getHistory', pools: 'getPools', logs: 'getLogs', digest: 'getDigest' }[which];
   send(cmd, which === 'history' ? { limit: 200 } : which === 'logs' ? { limit: 300 } : {});
-  const t = { overview: 'overview', history: 'history', pools: 'pools', logs: 'logs' }[which] as
-    'overview' | 'history' | 'pools' | 'logs';
+  const t = { overview: 'overview', history: 'history', pools: 'pools', logs: 'logs', digest: 'digest' }[which] as
+    'overview' | 'history' | 'pools' | 'logs' | 'digest';
   await waitFor(t, 5000);
 }
 
 /** 试听一句台词：走外壳 → 球冒这句（纯预览，不进记忆）。 */
 export function preview(text: string): void {
   send('previewLine', { text });
+}
+
+/**
+ * 「随便说一句」（9.4 首页快捷按钮）：让只只**现在**说一句。
+ * ⚠️ 走内核已有的 requestSay —— 是「用户点名」，不受沉默档/静音压制，也不占每日闲聊额度。
+ */
+export function requestSay(): void {
+  send('requestSay');
+}
+
+/** 「静一下 / 恢复」（9.4 首页快捷按钮）：复用面板那个开关（同一个状态源）。 */
+export function toggleMute(): void {
+  send('toggleMute');
 }
 
 /** 日志实时推流开关。 */

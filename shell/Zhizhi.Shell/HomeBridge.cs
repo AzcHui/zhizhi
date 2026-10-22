@@ -48,12 +48,13 @@ internal sealed class HomeBridge
             switch (cmd)
             {
                 case "ready":
-                    // 首屏：一次给全（overview + pools + history）—— 三条独立消息
+                    // 首屏：一次给全（overview + pools + history + digest）—— 四条独立消息
                     return new[]
                     {
                         JsonSerializer.Serialize(new { type = "overview", data = BuildOverview() }),
                         JsonSerializer.Serialize(new { type = "pools", data = BuildPools() }),
                         JsonSerializer.Serialize(new { type = "history", data = BuildHistory(200, 0, null) }),
+                        JsonSerializer.Serialize(new { type = "digest", data = BuildDigest() }),
                     };
 
                 case "getOverview":
@@ -69,6 +70,11 @@ internal sealed class HomeBridge
 
                 case "getPools":
                     return new[] { JsonSerializer.Serialize(new { type = "pools", data = BuildPools() }) };
+
+                case "getDigest":
+                    // ⭐ 9.4：首页摘要（今天/昨天/它注意到你/说过多少句）。
+                    //   只在打开家 / 点刷新时算一次 —— **不做定时轮询**（低频界面，别学面板 1Hz）。
+                    return new[] { JsonSerializer.Serialize(new { type = "digest", data = BuildDigest() }) };
 
                 case "getLogs":
                 {
@@ -89,6 +95,20 @@ internal sealed class HomeBridge
                     // ⚠️ 试听 = 纯预览：走 PreviewLine（不进记忆、不动 trust、不计 occurrence）
                     _float.PreviewLine(text!);
                     return new[] { JsonSerializer.Serialize(new { type = "previewDone", data = new { ok = true } }) };
+                }
+
+                case "requestSay":
+                {
+                    // ⭐ 9.4：首页「随便说一句」→ 走内核已有的 requestSay（内核零改动）
+                    _float.RequestSay();
+                    return new[] { JsonSerializer.Serialize(new { type = "sayDone", data = new { ok = true } }) };
+                }
+
+                case "toggleMute":
+                {
+                    // ⭐ 9.4：首页「静一下」→ 复用面板那个 ToggleMute（同一个状态源，不搞两套）
+                    _float.ToggleMutePublic();
+                    return new[] { JsonSerializer.Serialize(new { type = "muteDone", data = new { ok = true } }) };
                 }
 
                 default:
@@ -129,9 +149,22 @@ internal sealed class HomeBridge
 
     // ───────────────────────── 台词池（三层合并，标来源）─────────────────────────
 
-    private object BuildPools()
+    /// <summary>台词池的一层（段）。**强类型** —— 首页摘要要算总句数，匿名类型拿不到（9.4）。</summary>
+    private sealed record PoolLayer(string Type, IReadOnlyList<PoolLineItem> Lines);
+
+    /// <summary>池里的一句。</summary>
+    private sealed record PoolLineItem(string Text, string Source);
+
+    /// <summary>三层合并后的池（对外序列化成 { type, lines:[{text,source}] }）。</summary>
+    private sealed record PoolsPayload(IReadOnlyList<PoolLayer> Sections)
     {
-        var sections = new List<object>();
+        /// <summary>总句数（首页摘要用；与台词池页「共 N 句」同一口径）。</summary>
+        public int TotalCount => Sections.Sum(s => s.Lines.Count);
+    }
+
+    private PoolsPayload BuildPools()
+    {
+        var sections = new List<PoolLayer>();
 
         // ① 官方池：packages/plugins/persona-zhi/persona.json（仓库内，跟着代码走）
         var repo = KernelSidecar.FindRepoRoot();
@@ -140,7 +173,7 @@ internal sealed class HomeBridge
             var personaPath = Path.Combine(repo, "packages", "plugins", "persona-zhi", "persona.json");
             foreach (var (name, lines) in ReadPoolFile(personaPath))
             {
-                sections.Add(new { type = name, lines = lines.Select(l => new { text = l, source = "persona" }) });
+                sections.Add(new PoolLayer(name, lines.Select(l => new PoolLineItem(l, "persona")).ToList()));
             }
         }
 
@@ -150,15 +183,15 @@ internal sealed class HomeBridge
         {
             foreach (var (name, lines) in ReadPoolFile(Path.Combine(dataDir, "user.json")))
             {
-                sections.Add(new { type = name, lines = lines.Select(l => new { text = l, source = "user" }) });
+                sections.Add(new PoolLayer(name, lines.Select(l => new PoolLineItem(l, "user")).ToList()));
             }
             foreach (var (name, lines) in ReadPoolFile(Path.Combine(dataDir, "learned.json")))
             {
-                sections.Add(new { type = name, lines = lines.Select(l => new { text = l, source = "learned" }) });
+                sections.Add(new PoolLayer(name, lines.Select(l => new PoolLineItem(l, "learned")).ToList()));
             }
         }
 
-        return new { sections };
+        return new PoolsPayload(sections);
     }
 
     /// <summary>
@@ -207,6 +240,154 @@ internal sealed class HomeBridge
             if (lines.Count > 0) result.Add((prop.Name, lines));
         }
     }
+
+    // ───────────────────────── 首页摘要（9.4 getDigest）─────────────────────────
+
+    /// <summary>
+    /// 首页摘要：今天/昨天说了几句、它注意到你什么、说过多少句。
+    ///
+    /// ⚠️ **口径（开工单 9.4）**：
+    ///   · 「今天/昨天」按**本地时区**分组（ts 是 epoch ms → DateTimeOffset 转本地日期）；
+    ///   · ⚠️ **greeting 不计入「今天说了」**（它是一次性的「启动告知」，不是聊天）。
+    ///     实测依据：今天 50 句里 **40 句是 greeting**（反复重启的噪音）——
+    ///     算进去的话这个数字几乎没信息量，而且判据⑥「今天它还没开口」永远不可达
+    ///     （内核一启动就打招呼 → today 至少 1）。greeting 单独记在 `greetedToday` 里。
+    ///   · 「它注意到你」按 type 归并成 4 类：写码(chitchat_code) / 网页(chitchat_browser) /
+    ///     开会(meeting 家族) / 戳(poked 家族) —— ⚠️ **只算今天的**
+    ///     （草图里它与「今天说了」并列，是「今天它注意到你什么」；
+    ///      踩过坑：漏了日期过滤 → 报「戳 111」，而今天实际只有 5 —— 那是全量历史）；
+    ///   · 「说过 N 句」= **全量事件里唯一台词条数**（按 key 字段去重，不是 text ——
+    ///     text 是填完占位符的成品，key 才是模板原文；同模板不同取值算同一句）。
+    ///
+    /// ⚠️ **为什么 uniqueSaid 不能沿用前端的 saidTotal**：
+    ///   前端那个是从 history（**只取最近 200 条**）去重算的 → 会低估。
+    ///   这里扫全量文件，是唯一准确口径。
+    ///
+    /// ⚠️ 纪律：**只在打开家/点刷新时算一次**，不轮询。文件不存在 → 全 0（前端写人话，不显示 NaN）。
+    /// </summary>
+    private object BuildDigest()
+    {
+        var today = 0;
+        var yesterday = 0;
+        var codeCount = 0;
+        var browserCount = 0;
+        var meetingCount = 0;
+        var pokeCount = 0;
+        var uniqueSaid = 0;
+        var total = 0;
+        var greetedToday = 0;   // greeting 单独记（不算进「今天说了」）
+        var hasFile = false;
+
+        var dataDir = DataDir;
+        if (dataDir is not null)
+        {
+            var path = Path.Combine(dataDir, "memory", "events.jsonl");
+            try
+            {
+                if (File.Exists(path))
+                {
+                    hasFile = true;
+                    var todayDate = DateTime.Now.Date;
+                    var yesterdayDate = todayDate.AddDays(-1);
+                    var saidKeys = new HashSet<string>(StringComparer.Ordinal);
+
+                    foreach (var line in File.ReadLines(path))
+                    {
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        JsonDocument doc;
+                        try
+                        {
+                            doc = JsonDocument.Parse(line);
+                        }
+                        catch (JsonException)
+                        {
+                            continue;   // 坏行跳过（写盘中断可能留半行）
+                        }
+                        using (doc)
+                        {
+                            var r = doc.RootElement;
+                            var ty = r.TryGetProperty("type", out var tyv) ? tyv.GetString() ?? "" : "";
+                            var ts = r.TryGetProperty("ts", out var tsv) && tsv.TryGetInt64(out var tsVal) ? tsVal : 0L;
+
+                            // 唯一台词：按 key（模板原文）去重；没有 key 的事件不算「说了句」
+                            var key = r.TryGetProperty("key", out var kv) ? kv.GetString() : null;
+                            if (!string.IsNullOrWhiteSpace(key)) saidKeys.Add(key!);
+
+                            // 只统计「说/被戳」类事件 —— 告警（security.*）不是它跟你说话
+                            if (!IsSayType(ty)) continue;
+                            total++;
+
+                            if (ts <= 0) continue;
+                            var local = DateTimeOffset.FromUnixTimeMilliseconds(ts).LocalDateTime.Date;
+
+                            // ⚠️ greeting 单独记 —— 它是「启动告知」，不是聊天（口径见方法注释）
+                            if (ty == "greeting")
+                            {
+                                if (local == todayDate) greetedToday++;
+                                continue;
+                            }
+
+                            if (local == todayDate)
+                            {
+                                today++;
+                                // ⚠️ 「它注意到你」**只算今天**（草图语境：与「今天说了」并列）。
+                                //   踩过坑：漏日期过滤 → 报「戳 111」，实际今天只有 5（那是全量历史）。
+                                switch (ty)
+                                {
+                                    case "chitchat_code": codeCount++; break;
+                                    case "chitchat_browser": browserCount++; break;
+                                    case "poked":
+                                    case "poked_again": pokeCount++; break;
+                                    case "chitchat_meeting":
+                                    case "chitchat_meeting_back": meetingCount++; break;
+                                }
+                            }
+                            else if (local == yesterdayDate)
+                            {
+                                yesterday++;
+                            }
+                        }
+                    }
+                    uniqueSaid = saidKeys.Count;
+                }
+            }
+            catch (Exception ex)
+            {
+                ShellLog.Write($"[WRN] 读摘要失败（降级为全 0）：{ex.Message}");
+            }
+        }
+
+        // 池子总句数：三层池合并（官方 + 用户 + 学习）—— 与台词池页同一份口径
+        var poolTotal = BuildPools().TotalCount;
+
+        return new
+        {
+            today,
+            yesterday,
+            total,
+            greetedToday,
+            uniqueSaid,
+            poolTotal,
+            hasFile,
+            noticed = new { code = codeCount, browser = browserCount, meeting = meetingCount, poke = pokeCount },
+        };
+    }
+
+    /// <summary>「说/被戳」类事件（告警与安全事件不算它跟你说话）。</summary>
+    private static bool IsSayType(string type) => type switch
+    {
+        "greeting" => true,
+        "chitchat" => true,
+        "chitchat_code" => true,
+        "chitchat_browser" => true,
+        "chitchat_back" => true,
+        "chitchat_meeting" => true,
+        "chitchat_meeting_back" => true,
+        "poked" => true,
+        "poked_again" => true,
+        "said" => true,
+        _ => false,
+    };
 
     // ───────────────────────── 消息历史（events.jsonl 倒序分页）─────────────────────────
 

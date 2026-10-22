@@ -36,3 +36,5 @@ zhi-shell.mood-*.png
 # 只只的家：前端构建产物（不进 git —— 跟 zhi-shell.render*.png 同处理）
 apps/home/dist/
 zhi-shell.home*.png
+# 只只的家 · 空状态验收截图（隔离实例用，加 empty- 前缀）
+shell/empty-zhi-shell.home*.png

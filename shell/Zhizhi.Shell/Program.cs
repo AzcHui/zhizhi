@@ -285,12 +285,45 @@ public static class Program
         var readySeen = false;
         var ackFields = 0;
         var historyCount = 0;
+        var echoPoolLines = -1;      // 前端回显：它真正解析到的句数（-1 = 还没回显）
+        var echoPoolSections = -1;
+        var echoPoolErr = "";
 
         home = new HomeWindow(bridge);
         // 监听前端消息：ready + overview 回显（③ 的判据靠这个）
         home.WebMessageProbe = (cmd, json) =>
         {
             if (cmd == "ready") readySeen = true;
+            if (cmd == "echoPools")
+            {
+                // ⚠️ 判据④c：**前端自己解析到的句数**（不是外壳自称发过的）。
+                //   上一轮的教训：外壳发的 JSON 字段名对不上（PascalCase），
+                //   前端拿到 undefined → 页面永远转圈 —— 而**外壳这边一切正常**，
+                //   所以「外壳侧自检」抓不到，必须让前端回吐它真正读到的数。
+                //   教训（可推广）：**发送方的自证不算数，要接收方回执。**
+                try
+                {
+                    using var d = System.Text.Json.JsonDocument.Parse(json);
+                    if (d.RootElement.TryGetProperty("lines", out var l)
+                        && l.ValueKind == System.Text.Json.JsonValueKind.Number
+                        && l.TryGetInt32(out var n))
+                    {
+                        echoPoolLines = n;
+                    }
+                    if (d.RootElement.TryGetProperty("sections", out var sec)
+                        && sec.ValueKind == System.Text.Json.JsonValueKind.Number
+                        && sec.TryGetInt32(out var sn))
+                    {
+                        echoPoolSections = sn;
+                    }
+                    if (d.RootElement.TryGetProperty("error", out var er)
+                        && er.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        echoPoolErr = er.GetString() ?? "";
+                    }
+                }
+                catch { /* 探针自己解析失败不影响主链 */ }
+            }
             if (cmd == "echoOverview")
             {
                 // ⚠️⚠️ 2026-10-22 修 9.2 假数字：**必须从 args 里真读 fields**，
@@ -333,14 +366,20 @@ public static class Program
                 timer.Stop();
                 Check("② 收到前端 ready", readySeen, readySeen ? "" : "（35s 内没收到 —— dist 没加载成功或 bridge 没通）");
                 Check("③ overview 回显（桥是双向的）", ackFields >= 5, ackFields >= 5 ? $"（真实字段数 {ackFields}）" : $"（字段数 {ackFields} < 5 —— 前端没回显或 overview 被丢字段）");
+                Check("④c 前端真解析到台词了（回执句数 > 0）", echoPoolLines > 0,
+                    echoPoolLines > 0 ? $"前端回显 {echoPoolSections} 段 / {echoPoolLines} 句"
+                        : (echoPoolErr.Length > 0 ? $"前端报结构错：{echoPoolErr}" : "前端没回显（echoPools 缺失）"));
                 Finish();
                 return;
             }
 
             if (phase == 0)
             {
+                // ⚠️ 等三样：ready + overview 回显 + **pools 回显**（前端真正解析到的句数）。
+                //   少了第三个 → 判据④c 会在前端还没回显时跑 → 假红。
                 if (!readySeen || ackFields < 5) return;
-                Console.WriteLine($"  握手完成：ready={readySeen}，overview 回显字段数={ackFields}");
+                if (echoPoolLines < 0 && waitTicks < 200) return;   // 最多再等 10s
+                Console.WriteLine($"  握手完成：ready={readySeen}，overview 回显字段数={ackFields}，pools 回显 {echoPoolSections} 段/{echoPoolLines} 句");
                 phase = 1;
                 waitTicks = 0;
                 return;
@@ -363,6 +402,68 @@ public static class Program
                 }
                 catch (Exception ex) { Console.WriteLine($"  （getHistory 解析失败：{ex.Message}）"); }
                 Check("④ getHistory 读到盘", historyCount > 0, $"{historyCount} 条");
+
+                // ④b ⭐ 台词池字段名判据（2026-10-22 P0 回归抓手）
+                //   症状：用户报「台词池一直显示正在读台词池」。
+                //   根因：BuildPools 从匿名类型改成了 record，而 .NET 的 JsonSerializer
+                //         **默认保持属性名原样（PascalCase）** → 序列化成
+                //         "Sections"/"Type"/"Lines"/"Text"/"Source"，
+                //         前端读的是 data.sections / s.type / l.text（全小写）→ 全 undefined
+                //         → state.pools 永远 null → 页面永远转圈。
+                //   ⚠️ 这条判据**直接查桥返回的 JSON 字段名** —— 因为
+                //      「前端有没有渲染出台词」截图能看出来，但**没人看截图**；
+                //      「字段名对不对」是纯数字，必须有自动判据盯着。
+                int poolSections = 0;
+                int poolLines = 0;
+                string poolShapeErr = "";
+                try
+                {
+                    var poolJson = bridge.Handle("{\"cmd\":\"getPools\"}");
+                    using var pdoc = System.Text.Json.JsonDocument.Parse(poolJson[0]);
+                    var data = pdoc.RootElement.GetProperty("data");
+                    // ⚠️ 这里刻意用**小写**属性名取 —— 取不到就说明序列化成了 PascalCase
+                    if (!data.TryGetProperty("sections", out var sectionsEl))
+                    {
+                        var actual = string.Join(",", data.EnumerateObject().Select(p => p.Name));
+                        poolShapeErr = $"data 里没有小写 sections，实际字段：{actual}";
+                    }
+                    else
+                    {
+                        foreach (var sec in sectionsEl.EnumerateArray())
+                        {
+                            if (!sec.TryGetProperty("type", out var ty) || !sec.TryGetProperty("lines", out var linesEl))
+                            {
+                                poolShapeErr = "section 缺小写 type/lines";
+                                break;
+                            }
+                            poolSections++;
+                            foreach (var ln in linesEl.EnumerateArray())
+                            {
+                                if (!ln.TryGetProperty("text", out _) || !ln.TryGetProperty("source", out _))
+                                {
+                                    poolShapeErr = "line 缺小写 text/source";
+                                    break;
+                                }
+                                poolLines++;
+                            }
+                            if (poolShapeErr.Length > 0) break;
+                        }
+                    }
+                }
+                catch (Exception ex) { poolShapeErr = ex.Message; }
+                Check("④b 台词池字段名是小写（前端能解析）",
+                    poolShapeErr.Length == 0 && poolSections > 0 && poolLines > 0,
+                    poolShapeErr.Length > 0 ? poolShapeErr : $"{poolSections} 段 / {poolLines} 句");
+
+                // ④c ⭐ 前端回执判据：**前端自己解析到的句数** > 0。
+                //   ⚠️ 这条比④b 更硬 —— ④b 查的是「外壳发的 JSON 对不对」，
+                //   ④c 查的是「前端真拿到手了吗」（端到端）。
+                //   上一轮 P0 回归时外壳侧一切正常、前端却永远转圈 ——
+                //   只有「接收方回执」才抓得到。
+                Check("④c 前端真解析到台词了（回执句数 > 0）",
+                    echoPoolLines > 0,
+                    echoPoolLines > 0 ? $"前端回显 {echoPoolSections} 段 / {echoPoolLines} 句"
+                        : (echoPoolErr.Length > 0 ? $"前端报结构错：{echoPoolErr}" : "前端没回显（echoPools 缺失）"));
 
                 // ⑤b 试听链路：previewLine → 球冒这句（**纯预览，不进记忆**）
                 //   验法：先记 events.jsonl 的条数 → 调 previewLine → 再记一次 → 必须**没变**。

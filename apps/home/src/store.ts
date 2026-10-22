@@ -27,6 +27,8 @@ export interface HomeState {
   ready: boolean;
   /** 最后一次错误（显示在顶栏，不静默吞） */
   error: string | null;
+  /** 台词池读取失败的原因（**独立于 error** —— error 会被试听回包清掉，互相覆盖就看不见了） */
+  poolsError: string | null;
 }
 
 export const state = reactive<HomeState>({
@@ -39,6 +41,7 @@ export const state = reactive<HomeState>({
   connected: false,
   ready: false,
   error: null,
+  poolsError: null,
 });
 
 /** 台词池总句数 */
@@ -56,6 +59,48 @@ export const saidTotal = computed(() => {
 function pushLog(line: LogLine): void {
   state.logs.push(line);
   if (state.logs.length > 500) state.logs.splice(0, state.logs.length - 500);
+}
+
+/**
+ * 校验并规整外壳发来的台词池。
+ *
+ * ⚠️ **为什么必须有这个函数**（2026-10-22 P0）：
+ *   外壳的 .NET `JsonSerializer` 默认**保持属性名原样**，
+ *   record 会被序列化成 `Sections` / `Type` / `Lines` / `Text` / `Source`（大写），
+ *   而前端约定是小写 —— 一旦对不上，`state.pools` 就是 undefined，
+ *   页面会**永远显示「正在读台词池…」且不报错**（用户视角：功能坏了但没人告诉他）。
+ *
+ * → 这里**宁可报错也不静默**：结构对不上就抛给上层记 error。
+ */
+function normalizePools(data: unknown): PoolSection[] {
+  const raw = (data as { sections?: unknown } | undefined)?.sections;
+  if (!Array.isArray(raw)) {
+    const actual = data && typeof data === 'object' ? Object.keys(data).join(',') : '(不是对象)';
+    throw new Error(`台词池结构对不上（缺 sections）—— 外壳发来的字段是：${actual}`);
+  }
+  return raw.map((sec, i) => {
+    const s = sec as { type?: unknown; lines?: unknown };
+    if (typeof s.type !== 'string' || !Array.isArray(s.lines)) {
+      const actual = sec && typeof sec === 'object' ? Object.keys(sec).join(',') : '(不是对象)';
+      throw new Error(`台词池第 ${i + 1} 段结构对不上 —— 字段是：${actual}`);
+    }
+    return {
+      type: s.type,
+      lines: s.lines.map((ln) => {
+        const l = ln as { text?: unknown; source?: unknown };
+        if (typeof l.text !== 'string') {
+          const actual = ln && typeof ln === 'object' ? Object.keys(ln).join(',') : '(不是对象)';
+          throw new Error(`台词池第 ${i + 1} 段里有一句结构对不上 —— 字段是：${actual}`);
+        }
+        return { text: l.text, source: (l.source as PoolSection['lines'][number]['source']) ?? 'persona' };
+      }),
+    };
+  });
+}
+
+/** 台词总句数（用于回显给外壳）。 */
+function countPoolLines(sections: PoolSection[] | null): number {
+  return (sections ?? []).reduce((n, s) => n + (s.lines?.length ?? 0), 0);
 }
 
 /**
@@ -85,7 +130,26 @@ export async function bootstrap(): Promise<void> {
         state.history = msg.data;
         break;
       case 'pools':
-        state.pools = msg.data.sections;
+        // ⚠️⚠️ 结构防御（2026-10-22 P0 回归留下的教训）：
+        //   外壳曾经把 pools 序列化成 {"Sections": …}（PascalCase，.NET 默认行为），
+        //   前端读 data.sections 拿到 undefined → state.pools 永远 null →
+        //   页面**永远显示「正在读台词池…」**，而且不报任何错。
+        //   → 这里**必须校验结构**：对不上就写清楚报错，别让用户对着一个永远转圈的页面发呆。
+        //   → 并且**回显实际解析到的句数**给外壳（判据④c）—— 证明「真的渲染出来了」，
+        //     而不是「外壳自称发过了」。
+        try {
+          state.pools = normalizePools(msg.data);
+          state.poolsError = null;
+          send('echoPools', { lines: countPoolLines(state.pools), sections: state.pools.length });
+        } catch (e) {
+          // ⚠️ **不许静默**：结构对不上 → 页面写清原因（Lines.vue 会读 state.poolsError）。
+          const why = e instanceof Error ? e.message : String(e);
+          state.pools = null;      // 保持 null → 页面走「读失败」分支（不是「读到但空」）
+          state.poolsError = why;
+          console.error('[家] pools 结构异常', e);
+          // 仍然回显 —— 让外壳的判据④c 变红（0 句），别让问题只存在于界面里
+          send('echoPools', { lines: 0, sections: 0, error: why });
+        }
         break;
       case 'digest':
         state.digest = msg.data;

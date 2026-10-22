@@ -6,7 +6,7 @@
  * 第一版**只读** —— 不做编辑（写回 json 防手滑）。
  */
 import { computed, ref } from 'vue';
-import { state, poolTotal, saidTotal, preview } from '../store';
+import { state, poolTotal, saidTotal, preview, refresh } from '../store';
 
 const filter = ref('');
 
@@ -65,6 +65,12 @@ function previewText(text: string): string {
     .replace(/\{drive\}/g, 'C')
     .replace(/\{[a-zA-Z_][a-zA-Z0-9_]*\}/g, '…');
 }
+
+/** 重试：重新拉一次台词池（读失败时给用户的出口，别让人干等）。 */
+async function reload(): Promise<void> {
+  state.poolsError = null;
+  await refresh('pools');
+}
 </script>
 
 <template>
@@ -74,7 +80,17 @@ function previewText(text: string): string {
       <span class="count">共 {{ poolTotal }} 句 · 已说过 {{ saidTotal }} 句</span>
     </div>
 
-    <div v-if="!state.pools" class="hint">正在读台词池…</div>
+    <!-- ⚠️ 三态区分（2026-10-22 P0 教训）：
+         · 没数据       → 「正在读台词池…」（正常加载中）
+         · 读失败       → 写清楚原因（state.error），并给个重试按钮
+         · 读到了但空   → 「没有匹配的台词。」
+         以前这三态塌成第一态 → 用户对着永远转圈的页面，完全不知道出了啥事。 -->
+    <div v-if="!state.pools && !state.poolsError" class="hint">正在读台词池…</div>
+
+    <div v-else-if="!state.pools && state.poolsError" class="hint err">
+      {{ state.poolsError }}
+      <button class="retry" @click="reload">重试</button>
+    </div>
 
     <section v-for="s in sections" :key="s.type" class="section">
       <h3>{{ label(s.type) }}<small>{{ s.type }} · {{ s.lines.length }} 句</small></h3>
@@ -104,6 +120,12 @@ function previewText(text: string): string {
 .search:focus { border-color: #1f8a7a; }
 .count { font-size: 12.5px; color: #888; }
 .hint { color: #999; font-size: 13px; }
+.hint.err { color: #c0392b; line-height: 1.8; }
+.retry {
+  margin-left: 8px; font-size: 12px; padding: 2px 10px; cursor: pointer;
+  border: 1px solid #c0392b; background: #fff; color: #c0392b; border-radius: 5px;
+}
+.retry:hover { background: #c0392b; color: #fff; }
 .section { margin-bottom: 16px; }
 .section h3 {
   font-size: 13.5px; margin: 0 0 6px; color: #333; font-weight: 600;

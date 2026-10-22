@@ -13,6 +13,29 @@ namespace Zhizhi.Shell;
 /// </summary>
 internal sealed class HomeBridge
 {
+    /// <summary>
+    /// ⭐ 桥的序列化选项：**camelCase**。
+    ///
+    /// ⚠️⚠️ **踩过的坑（2026-10-22 P0）**：
+    ///   .NET 的 <see cref="JsonSerializer"/> **默认保持属性名原样（PascalCase）**。
+    ///   所以：
+    ///     · 匿名类型 `new { cpu = 1 }` → 输出 `"cpu"`（因为匿名类型的属性名本来就是小写）；
+    ///     · record `record X(int Sections)` → 输出 `"Sections"`（**大写！**）。
+    ///   前端约定全是小写（`data.sections` / `s.type` / `l.text`）→
+    ///   record 一旦混进来就**全变 undefined**，页面永远空/永远转圈。
+    ///
+    ///   教训：**同一份协议里，匿名类型和 record 的默认序列化结果不一样** ——
+    ///   匿名类型看着「没问题」其实是运气好（属性名恰好写成小写）。
+    ///   → 统一用 camelCase 策略，**不依赖「我这次记得写小写」**。
+    /// </summary>
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
+    /// <summary>统一出口：所有给前端的 JSON 都走这里（保证命名策略一致）。</summary>
+    private static string Ser<T>(T value) => JsonSerializer.Serialize(value, JsonOpts);
+
     private readonly FloatWindow _float;
     private readonly KernelSidecar _kernel;
 
@@ -51,35 +74,35 @@ internal sealed class HomeBridge
                     // 首屏：一次给全（overview + pools + history + digest）—— 四条独立消息
                     return new[]
                     {
-                        JsonSerializer.Serialize(new { type = "overview", data = BuildOverview() }),
-                        JsonSerializer.Serialize(new { type = "pools", data = BuildPools() }),
-                        JsonSerializer.Serialize(new { type = "history", data = BuildHistory(200, 0, null) }),
-                        JsonSerializer.Serialize(new { type = "digest", data = BuildDigest() }),
+                        Ser(new { type = "overview", data = BuildOverview() }),
+                        Ser(new { type = "pools", data = BuildPools() }),
+                        Ser(new { type = "history", data = BuildHistory(200, 0, null) }),
+                        Ser(new { type = "digest", data = BuildDigest() }),
                     };
 
                 case "getOverview":
-                    return new[] { JsonSerializer.Serialize(new { type = "overview", data = BuildOverview() }) };
+                    return new[] { Ser(new { type = "overview", data = BuildOverview() }) };
 
                 case "getHistory":
                 {
                     var limit = GetInt(root, "limit", 200);
                     var offset = GetInt(root, "offset", 0);
                     string? type = root.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
-                    return new[] { JsonSerializer.Serialize(new { type = "history", data = BuildHistory(limit, offset, type) }) };
+                    return new[] { Ser(new { type = "history", data = BuildHistory(limit, offset, type) }) };
                 }
 
                 case "getPools":
-                    return new[] { JsonSerializer.Serialize(new { type = "pools", data = BuildPools() }) };
+                    return new[] { Ser(new { type = "pools", data = BuildPools() }) };
 
                 case "getDigest":
                     // ⭐ 9.4：首页摘要（今天/昨天/它注意到你/说过多少句）。
                     //   只在打开家 / 点刷新时算一次 —— **不做定时轮询**（低频界面，别学面板 1Hz）。
-                    return new[] { JsonSerializer.Serialize(new { type = "digest", data = BuildDigest() }) };
+                    return new[] { Ser(new { type = "digest", data = BuildDigest() }) };
 
                 case "getLogs":
                 {
                     var limit = GetInt(root, "limit", 300);
-                    return new[] { JsonSerializer.Serialize(new { type = "logs", data = BuildLogs(limit) }) };
+                    return new[] { Ser(new { type = "logs", data = BuildLogs(limit) }) };
                 }
 
                 case "subscribeLogs":
@@ -94,21 +117,21 @@ internal sealed class HomeBridge
                     if (string.IsNullOrWhiteSpace(text)) return Array.Empty<string>();
                     // ⚠️ 试听 = 纯预览：走 PreviewLine（不进记忆、不动 trust、不计 occurrence）
                     _float.PreviewLine(text!);
-                    return new[] { JsonSerializer.Serialize(new { type = "previewDone", data = new { ok = true } }) };
+                    return new[] { Ser(new { type = "previewDone", data = new { ok = true } }) };
                 }
 
                 case "requestSay":
                 {
                     // ⭐ 9.4：首页「随便说一句」→ 走内核已有的 requestSay（内核零改动）
                     _float.RequestSay();
-                    return new[] { JsonSerializer.Serialize(new { type = "sayDone", data = new { ok = true } }) };
+                    return new[] { Ser(new { type = "sayDone", data = new { ok = true } }) };
                 }
 
                 case "toggleMute":
                 {
                     // ⭐ 9.4：首页「静一下」→ 复用面板那个 ToggleMute（同一个状态源，不搞两套）
                     _float.ToggleMutePublic();
-                    return new[] { JsonSerializer.Serialize(new { type = "muteDone", data = new { ok = true } }) };
+                    return new[] { Ser(new { type = "muteDone", data = new { ok = true } }) };
                 }
 
                 default:
@@ -158,7 +181,10 @@ internal sealed class HomeBridge
     /// <summary>三层合并后的池（对外序列化成 { type, lines:[{text,source}] }）。</summary>
     private sealed record PoolsPayload(IReadOnlyList<PoolLayer> Sections)
     {
-        /// <summary>总句数（首页摘要用；与台词池页「共 N 句」同一口径）。</summary>
+        /// <summary>总句数（首页摘要用；与台词池页「共 N 句」同一口径）。
+        /// ⚠️ 这是**给 C# 侧算的**，不是给前端的字段 → 必须 [JsonIgnore]，
+        ///   否则会跟着 camelCase 变成 "totalCount" 混进协议里（前端不认，无害但脏）。</summary>
+        [System.Text.Json.Serialization.JsonIgnore]
         public int TotalCount => Sections.Sum(s => s.Lines.Count);
     }
 
@@ -464,7 +490,7 @@ internal sealed class HomeBridge
     public void PushKernelLogLine(string text)
     {
         if (!_logLive) return;
-        var msg = JsonSerializer.Serialize(new
+        var msg = Ser(new
         {
             type = "logLine",
             data = new { ts = DateTimeOffset.Now.ToUnixTimeMilliseconds(), source = "kernel", text },

@@ -12,7 +12,9 @@
     "once": "pnpm --filter @zhizhi/cli once",
     "typecheck": "tsc --noEmit",
     "build:home": "pnpm --filter @zhizhi/home build",
-    "dev:home": "pnpm --filter @zhizhi/home dev"
+    "dev:home": "pnpm --filter @zhizhi/home dev",
+    "build:shell": "dotnet build shell/Zhizhi.Shell/Zhizhi.Shell.csproj -c Debug",
+    "build:all": "pnpm build:home && pnpm build:shell"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

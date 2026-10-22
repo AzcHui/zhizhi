@@ -42,7 +42,7 @@ internal sealed class HomeBridge
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            if (!root.TryGetProperty("cmd", out var cmdEl)) return null;
+            if (!root.TryGetProperty("cmd", out var cmdEl)) return Array.Empty<string>();
             var cmd = cmdEl.GetString() ?? "";
 
             switch (cmd)

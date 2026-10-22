@@ -68,6 +68,22 @@ public static class Program
             return 2;
         }
 
+        // ⚠️ WebView2 托管 DLL 预检（2026-10-22 P0 根治第二层）：
+        //   缺了的话「只只的家」开窗就报 .NET 的 FileNotFoundException（天书）。
+        //   这里启动时就查一次，日志留痕；**不弹窗打断** —— 球照常跑，
+        //   等用户真去开「家」时 HomeWindow 会给一句人话提示（那才是该打扰的时刻）。
+        //   ⚠️ 用 WebView2Preflight（不碰任何 WebView2 类型）—— 本行所在的方法若引用了
+        //   WebView2 类型，JIT 就会在进方法时先抛 FileNotFoundException，预检成死代码。
+        var missingWv2 = WebView2Preflight.FindMissingAssemblies();
+        if (missingWv2.Count > 0)
+        {
+            ShellLog.Write($"[WRN] 缺 WebView2 托管 DLL（只只的家会开不了）：{string.Join("、", missingWv2)}");
+        }
+        else
+        {
+            ShellLog.Write("[OK] WebView2 托管 DLL 齐备");
+        }
+
         var kernel = new KernelSidecar();
         try
         {
@@ -215,6 +231,14 @@ public static class Program
             Console.WriteLine($"  {(ok ? "OK " : "FAIL")}  {name}{(detail.Length > 0 ? $"  {detail}" : "")}");
             if (!ok) failures++;
         }
+
+        // ⓪ WebView2 托管 DLL 预检（**必须在调 GetRuntimeVersion 之前** ——
+        //    那个方法引用了 WebView2 类型，缺 DLL 时 JIT 阶段就抛 FileNotFoundException，
+        //    下面的判据根本没机会跑。这里先查、给人话、直接退出。）
+        var missingWv2 = WebView2Preflight.FindMissingAssemblies();
+        Check("⓪ WebView2 托管 DLL 齐备", missingWv2.Count == 0,
+            missingWv2.Count == 0 ? "" : $"（缺 {string.Join("、", missingWv2)} —— 构建产物不完整，重新 dotnet build）");
+        if (missingWv2.Count > 0) return 1;
 
         // ① WebView2 运行时
         var runtime = HomeWindow.GetRuntimeVersion();

@@ -57,7 +57,12 @@ internal sealed class HomeWindow : Window
         return File.Exists(Path.Combine(dist, "index.html")) ? dist : null;
     }
 
-    /// <summary>WebView2 运行时版本（null = 没装）。启动检测用。</summary>
+    /// <summary>
+    /// WebView2 运行时版本（null = 没装）。启动检测用。
+    /// ⚠️ ⚠️ **调用前必须先过 <see cref="WebView2Preflight"/> 的预检** ——
+    ///   本方法体引用了 CoreWebView2Environment，托管 DLL 缺失时 **JIT 阶段就会抛
+    ///   FileNotFoundException**（进不到我们自己的检查里）。详见 WebView2Preflight 的注释。
+    /// </summary>
     public static string? GetRuntimeVersion()
     {
         try
@@ -176,6 +181,19 @@ internal sealed class HomeWindow : Window
             // 纪律：不白屏 —— 给一句人话
             ShowFallback(MissingDistHtml);
             ShellLog.Write("[WRN] 只只的家：apps/home/dist 不存在，显示未构建提示");
+            return;
+        }
+
+        // ⚠️ 前置自检：**必须在碰任何 WebView2 类型之前**（含 GetRuntimeVersion —— 它内部
+        //   引用 CoreWebView2Environment，托管 DLL 缺失时 JIT 阶段就抛，压根到不了这里）。
+        //   不做这一步的话，用户看到的是 .NET 的
+        //   「Could not load file or assembly 'Microsoft.Web.WebView2.Core'…系统找不到指定的文件」
+        //   —— 那是天书，而且用户会以为是「程序坏了」而不是「构建没带全依赖」。
+        var missing = WebView2Preflight.FindMissingAssemblies();
+        if (missing.Count > 0)
+        {
+            ShowFallback(WebView2Preflight.BuildMissingHintHtml(missing));
+            ShellLog.Write($"[ERR] 只只的家：缺 WebView2 托管 DLL —— {string.Join("、", missing)}（构建产物不完整）");
             return;
         }
 

@@ -32,4 +32,50 @@
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
   </ItemGroup>
 
+  <!-- ⭐⭐ 根治 P0（2026-10-22）：WebView2 托管 DLL 必须**无条件**进输出目录。
+       起因：这个包的托管 DLL 不在 lib/ 而在 lib_manual/（非标准布局），靠包自己的
+       buildTransitive/*.targets 里的 <Reference> 注入。**该注入走 RAR（ResolveAssemblyReference）**，
+       而 RAR 有增量缓存（obj/…/Zhizhi.Shell.csproj.AssemblyReference.cache）——
+       一旦缓存命中（如：先 publish/构建到别的目录，再增量构建回默认输出），
+       **RAR 不再重新解析 → ReferenceCopyLocalPaths 为空 → 三个 Microsoft.Web.WebView2.*.dll 不被复制**
+       → 运行时抛「Could not load file or assembly 'Microsoft.Web.WebView2.Core'…系统找不到指定的文件」。
+       现象：home-test 全绿（用的是干净构建产物），用户双击 bin/Debug 的 exe 就报「找不到文件」。
+       修法：不依赖 RAR 的增量判断，直接把三个托管 DLL + 原生 loader 声明成 Content，
+             CopyToOutputDirectory=Always —— 每次构建都复制，删了也会补回来。 -->
+  <PropertyGroup>
+    <!-- WebView2 包版本号（与上面的 PackageReference 保持一致；升级时两处同改） -->
+    <WebView2PackageVersion>1.0.2903.40</WebView2PackageVersion>
+    <WebView2PackageRoot>$(NuGetPackageRoot)microsoft.web.webview2\$(WebView2PackageVersion)\</WebView2PackageRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 三个托管封装（Core 必需；Wpf 是本项目用的；WinForms 随包一起带上免得以后引 WinForms 再踩坑） -->
+    <Content Include="$(WebView2PackageRoot)lib_manual\netcoreapp3.0\Microsoft.Web.WebView2.Core.dll">
+      <Link>Microsoft.Web.WebView2.Core.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(WebView2PackageRoot)lib_manual\netcoreapp3.0\Microsoft.Web.WebView2.Wpf.dll">
+      <Link>Microsoft.Web.WebView2.Wpf.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(WebView2PackageRoot)lib_manual\netcoreapp3.0\Microsoft.Web.WebView2.WinForms.dll">
+      <Link>Microsoft.Web.WebView2.WinForms.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <!-- 原生 loader（x64 为主，三个架构都带上 —— AnyCPU 发布时按需选） -->
+    <Content Include="$(WebView2PackageRoot)runtimes\win-x64\native\WebView2Loader.dll">
+      <Link>runtimes\win-x64\native\WebView2Loader.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(WebView2PackageRoot)runtimes\win-x86\native\WebView2Loader.dll">
+      <Link>runtimes\win-x86\native\WebView2Loader.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
 </Project>

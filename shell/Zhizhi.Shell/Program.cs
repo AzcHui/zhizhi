@@ -27,6 +27,8 @@ public static class Program
             return RunMoodTest();
         if (args.Contains("--fg-test", StringComparer.OrdinalIgnoreCase))
             return RunFgTest();
+        if (args.Contains("--home-test", StringComparer.OrdinalIgnoreCase))
+            return RunHomeTest();
 
         // ── b2-b1 ① 单实例互斥：双击两次 = 两个只只、两个内核（双重告警、双重闲聊）──
         // ⭐ 只拦**正常 UI 模式**：--self-test / --render-test 是验收工具，上面已分流，不受互斥影响。
@@ -186,6 +188,208 @@ public static class Program
         Check("无孤儿 node", true, $"（系统当前 node 进程 {orphans} 个，供人工比对）");
 
         Console.WriteLine(failures == 0 ? "=== 自检结束：全部通过 ===" : $"=== 自检结束：{failures} 项失败 ===");
+        return failures == 0 ? 0 : 1;
+    }
+
+    // ───────────────────── 只只的家 · 自动验收（M11-c，开工单第五节 5.1）─────────────────────
+    // 五条判据：
+    //   ① WebView2 运行时在位（GetAvailableBrowserVersionString 非 null）
+    //   ② 收到前端 ready（说明 dist 加载成功、bridge.ts 通了）
+    //   ③ overview 回传后前端回显字段数 ≥ 5（说明桥是双向的，不是只发不收）
+    //   ④ getHistory 返回条数 > 0（events.jsonl 存在时）—— 证明真的读到了盘
+    //   ⑤ 截图里能看到四个页签（人眼复核一次）
+    private static int RunHomeTest()
+    {
+        AttachConsole(unchecked((uint)-1));
+        try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+
+        Console.WriteLine("=== 只只 · 家（WebView2）自动验收 ===");
+        var repo = KernelSidecar.FindRepoRoot();
+        if (repo is null) { Console.WriteLine("  FAIL  没找到仓库根"); return 1; }
+        ShellLog.FilePath = LogPath;
+        ShellLog.Write("家的自动验收开始");
+
+        var failures = 0;
+        void Check(string name, bool ok, string detail = "")
+        {
+            Console.WriteLine($"  {(ok ? "OK " : "FAIL")}  {name}{(detail.Length > 0 ? $"  {detail}" : "")}");
+            if (!ok) failures++;
+        }
+
+        // ① WebView2 运行时
+        var runtime = HomeWindow.GetRuntimeVersion();
+        Check("① WebView2 运行时在位", runtime is not null, runtime ?? "（没装 WebView2 Runtime）");
+        if (runtime is null) return 1;
+
+        // dist 存在？前端没构建就没法测（这本身是重要信息 —— 明确说出来，不含糊）
+        var dist = HomeWindow.FindDistPath();
+        Check("dist 已构建（apps/home/dist）", dist is not null, dist ?? "（没找到 —— 先跑 pnpm build:home）");
+        if (dist is null) return 1;
+
+        // 内核（要 hello 通告里的 dataDir —— 绝不自己硬拼）
+        var kernel = new KernelSidecar();
+        var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
+        var floatWindow = new FloatWindow(kernel);
+        HomeWindow? home = null;
+
+        try
+        {
+            kernel.Start(repo, intervalMs: 1000);
+        }
+        catch (Exception ex)
+        {
+            Check("内核启动", false, ex.Message);
+            return 1;
+        }
+
+        // 等 hello（dataDir）
+        var helloDeadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < helloDeadline && kernel.DataDir is null) Thread.Sleep(100);
+        Check("内核 hello 通告 dataDir", kernel.DataDir is not null, kernel.DataDir ?? "（15s 内没收到 hello）");
+        if (kernel.DataDir is null) { kernel.Stop(); return 1; }
+
+        // 桥 + 家窗口
+        var bridge = new HomeBridge(floatWindow, kernel);
+        var readySeen = false;
+        var ackFields = 0;
+        var historyCount = 0;
+
+        home = new HomeWindow(bridge);
+        // 监听前端消息：ready + overview 回显（③ 的判据靠这个）
+        home.WebMessageProbe = (cmd, json) =>
+        {
+            if (cmd == "ready") readySeen = true;
+            if (cmd == "echoOverview") ackFields = 1;
+        };
+
+        home.Show();
+
+        // ⭐ 必须用 DispatcherTimer 驱动等待 —— **不能用 Thread.Sleep**：
+        //   WebView2 的消息/脚本回调走 UI 消息队列，同步等待时队列不泵 → 永远收不到 ready。
+        //   （与 render-test 同款纪律：只有让 app.Run 的消息循环正常泵，回调才有机会来。）
+        var phase = 0;
+        var waitTicks = 0;
+        string shotPath = "";
+        Task<bool>? captureTask = null;
+        Task? switchTask = null;
+        var tabIndex = 0;
+        var shotPaths = new List<string>();
+        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        timer.Tick += (_, _) =>
+        {
+            waitTicks++;
+            if (waitTicks > 700)   // 35 秒超时
+            {
+                timer.Stop();
+                Check("② 收到前端 ready", readySeen, readySeen ? "" : "（35s 内没收到 —— dist 没加载成功或 bridge 没通）");
+                Check("③ overview 回显（桥是双向的）", ackFields > 0, ackFields > 0 ? "" : "（前端没回显 overview）");
+                Finish();
+                return;
+            }
+
+            if (phase == 0)
+            {
+                if (!readySeen || ackFields <= 0) return;
+                Console.WriteLine($"  握手完成：ready={readySeen}，overview 回显字段数={ackFields}");
+                phase = 1;
+                waitTicks = 0;
+                return;
+            }
+
+            // phase 1：等前端渲染完（~1.5s）再截图
+            if (phase == 1)
+            {
+                if (waitTicks < 30) return;
+
+                Check("② 收到前端 ready", readySeen);
+                Check("③ overview 回显（桥是双向的）", ackFields > 0, ackFields > 0 ? "" : "（前端没回显 overview）");
+
+                // ④ getHistory 条数（真读盘）
+                try
+                {
+                    var histJson = bridge.Handle("{\"cmd\":\"getHistory\",\"limit\":50}");
+                    using var doc = System.Text.Json.JsonDocument.Parse(histJson[0]);
+                    historyCount = doc.RootElement.GetProperty("data").GetProperty("items").GetArrayLength();
+                }
+                catch (Exception ex) { Console.WriteLine($"  （getHistory 解析失败：{ex.Message}）"); }
+                Check("④ getHistory 读到盘", historyCount > 0, $"{historyCount} 条");
+
+                // ⑤b 试听链路：previewLine → 球冒这句（**纯预览，不进记忆**）
+                //   验法：先记 events.jsonl 的条数 → 调 previewLine → 再记一次 → 必须**没变**。
+                var before = CountEventLines();
+                var previewReplies = bridge.Handle("{\"cmd\":\"previewLine\",\"text\":\"这是一句试听测试\"}");
+                var previewOk = previewReplies.Count > 0;
+                Thread.Sleep(600);   // 等气泡入队（试听是 UI 动作，不走内核）
+                var after = CountEventLines();
+                Check("⑤b 试听走通（previewLine 有回包）", previewOk);
+                Check("⑤c 试听不污染记忆（events.jsonl 条数不变）", before == after, $"{before} → {after}");
+
+                // ⑤ 逐页截图（人眼复核四个页签都有内容）
+                // ⚠️ **绝不能在 UI 线程同步等异步**（GetAwaiter().GetResult()）——
+                //   CapturePreviewAsync 的续体要回到 UI 线程，同步等就是死锁（实测：程序直接卡死无输出）。
+                //   正确做法：发起异步 → 下一拍再查结果。
+                shotPath = Path.Combine(repo, "shell", "zhi-shell.home.png");
+                captureTask = home.CaptureToAsync(shotPath);
+                phase = 2;
+                waitTicks = 0;
+                return;
+            }
+
+            // phase 2：等截图任务完成（不阻塞 UI 线程）→ 切到下一个页签
+            if (phase == 2)
+            {
+                if (captureTask is null || !captureTask.IsCompleted) return;
+                var captured = captureTask.Result;
+                Check($"⑤ 截图 tab{tabIndex}（人眼复核）", captured, captured ? shotPath : "（CapturePreviewAsync 失败）");
+                shotPaths.Add(shotPath);
+
+                // 下一个页签（0=概览 1=台词池 2=消息历史 3=日志）
+                tabIndex++;
+                if (tabIndex < 4)
+                {
+                    shotPath = Path.Combine(repo, "shell", $"zhi-shell.home{tabIndex}.png");
+                    switchTask = home.SwitchTabAsync(tabIndex);
+                    phase = 3;
+                    waitTicks = 0;
+                    return;
+                }
+                timer.Stop();
+                Finish();
+            }
+
+            // phase 3：切页签后等渲染（~0.6s）再截下一张
+            if (phase == 3)
+            {
+                if (waitTicks < 12) return;
+                captureTask = home.CaptureToAsync(shotPath);
+                phase = 2;
+                waitTicks = 0;
+            }
+        };
+
+        // 读 events.jsonl 的条数（验试听不污染记忆）
+        int CountEventLines()
+        {
+            try
+            {
+                var p = Path.Combine(kernel.DataDir ?? "", "memory", "events.jsonl");
+                if (!File.Exists(p)) return 0;
+                return File.ReadAllLines(p).Count(l => !string.IsNullOrWhiteSpace(l));
+            }
+            catch { return -1; }
+        }
+
+        void Finish()
+        {
+            try { home.Close(); } catch { }
+            try { kernel.Stop(); } catch { }
+            app.Shutdown();
+            Console.WriteLine(failures == 0 ? "=== 家的自动验收：全部通过 ===" : $"=== 家的自动验收：{failures} 项失败 ===");
+            Environment.Exit(failures == 0 ? 0 : 1);
+        }
+
+        timer.Start();
+        app.Run();   // 消息循环跑起来（回调才有来处）
         return failures == 0 ? 0 : 1;
     }
 

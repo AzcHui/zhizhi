@@ -33,3 +33,6 @@ shell/zhi-shell.log
 .env.*
 !.env.example
 zhi-shell.mood-*.png
+# 只只的家：前端构建产物（不进 git —— 跟 zhi-shell.render*.png 同处理）
+apps/home/dist/
+zhi-shell.home*.png

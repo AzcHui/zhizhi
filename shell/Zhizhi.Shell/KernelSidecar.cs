@@ -40,6 +40,24 @@ public sealed class KernelSidecar : IDisposable
     /// <summary>启动日志（含定位失败、退出等）。</summary>
     public event Action<string>? Log;
 
+    /// <summary>⭐ M11-c：内核通告的真实 dataDir（hello 行）—— 外壳**只认这个**，绝不自己硬拼。</summary>
+    public string? DataDir { get; private set; }
+
+    /// <summary>⭐ M11-c：内核 stderr 逐行（只只的家「日志」页要实时推流）。</summary>
+    public event Action<string>? KernelLogLine;
+
+    /// <summary>内核 stderr 环形缓冲（最近 N 行，带时间戳）。</summary>
+    private readonly List<(long Ts, string Text)> _stderrLines = new();
+
+    /// <summary>内核 stderr 环形缓冲最近 N 条（供只只的家取）。</summary>
+    public IReadOnlyList<(long Ts, string Text)> DumpStderrLines()
+    {
+        lock (_stderrBuf)
+        {
+            lock (_stderrLines) { return _stderrLines.ToArray(); }
+        }
+    }
+
     /// <summary>
     /// 定位仓库根：从 exe 所在目录向上找 packages/cli/src/main.ts（最多 8 层）。
     /// 找不到返回 null —— 由调用方决定怎么报告（不猜、不静默填错）。
@@ -90,6 +108,13 @@ public sealed class KernelSidecar : IDisposable
         {
             using var doc = JsonDocument.Parse(line);
             var root = doc.RootElement;
+            // ⭐ M11-c：hello 行 —— 内核通告真实 dataDir（外壳不许硬拼路径）
+            if (root.TryGetProperty("type", out var ht) && ht.ValueEquals("hello"))
+            {
+                DataDir = root.TryGetProperty("dataDir", out var dd) ? dd.GetString() : null;
+                Log?.Invoke($"内核通告 dataDir：{DataDir ?? "（无）"}");
+                return;
+            }
             if (root.TryGetProperty("type", out var t) && t.ValueEquals("event"))
             {
                 var said = new SaidLine(
@@ -138,6 +163,13 @@ public sealed class KernelSidecar : IDisposable
             _stderrBuf.AppendLine(e.Data);
             if (_stderrBuf.Length > 8192) _stderrBuf.Clear(); // 极简防膨胀
         }
+        // ⭐ M11-c：只只的家「日志」页要实时推内核 stderr —— 这里逐行抛出去
+        lock (_stderrLines)
+        {
+            _stderrLines.Add((DateTimeOffset.Now.ToUnixTimeMilliseconds(), e.Data));
+            if (_stderrLines.Count > 200) _stderrLines.RemoveRange(0, _stderrLines.Count - 200);
+        }
+        KernelLogLine?.Invoke(e.Data);
     }
 
     public string DumpStderr()

@@ -580,6 +580,20 @@ log.info(
 );
 if (Number.isFinite(maxTicks)) log.info(`验收模式：跑满 ${maxTicks} 轮就退出。`);
 
+// ── M11-c · 只只的家：启动时通告一条 hello（stdout 唯一新增的数据行）──
+// ⭐ 理由：外壳要读 events.jsonl / 台词池，**必须知道真实的 dataDir** ——
+//   打包后（M4-b）它会改指 %LOCALAPPDATA%，外壳**不许自己硬拼**（会读错地方）。
+//   所以这条 hello 是「内核告诉外壳我的地盘在哪」的唯一渠道。
+// 纪律：stdout 仍**只有数据**（M0 锁定）—— 这行是 JSON 数据，不是日志；日志照旧走 stderr。
+process.stdout.write(
+  `${JSON.stringify({
+    type: 'hello',
+    // ⚠️ 不要自己转义反斜杠 —— JSON.stringify 本来就会转义，手动 replace 会变成双反斜杠
+    dataDir: resolve(dataDir, '.'),
+    version: '0.0.0',
+  })}\n`,
+);
+
 // ── M8-a：采集计划 → 校准 → 生效间隔 → 报告（验收①②③全在这条链上）──
 probePlan = parseProbePlan(settings, registry.probes().map((p) => p.id), log);
 const calibration = await calibrateProbes(registry.probes(), dataDir, log.child('calibrate'));

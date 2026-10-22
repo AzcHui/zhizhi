@@ -10,7 +10,9 @@
   "scripts": {
     "start": "pnpm --filter @zhizhi/cli start",
     "once": "pnpm --filter @zhizhi/cli once",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:home": "pnpm --filter @zhizhi/home build",
+    "dev:home": "pnpm --filter @zhizhi/home dev"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

@@ -1,0 +1,15 @@
+/* 只只的家 · 全局基础样式（浅色，跟系统走 —— 第一版不做暗色主题） */
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  color: #333;
+  background: #fff;
+  -webkit-font-smoothing: antialiased;
+}
+/* 滚动条收细一点（深色日志区用） */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #b8b8b8; }

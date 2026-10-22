@@ -26,4 +26,10 @@
     <Using Remove="System.Windows.Forms" />
   </ItemGroup>
 
+  <!-- ⭐ 只只的家（M11-c）：WPF 内嵌 WebView2 承载 Vue3 单页。
+       WebView2 走 NuGet 的托管封装；运行时（Edge WebView2 Runtime）本机已装。 -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
 </Project>

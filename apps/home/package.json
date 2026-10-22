@@ -1,0 +1,22 @@
+{
+  "name": "@zhizhi/home",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "只只的家 —— WPF 内嵌 WebView2 里的 Vue3 单页（低频、结构化、可编辑内容）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.9.0",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  }
+}

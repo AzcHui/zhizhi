@@ -2,3 +2,9 @@ packages:
   - "packages/*"
   # 官方插件：每个插件一个独立包（与未来的社区插件形态一致）
   - "packages/plugins/*"
+  # 只只的家（WPF 内嵌 WebView2 里的 Vue3 单页）
+  - "apps/*"
+
+# pnpm 10+ 默认拦依赖的构建脚本；esbuild 必须跑（vite 靠它的原生二进制）
+allowBuilds:
+  esbuild: true

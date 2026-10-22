@@ -164,6 +164,9 @@ public sealed class FloatWindow : Window
     private bool _lastAlertState;                     // 告警保持期上次状态（翻转才记日志）
     private double _curHue = HueCalm, _curSat = SatCalm, _curLum = LumCalm;   // 当前色（HSL，向目标逼近 5%/帧）
     private double? _lastCpu;                          // 最近采样 CPU —— 驱动颜色连续插值 + 档位
+    private double? _lastMem;                          // 最近采样 MEM —— 只只的家概览要用（同一采样源，不重新采集）
+    private double? _lastIdleMs;                       // 最近一次喂给内核的 idleMs —— 家概览要用（不另调 Win32）
+    private DateTime _startedAt = DateTime.Now;        // 启动时刻 —— 「醒了 N 小时」用
     private DateTime _alertHoldUntil = DateTime.MinValue;              // 告警级台词后的保持期
 
     // ── M11-a 情绪状态（二·Z）：trust 档位 ＋ 说话脉冲 ＋ 被冷落 —— 只碰 alpha/线宽/半径，绝不碰 gain ──
@@ -203,12 +206,18 @@ public sealed class FloatWindow : Window
     private long? _muteUntil;                          // 静音截止 epoch ms；null = 未静音
     private const long MuteDurationMs = 60 * 60 * 1000; // 「静一下」= 1 小时（决策 #30；必须有明确结束）
     private Button _muteBtn = null!;                   // 面板「静一下 / 恢复」按钮
+    private Button _homeOrExitBtn = null!;             // M11-c：面板第三按钮（「进屋」或「退出」，看托盘成败）
 
     // ── b2-b1（托盘）──
     private System.Windows.Forms.NotifyIcon? _tray;
     private System.Windows.Forms.ToolStripMenuItem? _trayShowItem;   // 显示/隐藏球（文案随状态）
     private System.Windows.Forms.ToolStripMenuItem? _trayMuteItem;   // 静一下/恢复（文案同步面板）
     private bool _ballHidden;
+
+    // ── M11-c · 只只的家 ──
+    private HomeWindow? _home;                         // 家的窗口（关掉即置空 → 下次重建，不常驻）
+    private HomeBridge? _homeBridge;                   // 桥（跟窗口同生命周期）
+    private bool _trayOk;                              // 托盘建成了吗 —— 面板第三按钮文案靠它（「进屋」还是「退出」）
 
     public FloatWindow(KernelSidecar kernel)
     {
@@ -359,6 +368,11 @@ public sealed class FloatWindow : Window
         _kernel.SampleArrived += s => Dispatcher.BeginInvoke(() => OnSample(s));
         _kernel.Said += said => Dispatcher.BeginInvoke(() => OnSaid(said));
         _kernel.Log += msg => Dispatcher.BeginInvoke(() => AppendLog(msg));
+        // M11-c：内核 stderr 逐行 → 只只的家「日志」页实时推流
+        _kernel.KernelLogLine += line => Dispatcher.BeginInvoke(() => _homeBridge?.PushKernelLogLine(line));
+
+        // M11-c：桥（与窗口同生命周期 —— 窗口关了桥就没用了）
+        _homeBridge = new HomeBridge(this, _kernel);
 
         InitTray();   // b2-b1 ②：托盘图标（五项菜单 + 双击显隐）—— 「回到右下角」是球被拖丢的唯一找回后路
 
@@ -403,6 +417,7 @@ public sealed class FloatWindow : Window
         if (s.Trust is { } t) _trust = t;
         _cpuText.Text = s.Cpu is { } c ? $"{c:F1}%" : "—";
         _memText.Text = s.Mem is { } m ? $"{m:F1}%" : "—";
+        _lastMem = s.Mem;   // M11-c：只只的家概览用（同一采样源，不重新采集）
         if (_panelOpen) UpdateStatusLine();
         // b2-b2：颜色不再换画刷 —— CPU 存起来，由 FluidTick 每帧 HSL 连续插值（形状档位也由它驱动）
         _lastCpu = s.Cpu;
@@ -1283,13 +1298,36 @@ public sealed class FloatWindow : Window
         // b2-a ②「静一下」（决策 #30 面板三按钮补齐）：点 = 静音 1 小时；静音中变「恢复」，点 = 立刻取消
         _muteBtn = new Button { Content = "静一下", Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
         _muteBtn.Click += (_, _) => ToggleMute();
-        var exitBtn = new Button { Content = "退出", Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand };
-        exitBtn.Click += (_, _) => Close();
+        // ⭐ M11-c · 3.7：第三按钮是**动态**的 ——
+        //   托盘建成了 → 「进屋」（打开只只的家）；托盘失败 → 仍显示「退出」。
+        //   理由（防呆）：InitTray 是 try/catch，失败只记账不崩。一旦托盘没建起来，
+        //   用户就**再没有任何退出入口**（只能任务管理器杀）→ 必须留后路。
+        //   ⚠️ 家打开时**不禁用**这个按钮 —— 内核停了也要能进家看日志，那正是最需要它的时候。
+        _homeOrExitBtn = new Button
+        {
+            Content = _trayOk ? "进屋" : "退出",
+            Padding = new Thickness(6, 3, 6, 3),
+            Margin = new Thickness(8, 0, 0, 0),
+            Cursor = Cursors.Hand,
+            ToolTip = _trayOk ? "打开只只的家" : "退出只只（托盘没建起来，这是唯一的退出入口）",
+        };
+        _homeOrExitBtn.Click += (_, _) =>
+        {
+            if (_trayOk)
+            {
+                OpenHome();
+                CollapsePanel();   // 纪律②：家弹出来了，面板别在旁边打架
+            }
+            else
+            {
+                Close();
+            }
+        };
 
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 0) };
         buttons.Children.Add(moveBtn);
         buttons.Children.Add(_muteBtn);
-        buttons.Children.Add(exitBtn);
+        buttons.Children.Add(_homeOrExitBtn);
 
         var stack = new StackPanel { Margin = new Thickness(2) };
         stack.Children.Add(_statusText);
@@ -1629,6 +1667,7 @@ public sealed class FloatWindow : Window
         var idle = Win32.GetIdleMs();
         if (idle is { } ms)
         {
+            _lastIdleMs = ms;   // M11-c：家概览用（不另调 Win32）
             // b2-a ②：muteUntil 随 idleMs 一起喂。**每秒都喂真值**（0 = 未静音）——
             // 内核按「每喂必真值」处理，点「恢复」后旧的未来时刻不能留在内核里。
             var mute = IsMuted ? _muteUntil!.Value : 0;
@@ -1688,7 +1727,7 @@ public sealed class FloatWindow : Window
     }
 
     // ───────────────────────── b2-b1 ② 托盘图标（NotifyIcon 来自 WinForms，全限定名）─────────
-    // 菜单五项：显示/隐藏球 ／ 静一下（复用 ToggleMute）／ 回到右下角 ／ 开机自启（勾选）／ 退出。
+    // 菜单六项：显示/隐藏球 ／ 静一下（复用 ToggleMute）／ 回到右下角 ／ **只只的家** ／ 开机自启（勾选）／ 退出。
     // 「回到右下角」是球被拖丢后唯一的找回后路；双击托盘 = 显示/隐藏。图标程序生成（圆点），不卡素材。
 
     private void InitTray()
@@ -1697,10 +1736,12 @@ public sealed class FloatWindow : Window
         try
         {
             InitTrayCore();
-            AppendLog("托盘已创建（五项菜单 + 双击显隐）");
+            _trayOk = true;   // ⭐ M11-c：托盘建成了 → 面板第三按钮显示「进屋」；退出走托盘右键
+            AppendLog("托盘已创建（六项菜单 + 双击显隐）");
         }
         catch (Exception ex)
         {
+            _trayOk = false;  // 托盘失败 → 面板第三按钮留「退出」（唯一的退出入口，不能丢）
             AppendLog($"[WRN] 托盘创建失败：{ex.Message}");
         }
     }
@@ -1742,13 +1783,18 @@ public sealed class FloatWindow : Window
             }
         };
 
+        // ⭐ M11-c：第六项「只只的家」—— 低频、结构化内容的入口（台词池/历史/日志）
+        var homeWindowItem = new System.Windows.Forms.ToolStripMenuItem("只只的家");
+        homeWindowItem.Click += (_, _) => OpenHome();
+
         var exitItem = new System.Windows.Forms.ToolStripMenuItem("退出");
         exitItem.Click += (_, _) => Close();
 
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.AddRange(new System.Windows.Forms.ToolStripItem[]
         {
-            _trayShowItem, _trayMuteItem, homeItem, autoStartItem, new System.Windows.Forms.ToolStripSeparator(), exitItem,
+            _trayShowItem, _trayMuteItem, homeItem, homeWindowItem, autoStartItem,
+            new System.Windows.Forms.ToolStripSeparator(), exitItem,
         });
 
         _tray = new System.Windows.Forms.NotifyIcon
@@ -1838,7 +1884,19 @@ public sealed class FloatWindow : Window
     {
         // 没定位好（NaN）就别写 —— 宁可不传也不传错
         if (!double.IsFinite(Left) || !double.IsFinite(Top)) return;
-        new ShellSettings { BallLeft = BallScreenLeft, BallTop = BallScreenTop, MuteUntil = _muteUntil ?? 0 }.TrySave();
+        // ⚠️ M11-c：家窗口的位置尺寸**也在这份档案里** —— 但 SaveSettings 会被频繁调用
+        //   （拖动结束/关窗），每次都重写整个对象会把家的字段抹掉 → 先读旧档案再合并。
+        var old = ShellSettings.TryLoad();
+        new ShellSettings
+        {
+            BallLeft = BallScreenLeft,
+            BallTop = BallScreenTop,
+            MuteUntil = _muteUntil ?? 0,
+            HomeLeft = old?.HomeLeft,
+            HomeTop = old?.HomeTop,
+            HomeWidth = old?.HomeWidth,
+            HomeHeight = old?.HomeHeight,
+        }.TrySave();
     }
 
     // ───────────────────────── 日志（内存环形缓冲 + 落盘；日志窗 b2 再做）─────────
@@ -1858,6 +1916,107 @@ public sealed class FloatWindow : Window
     public string DumpLogs()
     {
         lock (_logLock) { return string.Join(Environment.NewLine, _logs); }
+    }
+
+    /// <summary>日志条目（带解析出的时间戳）—— 只只的家「日志」页用。</summary>
+    public IReadOnlyList<(long Ts, string Text)> DumpLogItems()
+    {
+        lock (_logLock)
+        {
+            var list = new List<(long, string)>(_logs.Count);
+            foreach (var raw in _logs)
+            {
+                // 格式是 "[HH:mm:ss] 文本" —— 今天的时刻；跨天的旧条目按当天算（够用，不做精确还原）
+                var ts = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+                if (raw.Length > 10 && raw[0] == '[')
+                {
+                    if (TimeSpan.TryParse(raw.Substring(1, 8), out var t))
+                    {
+                        var now = DateTime.Now;
+                        var today = now.Date + t;
+                        if (today > now.AddHours(1)) today = today.AddDays(-1);   // 未来的时刻 = 昨天
+                        ts = new DateTimeOffset(today).ToUnixTimeMilliseconds();
+                    }
+                }
+                var text = raw.Length > 10 ? raw.Substring(10) : raw;
+                list.Add((ts, text));
+            }
+            return list;
+        }
+    }
+
+    // ───────────────────────── M11-c · 只只的家（对外接口）─────────────────────────
+
+    /// <summary>只只的家要用的状态快照 —— **全部来自已有内存字段**（与浮窗面板同一采样源，不重新采集）。</summary>
+    public (double? Cpu, double? Mem, int? Trust, string FgClass, double? IdleSec, int MuteLeftMin, double UptimeSec) HomeSnapshot
+    {
+        get
+        {
+            var muteMin = IsMuted
+                ? (int)Math.Max(0, Math.Ceiling((_muteUntil!.Value - EpochNow()) / 60000.0))
+                : 0;
+            return (
+                _lastCpu,
+                _lastMem,
+                _trust,
+                // 「—」是「还没采到」的占位 → 给个能看的默认值（unknown = 不影响闲聊）
+                _fgClass == "—" ? "unknown" : _fgClass,
+                _lastIdleMs,
+                muteMin,
+                (DateTime.Now - _startedAt).TotalSeconds);
+        }
+    }
+
+    /// <summary>
+    /// 家 · 台词试听：让球冒这句话（**纯预览** —— 不进记忆、不动 trust、不计 occurrence）。
+    /// ⚠️ **不要调 ExpandPanel()** —— 展开会挡住用户正在看的列表。
+    /// ⚠️ 不喂内核（喂了就会记进 events.jsonl）—— 台词池点 200 次就把记忆搅乱了。
+    /// </summary>
+    public void PreviewLine(string text)
+    {
+        EnqueueBubble(new SaidLine("preview@", "info", text));
+        AppendLog($"[家] 试听：{text}");
+    }
+
+    /// <summary>把一条 JSON 消息推给只只的家（前端）。窗口没开就不做（不建常驻资源）。</summary>
+    public void PostToHome(string json)
+    {
+        var home = _home;
+        if (home is null) return;
+        try
+        {
+            home.PostMessage(json);
+        }
+        catch (Exception ex)
+        {
+            ShellLog.Write($"[WRN] 推消息给只只的家失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>打开只只的家（已开着 → 激活，不建第二个）。</summary>
+    public void OpenHome()
+    {
+        if (_home is { } h && h.IsLoaded)
+        {
+            if (h.WindowState == WindowState.Minimized) h.WindowState = WindowState.Normal;
+            h.Activate();
+            h.Topmost = true;    // 抬一下再撤 —— 让它从浮窗（Topmost）后面出来
+            h.Topmost = false;
+            AppendLog("只只的家：已存在 → 激活");
+            return;
+        }
+        try
+        {
+            _home = new HomeWindow(_homeBridge!) { Owner = this };
+            _home.Closed += (_, _) => { _home = null; };
+            _home.Show();
+            AppendLog("只只的家：已打开");
+        }
+        catch (Exception ex)
+        {
+            ShellLog.Write($"[ERR] 打开只只的家失败：{ex.Message}");
+            MessageBox.Show($"只只的家打不开：{ex.Message}", "只只", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     // ───────────────────────── 小工具 ─────────────────────────

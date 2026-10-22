@@ -20,6 +20,13 @@ internal sealed class ShellSettings
     /// <summary>静音截止时刻（epoch ms）；0 = 未静音。重启后仍然静音、到点自然失效。</summary>
     public long MuteUntil { get; set; }
 
+    // ── M11-c · 只只的家（窗口位置尺寸记忆）──
+    // nullable：null = 还没存过（第一次开）→ 居中显示。
+    public double? HomeLeft { get; set; }
+    public double? HomeTop { get; set; }
+    public double? HomeWidth { get; set; }
+    public double? HomeHeight { get; set; }
+
     /// <summary>唯一事实源 —— FloatWindow 不许自己再拼一遍（b2-a 复验小项2：只改一处）。</summary>
     internal static string DefaultPath =>
         System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "zhizhi", "shell.json");
